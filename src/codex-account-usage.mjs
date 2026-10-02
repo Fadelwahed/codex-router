@@ -43,6 +43,10 @@ function clampPercent(value) {
   return Math.max(0, Math.min(100, Number(value) || 0));
 }
 
+function plainObject(value) {
+  return Boolean(value) && typeof value === "object" && !Array.isArray(value);
+}
+
 const WEEK_MINUTES = 7 * 24 * 60;
 const MONTH_MINUTES = 28 * 24 * 60;
 
@@ -64,7 +68,10 @@ function trimmedPlanType(value) {
 }
 
 function normalizeWindow(window, nowMs) {
-  if (!window || typeof window !== "object") return null;
+  if (!plainObject(window)) return null;
+  // A missing or non-finite used percent is not zero. Coercing it invented a
+  // full window ("100% remaining") for an array, NaN, or an absent field.
+  if (typeof window.usedPercent !== "number" || !Number.isFinite(window.usedPercent)) return null;
   const usedPercent = clampPercent(window.usedPercent);
   return {
     usedPercent,
@@ -144,6 +151,8 @@ function selectAccountUsageWindow(windows) {
 }
 
 function boundedAccountUsageWindow(window) {
+  if (!plainObject(window)) return null;
+  if (typeof window.remainingPercent !== "number" || !Number.isFinite(window.remainingPercent)) return null;
   return {
     period: accountUsagePeriod(window),
     remainingPercent: window.remainingPercent,
@@ -169,12 +178,14 @@ export async function attachBoundedChatGPTAccountUsage(pool, {
   await Promise.all(candidates.map(async (account) => {
     try {
       const usage = await readUsage({ codexHome: accountHome(account.id), timeoutMs });
-      const windows = [usage.primary, usage.secondary].filter(Boolean);
+      const windows = [usage?.primary, usage?.secondary]
+        .map((window) => boundedAccountUsageWindow(window))
+        .filter(Boolean);
       const selected = selectAccountUsageWindow(windows);
       if (selected) {
-        const primary = boundedAccountUsageWindow(selected);
+        const primary = selected;
         const other = windows.find((window) => window !== selected);
-        const secondary = other ? boundedAccountUsageWindow(other) : null;
+        const secondary = other ?? null;
         // The other window is the rest of what the probe returned. It stays
         // beside the primary line when its duration differs, and it is not an
         // exhaustion signal: a drained short window must not pause or switch

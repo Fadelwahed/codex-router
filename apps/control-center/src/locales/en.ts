@@ -1115,6 +1115,8 @@ export const en = {
   "settings.accounts.windowMinutes": "{minutes}m",
   "settings.accounts.periodWeekly": "weekly",
   "settings.accounts.periodMonthly": "monthly",
+  "settings.accounts.periodCurrent": "current",
+  "settings.accounts.resetRefreshing": "Refreshing usage",
   "settings.accounts.usageUnavailable": "Usage unavailable",
   "settings.accounts.tokenHours": " · {hours}h token",
   "settings.accounts.rename": "Rename",

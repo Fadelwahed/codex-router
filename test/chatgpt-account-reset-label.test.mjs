@@ -1,7 +1,13 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { accountWindowPeriodLabel, formatAccountReset } from "../apps/control-center/src/lib.ts";
+import {
+  accountResetProbeEpochs,
+  accountResetTickDelay,
+  accountUsageClause,
+  accountWindowPeriodLabel,
+  formatAccountReset,
+} from "../apps/control-center/src/lib.ts";
 import { createTranslator } from "../apps/control-center/src/i18n.ts";
 
 const NOW = Date.UTC(2026, 9, 2, 12, 0, 0);
@@ -64,6 +70,57 @@ test("only an exact week is labeled weekly, in the active language", () => {
   assert.equal(accountWindowPeriodLabel({ period: "current", windowDurationMins: 300 }, traditional), "5 小時");
   assert.equal(accountWindowPeriodLabel({ period: "weekly", windowDurationMins: 10 * 24 * 60 }, simplified), "每周");
   assert.equal(accountWindowPeriodLabel({ period: "current", windowDurationMins: 10 * 24 * 60 }, t), "10d");
+});
+
+test("a missing, zero, or negative window duration localizes the current period", () => {
+  const t = createTranslator("en");
+  const simplified = createTranslator("zh-CN");
+  const traditional = createTranslator("zh-TW");
+  for (const windowDurationMins of [undefined, null, 0, -5, Number.NaN]) {
+    const window = { period: "current", windowDurationMins };
+    assert.equal(accountWindowPeriodLabel(window, t), "current");
+    assert.equal(accountWindowPeriodLabel(window, simplified), "当前");
+    assert.equal(accountWindowPeriodLabel(window, traditional), "目前");
+  }
+  assert.equal(accountWindowPeriodLabel({ period: "weekly" }, simplified), "每周");
+  assert.equal(accountWindowPeriodLabel({ period: "monthly", windowDurationMins: 0 }, traditional), "每月");
+});
+
+test("minute labels floor, and under a minute lasts only while time remains", () => {
+  const t = createTranslator("en");
+  const simplified = createTranslator("zh-CN");
+  assert.equal(formatAccountReset(at(50_000), t, NOW), "resets in <1m");
+  assert.equal(formatAccountReset(at(80_000), t, NOW), "resets in 1m");
+  assert.equal(formatAccountReset(at(MINUTE), t, NOW), "resets in 1m");
+  assert.equal(formatAccountReset(at(MINUTE + 1), t, NOW), "resets in 1m");
+  assert.equal(formatAccountReset(at(1), simplified, NOW), "不到 1 分钟后重置");
+  assert.equal(accountResetTickDelay([at(50_000)], NOW), 50_000);
+  assert.equal(accountResetTickDelay([at(80_000)], NOW), 20_000);
+  assert.equal(accountResetTickDelay([at(MINUTE)], NOW), 1);
+  assert.equal(accountResetTickDelay([at(3 * HOUR + 12 * MINUTE + 45_000)], NOW), 45_000);
+  assert.equal(accountResetTickDelay([at(3 * HOUR + 12 * MINUTE + 45_000), at(2 * DAY + 4 * HOUR + 20 * MINUTE)], NOW), 1);
+  assert.equal(accountResetTickDelay([0, -5], NOW), null);
+});
+
+test("a passed reset refreshes instead of keeping the previous percent", () => {
+  const t = createTranslator("en");
+  const simplified = createTranslator("zh-CN");
+  const traditional = createTranslator("zh-TW");
+  const window = { period: "current", remainingPercent: 70, resetsAt: at(-1), windowDurationMins: 0 };
+  assert.equal(accountUsageClause(window, t, NOW), "Refreshing usage");
+  assert.equal(accountUsageClause(window, simplified, NOW), "正在刷新用量");
+  assert.equal(accountUsageClause(window, traditional, NOW), "正在更新用量");
+  assert.equal(accountUsageClause(window, t, NOW).includes("70"), false);
+  assert.equal(accountUsageClause({ ...window, resetsAt: at(0) }, t, NOW), "Refreshing usage");
+  assert.equal(accountUsageClause({ ...window, resetsAt: at(50_000) }, t, NOW), "current · 70% remaining · resets in <1m");
+  assert.equal(accountUsageClause({ period: "weekly", remainingPercent: 70, resetsAt: at(2 * DAY) }, simplified, NOW), "每周 · 剩余 70% · 2 天后重置");
+  assert.equal(accountUsageClause({ period: "current", remainingPercent: Number.NaN }, t, NOW), "");
+  assert.equal(accountUsageClause([], t, NOW), "");
+  const probed = new Set();
+  const due = accountResetProbeEpochs([at(-1), at(MINUTE), at(-1)], NOW, probed);
+  assert.deepEqual(due, [at(-1)]);
+  for (const epoch of due) probed.add(epoch);
+  assert.deepEqual(accountResetProbeEpochs([at(-1), 0], NOW, probed), []);
 });
 
 test("leftover seconds stay inside the current floor bucket", () => {

@@ -1063,6 +1063,8 @@ export const zhCN = {
   "settings.accounts.windowMinutes": "{minutes} 分钟",
   "settings.accounts.periodWeekly": "每周",
   "settings.accounts.periodMonthly": "每月",
+  "settings.accounts.periodCurrent": "当前",
+  "settings.accounts.resetRefreshing": "正在刷新用量",
   "settings.accounts.usageUnavailable": "用量不可用",
   "settings.accounts.tokenHours": " · 登录凭证剩余 {hours} 小时",
   "settings.accounts.rename": "重命名",

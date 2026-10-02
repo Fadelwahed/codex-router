@@ -1117,6 +1117,8 @@ export const zhTW = {
   "settings.accounts.windowMinutes": "{minutes} 分鐘",
   "settings.accounts.periodWeekly": "每週",
   "settings.accounts.periodMonthly": "每月",
+  "settings.accounts.periodCurrent": "目前",
+  "settings.accounts.resetRefreshing": "正在更新用量",
   "settings.accounts.usageUnavailable": "用量無法取得",
   "settings.accounts.tokenHours": " · {hours} 小時 token",
   "settings.accounts.rename": "重新命名",

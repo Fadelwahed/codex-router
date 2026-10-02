@@ -348,6 +348,48 @@ test("clamps malformed percentages and tolerates missing usage", () => {
   assert.deepEqual(value.dailyUsageBuckets, []);
 });
 
+test("an array window or a missing used percent is not usage", async () => {
+  const now = new Date("2026-07-21T12:00:00.000Z");
+  const value = normalizeCodexAccountUsage({
+    rateLimits: {
+      primary: [{ usedPercent: 10, windowDurationMins: 300 }],
+      secondary: { windowDurationMins: 300 },
+    },
+  }, undefined, now);
+  assert.equal(value.primary, null);
+  assert.equal(value.secondary, null);
+  assert.equal(JSON.stringify(value).includes("100"), false);
+
+  const nonFinite = normalizeCodexAccountUsage({
+    rateLimits: {
+      primary: { usedPercent: Number.NaN, windowDurationMins: 300 },
+      secondary: { usedPercent: Number.POSITIVE_INFINITY, windowDurationMins: 300 },
+    },
+  }, undefined, now);
+  assert.equal(nonFinite.primary, null);
+  assert.equal(nonFinite.secondary, null);
+
+  const accounts = {
+    acct_array_000001: { id: "acct_array_000001", subscription: { usable: true } },
+    acct_mixed_000001: { id: "acct_mixed_000001", subscription: { usable: true } },
+  };
+  await attachBoundedChatGPTAccountUsage({ accounts }, {
+    accountHome: (id) => `/isolated/${id}`,
+    readUsage: async ({ codexHome }) => path.basename(codexHome) === "acct_array_000001"
+      ? { primary: [], secondary: { remainingPercent: Number.NaN, windowDurationMins: 300 } }
+      : {
+          primary: [{ remainingPercent: 100, windowDurationMins: 300 }],
+          secondary: { remainingPercent: 40, windowDurationMins: 300 },
+        },
+  });
+  assert.equal(accounts.acct_array_000001.subscription.usage, undefined);
+  assert.deepEqual(accounts.acct_mixed_000001.subscription.usage, {
+    period: "current",
+    remainingPercent: 40,
+    windowDurationMins: 300,
+  });
+});
+
 test("preserves optional daily account token breakdowns for the usage graph", () => {
   const value = normalizeCodexAccountUsage(
     {},
