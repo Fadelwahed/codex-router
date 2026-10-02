@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import http from "node:http";
 import os from "node:os";
 import path from "node:path";
@@ -210,6 +210,48 @@ function beginSlowChatRequest(base) {
   return { request, responsePromise };
 }
 
+// The forwarder reads the admitted session when the headers arrive, then
+// waits for the rest of the body. A fixed sleep races that read: under load
+// the replacement lands before admission and the mock's own status comes
+// back instead of the local 409. The child records each open of the
+// credential file; the replacement waits for the open that belongs to this
+// request.
+function admitMarkerEnv(marker) {
+  const existing = process.env.NODE_OPTIONS ?? "";
+  // Relative to the forwarder's cwd, which is the repository root. A quoted
+  // absolute path is not portable through NODE_OPTIONS on Windows.
+  return {
+    ANTIGRAVITY_ADMIT_MARKER: marker,
+    NODE_OPTIONS: `${existing} --require ./test/antigravity-admit-hook.cjs`.trim(),
+  };
+}
+
+function markerReads(marker) {
+  try {
+    const text = readFileSync(marker, "utf8");
+    if (text === "") return 0;
+    return text.split("\n").filter((line) => line.length > 0).length;
+  } catch (error) {
+    if (error?.code === "ENOENT") return 0;
+    throw error;
+  }
+}
+
+async function finishSlowBodyAfterAdmission(base, marker, replaceSession) {
+  const before = markerReads(marker);
+  const slow = beginSlowChatRequest(base);
+  const deadline = Date.now() + 10_000;
+  while (markerReads(marker) <= before) {
+    if (Date.now() >= deadline) {
+      throw new Error("forwarder did not admit the in-flight body before the session was replaced");
+    }
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  replaceSession();
+  slow.request.end('{"role":"user","content":"must stay local"}]}');
+  return slow.responsePromise;
+}
+
 test("rejects an omitted forced Claude tool locally before OAuth or upstream work", async () => {
   const directory = mkdtempSync(path.join(os.tmpdir(), "antigravity-local-shape-"));
   let upstreamCalls = 0;
@@ -413,21 +455,20 @@ test("a slow request body cannot cross a session replacement", async () => {
   });
   const port = await openPort();
   const tokenPath = writeTestToken(directory);
-  const child = startForwarder(port, upstream.url, tokenPath);
+  const marker = path.join(directory, "admit-marker");
+  const child = startForwarder(port, upstream.url, tokenPath, admitMarkerEnv(marker));
   const base = `http://127.0.0.1:${port}`;
   try {
     await waitForForwarder(base, child);
-    const slow = beginSlowChatRequest(base);
-    await new Promise((resolve) => setTimeout(resolve, 30));
-    writeTestToken(directory, {
-      overrides: {
-        session_generation: "cccccccc-cccc-4ccc-8ccc-cccccccccccc",
-        access_token: "replacement-access",
-        refresh_token: "replacement-refresh",
-      },
+    const result = await finishSlowBodyAfterAdmission(base, marker, () => {
+      writeTestToken(directory, {
+        overrides: {
+          session_generation: "cccccccc-cccc-4ccc-8ccc-cccccccccccc",
+          access_token: "replacement-access",
+          refresh_token: "replacement-refresh",
+        },
+      });
     });
-    slow.request.end('{"role":"user","content":"must stay local"}]}');
-    const result = await slow.responsePromise;
     assert.equal(result.status, 409);
     assert.equal(JSON.parse(result.body).error.code, "oauth_session_changed");
     assert.equal(upstreamCalls, 0);
@@ -447,15 +488,14 @@ test("a slow request body cannot outlive proof invalidation", async () => {
   });
   const port = await openPort();
   const tokenPath = writeTestToken(directory);
-  const child = startForwarder(port, upstream.url, tokenPath);
+  const marker = path.join(directory, "admit-marker");
+  const child = startForwarder(port, upstream.url, tokenPath, admitMarkerEnv(marker));
   const base = `http://127.0.0.1:${port}`;
   try {
     await waitForForwarder(base, child);
-    const slow = beginSlowChatRequest(base);
-    await new Promise((resolve) => setTimeout(resolve, 30));
-    writeTestToken(directory, { verified: false });
-    slow.request.end('{"role":"user","content":"must stay local"}]}');
-    const result = await slow.responsePromise;
+    const result = await finishSlowBodyAfterAdmission(base, marker, () => {
+      writeTestToken(directory, { verified: false });
+    });
     assert.equal(result.status, 403);
     assert.equal(JSON.parse(result.body).error.code, "antigravity_probe_required");
     assert.equal(upstreamCalls, 0);
