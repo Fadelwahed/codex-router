@@ -1112,6 +1112,7 @@ export const zhTW = {
   "settings.accounts.resetHours": "{hours} 小時",
   "settings.accounts.resetMinutes": "{minutes} 分鐘",
   "settings.accounts.resetUnderMinute": "不到 1 分鐘",
+  "settings.accounts.windowDays": "{days} 天",
   "settings.accounts.windowHours": "{hours} 小時",
   "settings.accounts.windowMinutes": "{minutes} 分鐘",
   "settings.accounts.usageUnavailable": "用量無法取得",

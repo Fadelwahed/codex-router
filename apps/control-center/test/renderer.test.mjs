@@ -257,9 +257,10 @@ const bridgeSource = String.raw`
       const usage = accountPoolState.accounts.active.subscription?.usage;
       if (usage) {
         const now = Date.now();
-        // Floor stays at 2d 4h for half an hour, and at 3h 12m for 45s, so a
-        // settings assertion after the rest of this page still matches.
-        usage.resetsAt = now + ((2 * 24 * 60) + (4 * 60) + 30) * 60_000;
+        // Day-scale leftovers of 30 minutes round up to the next hour, so the
+        // padding stays under that line. 3h 12m keeps a 45s pad because
+        // seconds are floored away.
+        usage.resetsAt = now + ((2 * 24 * 60) + (4 * 60) + 20) * 60_000;
         usage.also.resetsAt = now + ((3 * 60) + 12) * 60_000 + 45_000;
       }
       return JSON.parse(JSON.stringify(accountPoolState));

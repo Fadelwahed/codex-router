@@ -2,7 +2,7 @@ import { backendText } from "../backend-text";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { AppWindow, Check, Eye, LogIn, Moon, Plus, RefreshCw, Server, ShieldCheck, Sun, Trash2, UserRound, Wrench } from "lucide-react";
 import { Badge, Button, Dialog, InlineNotice, PageHeader, SectionHeading, Toggle } from "../components";
-import { compactNumber, effortLabel, formatAccountReset } from "../lib";
+import { accountWindowPeriodLabel, compactNumber, effortLabel, formatAccountReset } from "../lib";
 import { LANGUAGE_OPTIONS, type LanguageId, type Translate } from "../i18n";
 import type {
   ChatGptAccountPool,
@@ -49,18 +49,6 @@ function accountUsageClause(
   });
   const reset = formatAccountReset(window.resetsAt, t);
   return reset ? `${remaining} · ${reset}` : remaining;
-}
-
-function alsoWindowPeriodLabel(
-  window: { period: string; windowDurationMins?: number | null },
-  t: Translate,
-): string {
-  const minutes = window.windowDurationMins;
-  if (window.period === "current" && typeof minutes === "number" && Number.isFinite(minutes) && minutes > 0) {
-    if (minutes % 60 === 0) return t("settings.accounts.windowHours", { hours: minutes / 60 });
-    return t("settings.accounts.windowMinutes", { minutes: Math.round(minutes) });
-  }
-  return window.period;
 }
 
 function optimisticAccountPlaceholder(label: string, clientId: string): ChatGptSubscriptionAccount {
@@ -438,10 +426,10 @@ export function SettingsPage({ target, health, presence, chatgptSession, account
                 const label = account.subscription?.email && account.label ? `${account.label} · ` : "";
                 const usage = account.subscription?.usage;
                 const primaryUsage = usage
-                  ? accountUsageClause(usage, usage.period, t)
+                  ? accountUsageClause(usage, accountWindowPeriodLabel(usage, t), t)
                   : "";
                 const alsoUsage = usage?.also
-                  ? accountUsageClause(usage.also, alsoWindowPeriodLabel(usage.also, t), t)
+                  ? accountUsageClause(usage.also, accountWindowPeriodLabel(usage.also, t), t)
                   : "";
                 const usageLabel = optimisticPending
                   ? t("settings.accounts.savingAccount")

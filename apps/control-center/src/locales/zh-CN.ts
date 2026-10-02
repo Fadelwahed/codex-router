@@ -1058,6 +1058,7 @@ export const zhCN = {
   "settings.accounts.resetHours": "{hours} 小时",
   "settings.accounts.resetMinutes": "{minutes} 分钟",
   "settings.accounts.resetUnderMinute": "不到 1 分钟",
+  "settings.accounts.windowDays": "{days} 天",
   "settings.accounts.windowHours": "{hours} 小时",
   "settings.accounts.windowMinutes": "{minutes} 分钟",
   "settings.accounts.usageUnavailable": "用量不可用",

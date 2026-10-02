@@ -1110,6 +1110,7 @@ export const en = {
   "settings.accounts.resetHours": "{hours}h",
   "settings.accounts.resetMinutes": "{minutes}m",
   "settings.accounts.resetUnderMinute": "<1m",
+  "settings.accounts.windowDays": "{days}d",
   "settings.accounts.windowHours": "{hours}h",
   "settings.accounts.windowMinutes": "{minutes}m",
   "settings.accounts.usageUnavailable": "Usage unavailable",

@@ -68,6 +68,14 @@ export function formatDateTime(value: number | string | null | undefined, t: Tra
 // same threshold formatDateTime uses distinguishes seconds from milliseconds.
 // A missing or past instant is omitted: the row must never show "NaN" or a
 // negative remainder.
+//
+// Two significant units, and no third. Under a day the label is hours and
+// minutes, or minutes alone. At day scale it is days and hours. Leftover
+// minutes are not a display unit there: 30 and above round up to the next
+// hour, and a carry of 24 hours becomes the next day ("2d 23h 30m" reads
+// "3d"). An exact number of days stays "2d". A remainder under 30 minutes
+// with a zero hour stays visible as "2d 0h", so it is not identical to an
+// exact day.
 export function formatAccountReset(
   resetsAt: number | string | null | undefined,
   t: Translate = createTranslator(detectLanguage()),
@@ -93,9 +101,18 @@ function accountResetWhen(totalMinutes: number, t: Translate): string {
   const hours = Math.floor((totalMinutes % (60 * 24)) / 60);
   const minutes = totalMinutes % 60;
   if (days > 0) {
-    return hours > 0
-      ? t("settings.accounts.resetDaysHours", { days, hours })
-      : t("settings.accounts.resetDays", { days });
+    let shownDays = days;
+    let shownHours = hours + (minutes >= 30 ? 1 : 0);
+    if (shownHours >= 24) {
+      shownDays += 1;
+      shownHours = 0;
+    }
+    if (shownHours === 0) {
+      return minutes > 0 && minutes < 30
+        ? t("settings.accounts.resetDaysHours", { days: shownDays, hours: 0 })
+        : t("settings.accounts.resetDays", { days: shownDays });
+    }
+    return t("settings.accounts.resetDaysHours", { days: shownDays, hours: shownHours });
   }
   if (hours > 0) {
     return minutes > 0
@@ -103,6 +120,27 @@ function accountResetWhen(totalMinutes: number, t: Translate): string {
       : t("settings.accounts.resetHours", { hours });
   }
   return t("settings.accounts.resetMinutes", { minutes });
+}
+
+const ACCOUNT_WINDOW_DAY_MINUTES = 24 * 60;
+
+// "weekly" is an exact seven-day window. Any other duration keeps its own
+// length, in whole days when it has them, so a ten-day window reads "10d"
+// and is not collapsed into the weekly line.
+export function accountWindowPeriodLabel(
+  window: { period: string; windowDurationMins?: number | null },
+  t: Translate,
+): string {
+  if (window.period === "weekly" || window.period === "monthly") return window.period;
+  const minutes = window.windowDurationMins;
+  if (typeof minutes === "number" && Number.isFinite(minutes) && minutes > 0) {
+    if (minutes % ACCOUNT_WINDOW_DAY_MINUTES === 0) {
+      return t("settings.accounts.windowDays", { days: minutes / ACCOUNT_WINDOW_DAY_MINUTES });
+    }
+    if (minutes % 60 === 0) return t("settings.accounts.windowHours", { hours: minutes / 60 });
+    return t("settings.accounts.windowMinutes", { minutes: Math.round(minutes) });
+  }
+  return window.period;
 }
 
 export function formatDuration(milliseconds: number | null | undefined, t: Translate = createTranslator(detectLanguage())): string {

@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { formatAccountReset } from "../apps/control-center/src/lib.ts";
+import { accountWindowPeriodLabel, formatAccountReset } from "../apps/control-center/src/lib.ts";
 import { createTranslator } from "../apps/control-center/src/i18n.ts";
 
 const NOW = Date.UTC(2026, 9, 2, 12, 0, 0);
@@ -28,6 +28,34 @@ test("zero trailing units are omitted", () => {
   assert.equal(formatAccountReset(at(3 * HOUR), t, NOW), "resets in 3h");
   assert.equal(formatAccountReset(at(45 * MINUTE), t, NOW), "resets in 45m");
   assert.equal(formatAccountReset(at(MINUTE), t, NOW), "resets in 1m");
+});
+
+test("day-scale leftovers round to the nearest hour", () => {
+  const t = createTranslator("en");
+  const simplified = createTranslator("zh-CN");
+  const traditional = createTranslator("zh-TW");
+  assert.equal(formatAccountReset(at(2 * DAY + 30 * MINUTE), t, NOW), "resets in 2d 1h");
+  assert.equal(formatAccountReset(at(2 * DAY + 29 * MINUTE), t, NOW), "resets in 2d 0h");
+  assert.equal(formatAccountReset(at(2 * DAY + 4 * HOUR + 29 * MINUTE), t, NOW), "resets in 2d 4h");
+  assert.equal(formatAccountReset(at(2 * DAY + 4 * HOUR + 30 * MINUTE), t, NOW), "resets in 2d 5h");
+  assert.equal(formatAccountReset(at(2 * DAY + 23 * HOUR + 30 * MINUTE), t, NOW), "resets in 3d");
+  assert.equal(formatAccountReset(at(2 * DAY + 30 * MINUTE), simplified, NOW), "2 天 1 小时后重置");
+  assert.equal(formatAccountReset(at(2 * DAY + 29 * MINUTE), simplified, NOW), "2 天 0 小时后重置");
+  assert.equal(formatAccountReset(at(2 * DAY + 30 * MINUTE), traditional, NOW), "2 天 1 小時後重設");
+  assert.equal(formatAccountReset(at(2 * DAY + 29 * MINUTE), traditional, NOW), "2 天 0 小時後重設");
+});
+
+test("only an exact week is labeled weekly", () => {
+  const t = createTranslator("en");
+  const simplified = createTranslator("zh-CN");
+  const traditional = createTranslator("zh-TW");
+  assert.equal(accountWindowPeriodLabel({ period: "weekly", windowDurationMins: 7 * 24 * 60 }, t), "weekly");
+  assert.equal(accountWindowPeriodLabel({ period: "monthly", windowDurationMins: 30 * 24 * 60 }, t), "monthly");
+  assert.equal(accountWindowPeriodLabel({ period: "current", windowDurationMins: 10 * 24 * 60 }, t), "10d");
+  assert.equal(accountWindowPeriodLabel({ period: "current", windowDurationMins: 300 }, t), "5h");
+  assert.equal(accountWindowPeriodLabel({ period: "current", windowDurationMins: 90 }, t), "90m");
+  assert.equal(accountWindowPeriodLabel({ period: "current", windowDurationMins: 10 * 24 * 60 }, simplified), "10 天");
+  assert.equal(accountWindowPeriodLabel({ period: "current", windowDurationMins: 10 * 24 * 60 }, traditional), "10 天");
 });
 
 test("leftover seconds stay inside the current floor bucket", () => {

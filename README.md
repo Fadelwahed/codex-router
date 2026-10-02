@@ -1568,11 +1568,17 @@ login remains saved, and switching never removes another account's session.
 
 Each account keeps its own native model catalog and routed overlay. Usage is
 read from up to eight saved, usable accounts' isolated `CODEX_HOME`
-directories, prioritizing the selected account and using the weekly
-window when available and the monthly window otherwise. A second window
-of a different duration is shown beside that line. Each shown window
-includes a compact relative reset time when Codex reported a future reset,
-and a missing or past reset time is omitted. A short window is not
+directories, prioritizing the selected account. An exact seven-day
+window is the primary line when OpenAI reports one; otherwise a window
+of at least seven and under twenty-eight days, otherwise the monthly
+window. A window of a different duration is shown beside that line
+with its own label, so ten days reads `10d` rather than weekly. The
+plan type is shown when the probe returns a non-empty name. Each shown
+window includes a compact relative reset time when Codex reported a
+future reset. At day scale that label uses days and hours, rounding
+leftover minutes to the nearest hour (`2d 30m` reads “resets in 2d 1h”;
+under 30 minutes with no hour reads “resets in 2d 0h”). A missing,
+non-finite, negative, or past reset time is omitted. A short window is not
 treated as exhaustion and does not change the selected account. This is
 an explicit switch-only feature: it does not perform automatic quota or
 round-robin routing. See [the account switching guide](docs/CHATGPT-ACCOUNT-MODES.md) for
