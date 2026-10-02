@@ -139,6 +139,138 @@ export function accountResetProbeEpochs(
   return due;
 }
 
+// A probe that answers with another reset a few seconds out used to arm the
+// next probe for those few seconds. The refresh covers every account, so the
+// wait is global: at least a minute, doubling while the answer is already
+// elapsed or closer than that minute, and cleared once every real reset is
+// at least a minute away. The cap is sixteen minutes.
+export const ACCOUNT_RESET_REPROBE_MIN_MS = 60_000;
+const ACCOUNT_RESET_REPROBE_MAX_SHIFT = 4;
+
+export type AccountResetProbeGate = {
+  streak: number;
+  nextAllowedAt: number;
+};
+
+export function accountResetReprobeWait(streak: number): number {
+  const shift = Math.min(
+    ACCOUNT_RESET_REPROBE_MAX_SHIFT,
+    Number.isFinite(streak) && streak > 0 ? Math.floor(streak) : 0,
+  );
+  return ACCOUNT_RESET_REPROBE_MIN_MS * (2 ** shift);
+}
+
+type AccountResetWindowKind = "elapsed" | "near" | "normal" | "none";
+
+function accountResetWindowKind(
+  resetsAt: Array<number | string | null | undefined>,
+  now: number,
+): AccountResetWindowKind {
+  let sawNear = false;
+  let sawNormal = false;
+  for (const value of resetsAt) {
+    const epochMs = accountResetEpochMs(value);
+    if (epochMs === null || epochMs <= 0) continue;
+    const remainingMs = epochMs - now;
+    if (remainingMs <= 0) return "elapsed";
+    if (remainingMs < ACCOUNT_RESET_REPROBE_MIN_MS) sawNear = true;
+    else sawNormal = true;
+  }
+  if (sawNear) return "near";
+  if (sawNormal) return "normal";
+  return "none";
+}
+
+function accountResetGate(gate: AccountResetProbeGate): AccountResetProbeGate {
+  return {
+    streak: Number.isFinite(gate.streak) && gate.streak > 0 ? Math.floor(gate.streak) : 0,
+    nextAllowedAt: Number.isFinite(gate.nextAllowedAt) && gate.nextAllowedAt > 0 ? gate.nextAllowedAt : 0,
+  };
+}
+
+// `delay` is the one wake for both the countdown paint and a held probe.
+// A dropped reset does not probe and does not clear a wait already in force.
+export function accountResetProbeStep(
+  resetsAt: Array<number | string | null | undefined>,
+  now: number,
+  gate: AccountResetProbeGate,
+): { probe: boolean; gate: AccountResetProbeGate; delay: number | null } {
+  const held = accountResetGate(gate);
+  if (!Number.isFinite(now)) return { probe: false, gate: held, delay: null };
+  const display = accountResetTickDelay(resetsAt, now);
+  const kind = accountResetWindowKind(resetsAt, now);
+  if (kind === "normal") return { probe: false, gate: { streak: 0, nextAllowedAt: 0 }, delay: display };
+  if (kind !== "elapsed") return { probe: false, gate: held, delay: display };
+  if (now < held.nextAllowedAt) {
+    const wake = held.nextAllowedAt - now;
+    return { probe: false, gate: held, delay: display === null ? wake : Math.min(display, wake) };
+  }
+  const wait = accountResetReprobeWait(held.streak);
+  return {
+    probe: true,
+    gate: { streak: held.streak + 1, nextAllowedAt: now + wait },
+    delay: display === null ? wait : Math.min(display, wait),
+  };
+}
+
+// One timer. A nested `arm` from `onProbe` is ignored, so the probe cannot
+// schedule a second one; the caller re-arms after the new resets arrive.
+export function bindAccountResetClock(options: {
+  getResets: () => Array<number | string | null | undefined>;
+  onTick: (now: number) => void;
+  onProbe: () => void;
+  gate: { current: AccountResetProbeGate };
+  allow?: () => boolean;
+  now?: () => number;
+  schedule?: (fn: () => void, ms: number) => unknown;
+  cancel?: (id: unknown) => void;
+}): { arm: () => void; pause: () => void; stop: () => void } {
+  const now = options.now ?? (() => Date.now());
+  const schedule = options.schedule ?? ((fn: () => void, ms: number) => setTimeout(fn, ms));
+  const cancel = options.cancel ?? ((id: unknown) => {
+    clearTimeout(id as ReturnType<typeof setTimeout>);
+  });
+  let timer: { id: unknown } | null = null;
+  let stopped = false;
+  let arming = false;
+  const clear = () => {
+    if (!timer) return;
+    cancel(timer.id);
+    timer = null;
+  };
+  const arm = () => {
+    if (arming) return;
+    arming = true;
+    try {
+      clear();
+      if (stopped || (options.allow && !options.allow())) return;
+      const current = now();
+      options.onTick(current);
+      const step = accountResetProbeStep(options.getResets(), current, options.gate.current);
+      options.gate.current = step.gate;
+      if (step.probe) options.onProbe();
+      if (stopped || (options.allow && !options.allow())) {
+        clear();
+        return;
+      }
+      if (step.delay === null) return;
+      timer = { id: schedule(arm, step.delay) };
+    } finally {
+      arming = false;
+    }
+  };
+  return {
+    arm,
+    pause() {
+      if (!stopped) clear();
+    },
+    stop() {
+      stopped = true;
+      clear();
+    },
+  };
+}
+
 export function formatAccountReset(
   resetsAt: number | string | null | undefined,
   t: Translate = createTranslator(detectLanguage()),

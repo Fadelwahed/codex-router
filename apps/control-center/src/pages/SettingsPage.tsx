@@ -2,7 +2,7 @@ import { backendText } from "../backend-text";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { AppWindow, Check, Eye, LogIn, Moon, Plus, RefreshCw, Server, ShieldCheck, Sun, Trash2, UserRound, Wrench } from "lucide-react";
 import { Badge, Button, Dialog, InlineNotice, PageHeader, SectionHeading, Toggle } from "../components";
-import { accountResetEpochMs, accountResetProbeEpochs, accountResetTickDelay, accountUsageClause, compactNumber, effortLabel } from "../lib";
+import { accountResetEpochMs, accountUsageClause, bindAccountResetClock, compactNumber, effortLabel } from "../lib";
 import { LANGUAGE_OPTIONS, type LanguageId, type Translate } from "../i18n";
 import type {
   ChatGptAccountPool,
@@ -33,9 +33,12 @@ function isOptimisticAccountId(id: string): boolean {
 }
 
 // Minute labels change on a minute boundary, and "<1m" must end at the reset
-// instant rather than on the next fixed poll. Schedule that sooner instant
-// while this page is mounted and the document is visible. A reset that has
-// passed asks the existing refresh for a new probe, once per instant.
+// instant rather than on the next fixed poll. One timer paints that sooner
+// instant while this page is visible. A passed reset asks the existing
+// refresh for a new probe, then waits at least a minute. The wait grows
+// while the answer stays elapsed or only seconds away, and a normal window
+// clears it. The gate survives a new reset epoch so that epoch cannot arm
+// another probe on its own.
 function useAccountResetClock(
   resetsAt: Array<number | string | null | undefined>,
   onElapsed: () => void,
@@ -45,38 +48,24 @@ function useAccountResetClock(
   onElapsedRef.current = onElapsed;
   const resetsRef = useRef(resetsAt);
   resetsRef.current = resetsAt;
-  const probedRef = useRef(new Set<number>());
+  const gateRef = useRef({ streak: 0, nextAllowedAt: 0 });
   const scheduleKey = resetsAt.map((value) => accountResetEpochMs(value) ?? "").join("|");
 
   useEffect(() => {
-    let timer: number | undefined;
-    let stopped = false;
-    const clear = () => {
-      if (timer === undefined) return;
-      window.clearTimeout(timer);
-      timer = undefined;
-    };
-    const arm = () => {
-      clear();
-      if (stopped || document.visibilityState === "hidden") return;
-      const current = Date.now();
-      setNow(current);
-      const due = accountResetProbeEpochs(resetsRef.current, current, probedRef.current);
-      for (const epoch of due) probedRef.current.add(epoch);
-      if (due.length > 0) onElapsedRef.current();
-      const delay = accountResetTickDelay(resetsRef.current, current);
-      if (delay === null) return;
-      timer = window.setTimeout(arm, delay);
-    };
-    const onVisibility = () => {
-      if (document.visibilityState === "hidden") clear();
-      else arm();
-    };
+    const clock = bindAccountResetClock({
+      getResets: () => resetsRef.current,
+      onTick: setNow,
+      onProbe: () => { onElapsedRef.current(); },
+      gate: gateRef,
+      allow: () => document.visibilityState !== "hidden",
+      schedule: (fn, ms) => window.setTimeout(fn, ms),
+      cancel: (id) => { window.clearTimeout(id as number); },
+    });
+    const onVisibility = () => { clock.arm(); };
     onVisibility();
     document.addEventListener("visibilitychange", onVisibility);
     return () => {
-      stopped = true;
-      clear();
+      clock.stop();
       document.removeEventListener("visibilitychange", onVisibility);
     };
   }, [scheduleKey]);

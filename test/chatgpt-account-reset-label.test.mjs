@@ -3,9 +3,11 @@ import test from "node:test";
 
 import {
   accountResetProbeEpochs,
+  accountResetProbeStep,
   accountResetTickDelay,
   accountUsageClause,
   accountWindowPeriodLabel,
+  bindAccountResetClock,
   formatAccountReset,
 } from "../apps/control-center/src/lib.ts";
 import { createTranslator } from "../apps/control-center/src/i18n.ts";
@@ -164,4 +166,178 @@ test("reset copy is localized in simplified and traditional Chinese", () => {
   assert.equal(formatAccountReset(at(3 * HOUR + 12 * MINUTE), traditional, NOW), "3 小時 12 分鐘後重設");
   assert.equal(formatAccountReset(at(30_000), traditional, NOW), "不到 1 分鐘後重設");
   assert.equal(formatAccountReset(at(-5), traditional, NOW), "");
+});
+
+test("the re-probe wait doubles through sixteen minutes and then holds", () => {
+  const gate = { streak: 0, nextAllowedAt: 0 };
+  let now = NOW;
+  const waits = [];
+  for (let i = 0; i < 6; i += 1) {
+    const step = accountResetProbeStep([now - 1], now, gate);
+    assert.equal(step.probe, true);
+    waits.push(step.gate.nextAllowedAt - now);
+    gate.streak = step.gate.streak;
+    gate.nextAllowedAt = step.gate.nextAllowedAt;
+    now = step.gate.nextAllowedAt;
+  }
+  assert.deepEqual(waits, [60_000, 120_000, 240_000, 480_000, 960_000, 960_000]);
+});
+
+test("a near or missing reset keeps the wait, and a normal window clears it", () => {
+  const held = accountResetProbeStep([NOW - 1], NOW, { streak: 0, nextAllowedAt: 0 });
+  assert.equal(held.probe, true);
+  const near = accountResetProbeStep([NOW + 5_000], NOW, held.gate);
+  assert.equal(near.probe, false);
+  assert.equal(near.delay, 5_000);
+  assert.equal(near.gate.streak, 1);
+  const dropped = accountResetProbeStep([null, 0, -1], NOW, near.gate);
+  assert.equal(dropped.probe, false);
+  assert.equal(dropped.delay, null);
+  assert.equal(dropped.gate.streak, 1);
+  assert.equal(dropped.gate.nextAllowedAt, held.gate.nextAllowedAt);
+  const cleared = accountResetProbeStep([NOW + 2 * HOUR, NOW + 5_000], NOW + 1, near.gate);
+  assert.equal(cleared.probe, false);
+  assert.equal(cleared.gate.streak, 1, "one reset still inside a minute keeps the wait");
+  const normal = accountResetProbeStep([NOW + 2 * HOUR], NOW, cleared.gate);
+  assert.deepEqual(normal.gate, { streak: 0, nextAllowedAt: 0 });
+  const again = accountResetProbeStep([NOW - 1], NOW, normal.gate);
+  assert.equal(again.probe, true);
+  assert.equal(again.gate.nextAllowedAt - NOW, 60_000);
+});
+
+function openResetClock(t, start, options = {}) {
+  t.mock.timers.enable({ apis: ["setTimeout", "Date"], now: start });
+  let resets = options.resets ?? [start - 1_000];
+  let probes = 0;
+  const live = new Set();
+  const handles = new Map();
+  let seq = 0;
+  let lastDelay = null;
+  const gate = { current: { streak: 0, nextAllowedAt: 0 } };
+  let clock;
+  clock = bindAccountResetClock({
+    getResets: () => resets,
+    onTick: () => {},
+    onProbe: () => {
+      probes += 1;
+      options.onProbe?.(() => { clock.arm(); });
+    },
+    gate,
+    schedule: (fn, ms) => {
+      lastDelay = ms;
+      const id = ++seq;
+      live.add(id);
+      const handle = setTimeout(() => {
+        if (!live.delete(id)) return;
+        handles.delete(id);
+        fn();
+      }, ms);
+      handles.set(id, handle);
+      return id;
+    },
+    cancel: (id) => {
+      live.delete(id);
+      const handle = handles.get(id);
+      if (handle !== undefined) {
+        clearTimeout(handle);
+        handles.delete(id);
+      }
+    },
+  });
+  return {
+    clock,
+    gate,
+    live,
+    setResets(next) { resets = next; },
+    probes: () => probes,
+    delay: () => lastDelay,
+  };
+}
+
+test("a reset a few seconds ahead waits, backs off, and a normal window restores the minute", (t) => {
+  const start = Date.UTC(2026, 9, 2, 12, 0, 0);
+  const harness = openResetClock(t, start);
+  harness.clock.arm();
+  assert.equal(harness.probes(), 1);
+  assert.equal(harness.live.size, 1);
+  assert.equal(harness.delay(), 60_000);
+  assert.equal(harness.gate.current.nextAllowedAt, start + 60_000);
+
+  harness.setResets([start + 5_000]);
+  harness.clock.arm();
+  assert.equal(harness.probes(), 1);
+  assert.equal(harness.live.size, 1);
+  assert.equal(harness.delay(), 5_000);
+
+  t.mock.timers.tick(5_000);
+  assert.equal(harness.probes(), 1);
+  assert.equal(harness.live.size, 1);
+  assert.equal(harness.delay(), 55_000);
+  t.mock.timers.tick(54_999);
+  assert.equal(harness.probes(), 1);
+  t.mock.timers.tick(1);
+  assert.equal(harness.probes(), 2);
+  assert.equal(harness.delay(), 120_000);
+  assert.equal(harness.gate.current.streak, 2);
+  assert.equal(harness.live.size, 1);
+
+  const secondProbeAt = start + 60_000;
+  harness.setResets([secondProbeAt + 5_000]);
+  harness.clock.arm();
+  assert.equal(harness.probes(), 2);
+  assert.equal(harness.delay(), 5_000);
+  t.mock.timers.tick(5_000);
+  assert.equal(harness.probes(), 2);
+  assert.equal(harness.delay(), 115_000);
+  t.mock.timers.tick(114_999);
+  assert.equal(harness.probes(), 2);
+  t.mock.timers.tick(1);
+  assert.equal(harness.probes(), 3);
+  assert.equal(harness.delay(), 240_000);
+  assert.equal(harness.live.size, 1);
+
+  const thirdProbeAt = secondProbeAt + 120_000;
+  harness.setResets([thirdProbeAt + 2 * 60 * 60_000]);
+  harness.clock.arm();
+  assert.equal(harness.probes(), 3);
+  assert.deepEqual(harness.gate.current, { streak: 0, nextAllowedAt: 0 });
+  assert.equal(harness.live.size, 1);
+
+  harness.setResets([Date.now() - 1]);
+  harness.clock.arm();
+  assert.equal(harness.probes(), 4);
+  assert.equal(harness.delay(), 60_000);
+  t.mock.timers.tick(59_000);
+  assert.equal(harness.probes(), 4);
+  t.mock.timers.tick(1_000);
+  assert.equal(harness.probes(), 5);
+  assert.equal(harness.delay(), 120_000);
+
+  harness.clock.pause();
+  assert.equal(harness.live.size, 0);
+  t.mock.timers.tick(30_000);
+  assert.equal(harness.probes(), 5);
+  harness.clock.arm();
+  assert.equal(harness.probes(), 5);
+  assert.equal(harness.live.size, 1);
+
+  harness.clock.stop();
+  assert.equal(harness.live.size, 0);
+  t.mock.timers.tick(60 * 60_000);
+  assert.equal(harness.probes(), 5);
+  assert.equal(harness.live.size, 0);
+});
+
+test("a probe that re-enters the clock does not arm a second timer", (t) => {
+  const harness = openResetClock(t, NOW, {
+    onProbe(rearm) { rearm(); },
+  });
+  harness.clock.arm();
+  assert.equal(harness.probes(), 1);
+  assert.equal(harness.live.size, 1);
+  harness.clock.stop();
+  assert.equal(harness.live.size, 0);
+  t.mock.timers.tick(120_000);
+  assert.equal(harness.probes(), 1);
+  assert.equal(harness.live.size, 0);
 });
