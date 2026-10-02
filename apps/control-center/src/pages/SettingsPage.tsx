@@ -1,5 +1,5 @@
 import { backendText } from "../backend-text";
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useId, useMemo, useRef, useState } from "react";
 import { AppWindow, Check, Eye, LogIn, Moon, Pencil, Plus, RefreshCw, Server, ShieldCheck, Sun, Trash2, UserRound, Wrench } from "lucide-react";
 import { Badge, Button, Dialog, InlineNotice, PageHeader, SectionHeading, Toggle } from "../components";
 import { compactNumber, effortLabel } from "../lib";
@@ -23,6 +23,44 @@ import { useOptimisticValues, type RunAction } from "../useOptimisticValues";
 // than being folded in with the default.
 const RETENTION_DEFAULT_TTL_DAYS = 7;
 const RETENTION_CHOICES = [1, 3, 7, 14, 30, 90];
+const ACCOUNT_LABEL_LIMIT = 120;
+
+function AccountLabelControl({ label, value, placeholder, onValue, t }: {
+  label: string;
+  value: string;
+  placeholder: string;
+  onValue: (value: string) => void;
+  t: Translate;
+}) {
+  const counterId = useId();
+  const limitId = useId();
+  const atLimit = value.length >= ACCOUNT_LABEL_LIMIT;
+  return (
+    <div className="account-label-field">
+      <input
+        aria-label={label}
+        aria-describedby={atLimit ? `${counterId} ${limitId}` : counterId}
+        value={value}
+        maxLength={ACCOUNT_LABEL_LIMIT}
+        placeholder={placeholder}
+        onChange={(event) => onValue(event.target.value.slice(0, ACCOUNT_LABEL_LIMIT))}
+      />
+      <span
+        id={counterId}
+        className="account-label-count"
+        data-at-limit={atLimit ? "true" : undefined}
+        aria-label={t("settings.accounts.labelCountAria", { count: value.length, limit: ACCOUNT_LABEL_LIMIT })}
+      >
+        {t("settings.accounts.labelCount", { count: value.length, limit: ACCOUNT_LABEL_LIMIT })}
+      </span>
+      {atLimit ? (
+        <span id={limitId} className="account-label-limit" role="status">
+          {t("settings.accounts.labelLimitReached")}
+        </span>
+      ) : null}
+    </div>
+  );
+}
 
 type AccountOverlay =
   | { kind: "add"; clientId: string; account: ChatGptSubscriptionAccount }
@@ -401,12 +439,12 @@ export function SettingsPage({ target, health, presence, chatgptSession, account
               </InlineNotice>
             ) : null}
             <div className="settings-actions subscription-account-create">
-              <input
-                aria-label={t("settings.accounts.newLabelAria")}
+              <AccountLabelControl
+                label={t("settings.accounts.newLabelAria")}
                 value={newAccountLabel}
-                maxLength={120}
                 placeholder={t("settings.accounts.labelPlaceholder")}
-                onChange={(event) => setNewAccountLabel(event.target.value)}
+                onValue={setNewAccountLabel}
+                t={t}
               />
               <Button
                 variant="secondary"
@@ -440,8 +478,12 @@ export function SettingsPage({ target, health, presence, chatgptSession, account
                     key={account.id}
                     data-optimistic={optimisticPending ? "true" : undefined}
                   >
-                    <div>
-                      <strong><UserRound aria-hidden size={14} strokeWidth={1.7} /> {title} {accountSelection === account.id ? <Badge tone="accent">{t("settings.accounts.selectedBadge")}</Badge> : null}</strong>
+                    <div className="subscription-account-identity">
+                      <strong>
+                        <UserRound aria-hidden size={14} strokeWidth={1.7} />
+                        <span className="subscription-account-title" title={title}>{title}</span>
+                        {accountSelection === account.id ? <Badge tone="accent">{t("settings.accounts.selectedBadge")}</Badge> : null}
+                      </strong>
                       <small>{label}{status}{account.subscription?.expiresInHours !== undefined ? t("settings.accounts.tokenHours", { hours: account.subscription.expiresInHours }) : ""} · {usageLabel}</small>
                       {accountLoginAttempt?.status === "failed" ? <small>{accountLoginAttempt.error}</small> : null}
                     </div>
@@ -758,12 +800,12 @@ export function SettingsPage({ target, health, presence, chatgptSession, account
           setRenameAccountId(null);
           if (api && id) void runAction(t("settings.accounts.renameTitle"), () => api.renameChatGptSubscriptionAccount(id, draft));
         }}>
-          <input
-            aria-label={t("settings.accounts.renameInputAria")}
+          <AccountLabelControl
+            label={t("settings.accounts.renameInputAria")}
             value={renameDraft}
-            maxLength={120}
             placeholder={t("settings.accounts.renamePlaceholder")}
-            onChange={(event) => setRenameDraft(event.target.value)}
+            onValue={setRenameDraft}
+            t={t}
           />
           <p className="dialog-copy">{t("settings.accounts.renameHint")}</p>
           <div className="dialog-actions">

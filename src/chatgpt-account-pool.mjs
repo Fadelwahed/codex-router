@@ -274,19 +274,23 @@ function ensurePrivateAccountDirectory(target, homesDir) {
   chmodSync(absolute, 0o700);
 }
 
+const GENERATED_ACCOUNT_LABEL = /^ChatGPT account (\d+)$/;
+
 function nextAccountLabel(state) {
   const used = new Set(Object.values(state.accounts).filter((account) => account?.state !== "revoked").map((account) => {
-    const match = /^ChatGPT account (\d+)$/.exec(account?.label || "");
+    const match = GENERATED_ACCOUNT_LABEL.exec(account?.label || "");
     return match ? Number(match[1]) : undefined;
   }).filter(Number.isInteger));
   let numberValue = 1;
   while (used.has(numberValue)) numberValue += 1;
   return `ChatGPT account ${numberValue}`;
 }
-// A display label is metadata on the existing account record. Empty input
-// clears it so the row falls back to the email. The stored field is already
-// capped at 120 characters by normalizeAccount; reject anything longer, or a
-// NUL, before that backstop so the caller sees the same limit as add.
+
+// Empty input clears a custom label only. A generated "ChatGPT account N"
+// name stays put, and a custom name is replaced with the next free generated
+// one, so a reset cannot leave the row without its number. The stored field
+// is already capped at 120 characters by normalizeAccount; reject anything
+// longer, or a NUL, before that backstop so the caller sees the same limit as add.
 export function chatGPTAccountLabelInput(label) {
   if (typeof label !== "string" || /[\u0000]/.test(label)) {
     throw new Error("Account label is invalid.");
@@ -306,8 +310,11 @@ export function renameChatGPTSubscriptionAccount(accountValue, label = "", { fil
     account.label = nextLabel;
     account.labelCustom = true;
   } else {
-    delete account.label;
     delete account.labelCustom;
+    if (!GENERATED_ACCOUNT_LABEL.test(account.label || "")) {
+      delete account.label;
+      account.label = nextAccountLabel(state);
+    }
   }
   writeChatGPTAccountPoolState(state, filePath);
   return sanitizeChatGPTAccount(readChatGPTAccountPoolState(filePath).accounts[id]);

@@ -1,5 +1,7 @@
 import assert from "node:assert/strict";
+import { spawn } from "node:child_process";
 import test from "node:test";
+import { fileURLToPath } from "node:url";
 
 import { freePort } from "./port-pool.mjs";
 
@@ -37,4 +39,43 @@ test("concurrent and sequential draws never hand out the same port twice", async
   for (let index = 0; index < 6; index += 1) sequential.push(await freePort());
   const all = [...concurrent, ...sequential];
   assert.equal(new Set(all).size, all.length, `duplicate draws: ${all.join(", ")}`);
+});
+
+function drawPortsInChild(count) {
+  const pool = fileURLToPath(new URL("./port-pool.mjs", import.meta.url));
+  const child = spawn(process.execPath, ["--input-type=module", "-e", `
+    import { freePort } from ${JSON.stringify(pool)};
+    const ports = [];
+    for (let index = 0; index < ${count}; index += 1) ports.push(await freePort());
+    process.stdout.write(JSON.stringify(ports));
+  `], { stdio: ["ignore", "pipe", "pipe"] });
+  let stdout = "";
+  let stderr = "";
+  child.stdout.setEncoding("utf8");
+  child.stderr.setEncoding("utf8");
+  child.stdout.on("data", (chunk) => { stdout += chunk; });
+  child.stderr.on("data", (chunk) => { stderr += chunk; });
+  return new Promise((resolve, reject) => {
+    child.once("error", reject);
+    child.once("exit", (code) => {
+      if (code !== 0) {
+        reject(new Error(`port child exited ${code}: ${stderr}`));
+        return;
+      }
+      resolve(JSON.parse(stdout));
+    });
+  });
+}
+
+test("concurrent processes receive disjoint ports", async () => {
+  const [first, second, local] = await Promise.all([
+    drawPortsInChild(8),
+    drawPortsInChild(8),
+    Promise.all(Array.from({ length: 8 }, () => freePort())),
+  ]);
+  const all = [...first, ...second, ...local];
+  assert.equal(new Set(all).size, all.length, `processes overlapped: ${all.join(", ")}`);
+  for (const port of all) {
+    assert.ok(port >= POOL_FLOOR && port <= POOL_CEILING, `port ${port} left the pool window`);
+  }
 });

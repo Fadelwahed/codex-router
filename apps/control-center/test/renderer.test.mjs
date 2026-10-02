@@ -521,8 +521,17 @@ const bridgeSource = String.raw`
         account.label = trimmed;
         account.labelCustom = true;
       } else {
-        delete account.label;
         delete account.labelCustom;
+        if (!/^ChatGPT account \d+$/.test(String(account.label || ""))) {
+          const used = new Set(Object.values(accountPoolState.accounts).filter((entry) => entry && entry.state !== "revoked").map((entry) => {
+            const match = /^ChatGPT account (\d+)$/.exec(String(entry.label || ""));
+            return match ? Number(match[1]) : undefined;
+          }).filter((value) => Number.isInteger(value)));
+          delete account.label;
+          let numberValue = 1;
+          while (used.has(numberValue)) numberValue += 1;
+          account.label = "ChatGPT account " + numberValue;
+        }
       }
       return { account };
     },
@@ -1075,6 +1084,8 @@ test("the production renderer exposes model discovery and picker actions", { tim
     ))), true);
     await renamed.getByRole("button", { name: "Rename ChatGPT account: Work laptop", exact: true }).click();
     await page.getByRole("textbox", { name: "ChatGPT account label", exact: true }).fill("ChatGPT account 2");
+    assert.equal(await page.locator(".dialog-panel .account-label-count").textContent(), "17/120");
+    assert.ok(await page.getByRole("textbox", { name: "ChatGPT account label", exact: true }).getAttribute("aria-describedby"));
     await page.getByRole("textbox", { name: "ChatGPT account label", exact: true }).press("Enter");
     const patterned = accountRows.filter({ hasText: "secondary@example.com" });
     await patterned.getByRole("button", { name: "Selected ChatGPT account: ChatGPT account 2", exact: true }).waitFor();
@@ -1093,8 +1104,49 @@ test("the production renderer exposes model discovery and picker actions", { tim
       const row = [...document.querySelectorAll(".subscription-account-row")]
         .find((node) => (node.textContent || "").includes("secondary@example.com"));
       const text = row?.textContent || "";
-      return Boolean(row) && !text.includes("Work laptop") && !text.includes("Secondary account") && !text.includes("ChatGPT account 2");
+      return Boolean(row) && text.includes("ChatGPT account 2") && !text.includes("Work laptop") && !text.includes("Secondary account");
     });
+
+    const newLabel = page.getByRole("textbox", { name: "New ChatGPT account label" });
+    await newLabel.fill("n".repeat(87));
+    const belowLimit = await newLabel.evaluate((el) => {
+      const ids = (el.getAttribute("aria-describedby") || "").split(/\s+/).filter(Boolean);
+      const counter = ids[0] ? document.getElementById(ids[0]) : null;
+      return {
+        ids: ids.length,
+        text: counter?.textContent || "",
+        label: counter?.getAttribute("aria-label") || "",
+      };
+    });
+    assert.equal(belowLimit.ids, 1);
+    assert.equal(belowLimit.text, "87/120");
+    assert.equal(belowLimit.label, "87 of 120 characters");
+    await newLabel.fill("n".repeat(120));
+    await newLabel.press("z");
+    assert.equal((await newLabel.inputValue()).length, 120);
+    const atLimit = await newLabel.evaluate((el) => {
+      const ids = (el.getAttribute("aria-describedby") || "").split(/\s+/).filter(Boolean);
+      return {
+        ids: ids.length,
+        count: ids[0] ? document.getElementById(ids[0])?.textContent : "",
+        limit: ids[1] ? document.getElementById(ids[1])?.textContent : "",
+        flagged: ids[0] ? document.getElementById(ids[0])?.getAttribute("data-at-limit") : "",
+      };
+    });
+    assert.equal(atLimit.ids, 2);
+    assert.equal(atLimit.count, "120/120");
+    assert.equal(atLimit.limit, "Character limit reached.");
+    assert.equal(atLimit.flagged, "true");
+    assert.equal(await page.getByRole("status").filter({ hasText: "Character limit reached." }).count(), 1);
+    await newLabel.fill("");
+
+    const currentTitle = page.locator(".subscription-account-row").filter({ hasText: "primary@example.com" }).locator(".subscription-account-title");
+    assert.equal(await currentTitle.getAttribute("title"), "Current account");
+    assert.equal(await currentTitle.evaluate((el) => getComputedStyle(el).whiteSpace), "nowrap");
+    assert.equal(await currentTitle.evaluate((el) => getComputedStyle(el).textOverflow), "ellipsis");
+    const identityMin = await currentTitle.evaluate((el) => getComputedStyle(el.closest(".subscription-account-identity")).minWidth);
+    assert.ok(parseFloat(identityMin) >= 140, identityMin);
+
     await page.getByRole("button", { name: "Select ChatGPT account: Current account", exact: true }).click();
     await page.waitForFunction(() => window.routerControlTest.calls()
       .some((call) => call.name === "setChatGptAccountSelection" && call.args[0] === "current"));

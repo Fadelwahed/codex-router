@@ -108,8 +108,10 @@ test("renaming an account label persists without changing its identity", () => {
   assert.deepEqual(stored.identity, before.identity);
 
   const cleared = renameChatGPTSubscriptionAccount(account.id, " \t ", options);
-  assert.equal(cleared.label, undefined);
-  assert.equal(readChatGPTAccountPoolState(options.filePath).accounts[account.id].label, undefined);
+  assert.equal(cleared.label, "ChatGPT account 1");
+  assert.equal(cleared.labelCustom, undefined);
+  assert.equal(readChatGPTAccountPoolState(options.filePath).accounts[account.id].label, "ChatGPT account 1");
+  assert.equal(readChatGPTAccountPoolState(options.filePath).accounts[account.id].labelCustom, undefined);
   assert.equal(readChatGPTAccountPoolState(options.filePath).accounts[account.id].id, account.id);
 
   assert.equal(chatGPTAccountLabelInput("  kept  "), "kept");
@@ -118,7 +120,8 @@ test("renaming an account label persists without changing its identity", () => {
   assert.throws(() => renameChatGPTSubscriptionAccount(account.id, "bad\u0000name", options), /Account label is invalid/);
   assert.throws(() => chatGPTAccountLabelInput(12), /Account label is invalid/);
   assert.throws(() => renameChatGPTSubscriptionAccount("acct_missing1", "Name", options), /not registered/);
-  assert.equal(readChatGPTAccountPoolState(options.filePath).accounts[account.id].label, undefined);
+  assert.equal(readChatGPTAccountPoolState(options.filePath).accounts[account.id].label, "ChatGPT account 1");
+  assert.equal(readChatGPTAccountPoolState(options.filePath).accounts[account.id].labelCustom, undefined);
 });
 
 test("a user-set label that matches the generated pattern stays marked as custom", () => {
@@ -136,14 +139,44 @@ test("a user-set label that matches the generated pattern stays marked as custom
   assert.equal(stored.labelCustom, true);
 
   const cleared = renameChatGPTSubscriptionAccount(generated.id, "  ", options);
-  assert.equal(cleared.label, undefined);
+  assert.equal(cleared.label, "ChatGPT account 2");
   assert.equal(cleared.labelCustom, undefined);
+  assert.equal(readChatGPTAccountPoolState(options.filePath).accounts[generated.id].label, "ChatGPT account 2");
   assert.equal(readChatGPTAccountPoolState(options.filePath).accounts[generated.id].labelCustom, undefined);
 
   const explicit = createChatGPTSubscriptionAccount({ ...options, label: "  ChatGPT account 4  " });
   assert.equal(explicit.label, "ChatGPT account 4");
   assert.equal(explicit.labelCustom, true);
   assert.equal(readChatGPTAccountPoolState(options.filePath).accounts[explicit.id].labelCustom, true);
+});
+
+test("a whitespace reset keeps a generated number and restores one after a custom label", () => {
+  const options = fixture();
+  const generated = createChatGPTSubscriptionAccount(options);
+  assert.equal(generated.label, "ChatGPT account 1");
+  assert.equal(generated.labelCustom, undefined);
+
+  const kept = renameChatGPTSubscriptionAccount(generated.id, " \n\t ", options);
+  assert.equal(kept.label, "ChatGPT account 1");
+  assert.equal(kept.labelCustom, undefined);
+  assert.equal(readChatGPTAccountPoolState(options.filePath).accounts[generated.id].label, "ChatGPT account 1");
+  assert.equal(readChatGPTAccountPoolState(options.filePath).accounts[generated.id].labelCustom, undefined);
+
+  const custom = renameChatGPTSubscriptionAccount(generated.id, "Work laptop", options);
+  assert.equal(custom.label, "Work laptop");
+  assert.equal(custom.labelCustom, true);
+  const sibling = createChatGPTSubscriptionAccount(options);
+  assert.equal(sibling.label, "ChatGPT account 1");
+
+  const restored = renameChatGPTSubscriptionAccount(generated.id, "   ", options);
+  assert.equal(restored.id, generated.id);
+  assert.equal(restored.label, "ChatGPT account 2");
+  assert.equal(restored.labelCustom, undefined);
+  const stored = readChatGPTAccountPoolState(options.filePath);
+  assert.equal(stored.accounts[generated.id].label, "ChatGPT account 2");
+  assert.equal(stored.accounts[generated.id].labelCustom, undefined);
+  assert.equal(stored.accounts[sibling.id].label, "ChatGPT account 1");
+  assert.notEqual(stored.accounts[generated.id].label, stored.accounts[sibling.id].label);
 });
 
 test("account labels reuse the first free number after a removed account", () => {
