@@ -307,6 +307,7 @@ export interface ChatGptSubscriptionAccount {
   paused: boolean;
   priority: number;
   label?: string;
+  labelCustom?: boolean;
   createdAt?: string;
   subscription?: {
     status?: "pending" | "usable" | "expired" | "invalid" | string;

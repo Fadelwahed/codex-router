@@ -138,6 +138,7 @@ function normalizeAccount(raw, id) {
     paused: raw.paused === true,
     priority: integer(raw.priority, 50, { min: 0, max: 100_000 }),
     ...(text(raw.label) ? { label: text(raw.label).slice(0, 120) } : {}),
+    ...(raw.labelCustom === true && text(raw.label) ? { labelCustom: true } : {}),
     ...(iso(raw.createdAt) ? { createdAt: iso(raw.createdAt) } : {}),
     ...(identity ? { identity } : {}),
     ...(subscription ? { subscription } : {}),
@@ -301,8 +302,13 @@ export function renameChatGPTSubscriptionAccount(accountValue, label = "", { fil
   const state = readChatGPTAccountPoolState(filePath);
   const account = state.accounts[id];
   if (!account) throw new Error("Account id is not registered.");
-  if (nextLabel) account.label = nextLabel;
-  else delete account.label;
+  if (nextLabel) {
+    account.label = nextLabel;
+    account.labelCustom = true;
+  } else {
+    delete account.label;
+    delete account.labelCustom;
+  }
   writeChatGPTAccountPoolState(state, filePath);
   return sanitizeChatGPTAccount(readChatGPTAccountPoolState(filePath).accounts[id]);
 }
@@ -313,7 +319,16 @@ export function createChatGPTSubscriptionAccount({ label = "", filePath = CHATGP
   const id = newAccountId(state);
   const home = chatGPTSubscriptionAccountHome(id, { homesDir });
   ensurePrivateAccountDirectory(home, homesDir);
-  const account = normalizeAccount({ id, state: "active", label: text(label).slice(0, 120) || nextAccountLabel(state), createdAt: isoNow(now), subscription: { status: "pending" }, health: { state: "healthy" } }, id);
+  const suppliedLabel = text(label).slice(0, 120);
+  const account = normalizeAccount({
+    id,
+    state: "active",
+    label: suppliedLabel || nextAccountLabel(state),
+    ...(suppliedLabel ? { labelCustom: true } : {}),
+    createdAt: isoNow(now),
+    subscription: { status: "pending" },
+    health: { state: "healthy" },
+  }, id);
   state.accounts[id] = account;
   try { writeChatGPTAccountPoolState(state, filePath); } catch (error) { rmSync(home, { recursive: true, force: true }); throw error; }
   return sanitizeChatGPTAccount(account);
@@ -707,7 +722,9 @@ export function sanitizeChatGPTAccount(account) {
   if (!account) return null;
   return {
     id: account.id, state: account.state, paused: account.paused === true, priority: account.priority,
-    ...(account.label ? { label: account.label } : {}), ...(account.createdAt ? { createdAt: account.createdAt } : {}),
+    ...(account.label ? { label: account.label } : {}),
+    ...(account.labelCustom === true && account.label ? { labelCustom: true } : {}),
+    ...(account.createdAt ? { createdAt: account.createdAt } : {}),
     ...(account.subscription ? { subscription: { ...account.subscription } } : {}),
     health: { ...account.health, ...(account.health?.lastError ? { lastError: "[redacted]" } : {}) }, turns: account.turns, requests: account.requests,
   };

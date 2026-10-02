@@ -517,8 +517,13 @@ const bridgeSource = String.raw`
       if (!account) throw new Error("Account id is not registered.");
       const trimmed = String(label).trim();
       if (trimmed.length > 120 || trimmed.includes("\u0000")) throw new Error("Account label is invalid.");
-      if (trimmed) account.label = trimmed;
-      else delete account.label;
+      if (trimmed) {
+        account.label = trimmed;
+        account.labelCustom = true;
+      } else {
+        delete account.label;
+        delete account.labelCustom;
+      }
       return { account };
     },
     addChatGptSubscriptionAccount: async (label = "") => {
@@ -1059,7 +1064,7 @@ test("the production renderer exposes model discovery and picker actions", { tim
     assert.equal(await primaryRow.count(), 1, "primary email should stay visible beside its label");
     await readySecondary.getByRole("button", { name: "Rename ChatGPT account: Secondary account", exact: true }).click();
     await page.getByRole("textbox", { name: "ChatGPT account label", exact: true }).fill("  Work laptop  ");
-    await page.getByRole("button", { name: "Save label", exact: true }).click();
+    await page.getByRole("textbox", { name: "ChatGPT account label", exact: true }).press("Enter");
     const renamed = accountRows.filter({ hasText: "Work laptop" });
     await renamed.waitFor();
     assert.match(await renamed.innerText(), /secondary@example.com/);
@@ -1069,13 +1074,26 @@ test("the production renderer exposes model discovery and picker actions", { tim
       && call.args[1] === "  Work laptop  "
     ))), true);
     await renamed.getByRole("button", { name: "Rename ChatGPT account: Work laptop", exact: true }).click();
+    await page.getByRole("textbox", { name: "ChatGPT account label", exact: true }).fill("ChatGPT account 2");
+    await page.getByRole("textbox", { name: "ChatGPT account label", exact: true }).press("Enter");
+    const patterned = accountRows.filter({ hasText: "secondary@example.com" });
+    await patterned.getByRole("button", { name: "Selected ChatGPT account: ChatGPT account 2", exact: true }).waitFor();
+    assert.match(await patterned.innerText(), /secondary@example.com/);
+    await patterned.getByRole("button", { name: "Rename ChatGPT account: ChatGPT account 2", exact: true }).click();
+    await page.getByRole("textbox", { name: "ChatGPT account label", exact: true }).fill("not saved");
+    await page.keyboard.press("Escape");
+    await page.getByRole("dialog").waitFor({ state: "hidden" });
+    assert.equal(await page.evaluate(() => window.routerControlTest.calls().some((call) => (
+      call.name === "renameChatGptSubscriptionAccount" && call.args[1] === "not saved"
+    ))), false);
+    await patterned.getByRole("button", { name: "Rename ChatGPT account: ChatGPT account 2", exact: true }).click();
     await page.getByRole("textbox", { name: "ChatGPT account label", exact: true }).fill("   ");
     await page.getByRole("button", { name: "Save label", exact: true }).click();
     await page.waitForFunction(() => {
       const row = [...document.querySelectorAll(".subscription-account-row")]
         .find((node) => (node.textContent || "").includes("secondary@example.com"));
       const text = row?.textContent || "";
-      return Boolean(row) && !text.includes("Work laptop") && !text.includes("Secondary account");
+      return Boolean(row) && !text.includes("Work laptop") && !text.includes("Secondary account") && !text.includes("ChatGPT account 2");
     });
     await page.getByRole("button", { name: "Select ChatGPT account: Current account", exact: true }).click();
     await page.waitForFunction(() => window.routerControlTest.calls()

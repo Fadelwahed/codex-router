@@ -39,7 +39,12 @@ function automaticAccountLabel(label: string): boolean {
 function accountRowIdentity(account: ChatGptSubscriptionAccount, fallback: string): { title: string; prefix: string; editableLabel: string } {
   const email = account.subscription?.email?.trim() || "";
   const stored = account.label?.trim() || "";
-  const custom = stored && !automaticAccountLabel(stored) ? stored : "";
+  // A label the operator typed is the row title even when it matches the
+  // generated "ChatGPT account N" pattern. An untouched generated label has
+  // no labelCustom flag and still yields the email.
+  const custom = account.labelCustom === true
+    ? stored
+    : stored && !automaticAccountLabel(stored) ? stored : "";
   return {
     title: custom || email || stored || fallback,
     prefix: custom && email && custom !== email ? `${email} · ` : !custom && email && stored ? `${stored} · ` : "",
@@ -746,23 +751,26 @@ export function SettingsPage({ target, health, presence, chatgptSession, account
         description={t("settings.accounts.renameDescription")}
         onClose={() => setRenameAccountId(null)}
       >
-        <input
-          aria-label={t("settings.accounts.renameInputAria")}
-          value={renameDraft}
-          maxLength={120}
-          placeholder={t("settings.accounts.renamePlaceholder")}
-          onChange={(event) => setRenameDraft(event.target.value)}
-        />
-        <p className="dialog-copy">{t("settings.accounts.renameHint")}</p>
-        <div className="dialog-actions">
-          <Button variant="secondary" onClick={() => setRenameAccountId(null)}>{t("settings.accounts.removeCancel")}</Button>
-          <Button variant="primary" disabled={!api || !renameAccountId} onClick={() => {
-            const id = renameAccountId;
-            const draft = renameDraft;
-            setRenameAccountId(null);
-            if (api && id) void runAction(t("settings.accounts.renameTitle"), () => api.renameChatGptSubscriptionAccount(id, draft));
-          }}>{t("settings.accounts.renameSave")}</Button>
-        </div>
+        <form onSubmit={(event) => {
+          event.preventDefault();
+          const id = renameAccountId;
+          const draft = renameDraft;
+          setRenameAccountId(null);
+          if (api && id) void runAction(t("settings.accounts.renameTitle"), () => api.renameChatGptSubscriptionAccount(id, draft));
+        }}>
+          <input
+            aria-label={t("settings.accounts.renameInputAria")}
+            value={renameDraft}
+            maxLength={120}
+            placeholder={t("settings.accounts.renamePlaceholder")}
+            onChange={(event) => setRenameDraft(event.target.value)}
+          />
+          <p className="dialog-copy">{t("settings.accounts.renameHint")}</p>
+          <div className="dialog-actions">
+            <Button type="button" variant="secondary" onClick={() => setRenameAccountId(null)}>{t("settings.accounts.removeCancel")}</Button>
+            <Button type="submit" variant="primary" disabled={!api || !renameAccountId}>{t("settings.accounts.renameSave")}</Button>
+          </div>
+        </form>
       </Dialog>
 
       <Dialog

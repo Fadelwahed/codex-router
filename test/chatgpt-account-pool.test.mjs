@@ -121,6 +121,31 @@ test("renaming an account label persists without changing its identity", () => {
   assert.equal(readChatGPTAccountPoolState(options.filePath).accounts[account.id].label, undefined);
 });
 
+test("a user-set label that matches the generated pattern stays marked as custom", () => {
+  const options = fixture();
+  const generated = createChatGPTSubscriptionAccount(options);
+  assert.equal(generated.label, "ChatGPT account 1");
+  assert.equal(generated.labelCustom, undefined);
+  assert.equal(readChatGPTAccountPoolState(options.filePath).accounts[generated.id].labelCustom, undefined);
+
+  const renamed = renameChatGPTSubscriptionAccount(generated.id, "ChatGPT account 2", options);
+  assert.equal(renamed.label, "ChatGPT account 2");
+  assert.equal(renamed.labelCustom, true);
+  const stored = readChatGPTAccountPoolState(options.filePath).accounts[generated.id];
+  assert.equal(stored.label, "ChatGPT account 2");
+  assert.equal(stored.labelCustom, true);
+
+  const cleared = renameChatGPTSubscriptionAccount(generated.id, "  ", options);
+  assert.equal(cleared.label, undefined);
+  assert.equal(cleared.labelCustom, undefined);
+  assert.equal(readChatGPTAccountPoolState(options.filePath).accounts[generated.id].labelCustom, undefined);
+
+  const explicit = createChatGPTSubscriptionAccount({ ...options, label: "  ChatGPT account 4  " });
+  assert.equal(explicit.label, "ChatGPT account 4");
+  assert.equal(explicit.labelCustom, true);
+  assert.equal(readChatGPTAccountPoolState(options.filePath).accounts[explicit.id].labelCustom, true);
+});
+
 test("account labels reuse the first free number after a removed account", () => {
   const options = fixture();
   const first = createChatGPTSubscriptionAccount(options);

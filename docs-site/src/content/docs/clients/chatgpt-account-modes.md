@@ -16,6 +16,8 @@ Each account keeps its own native model catalog and routed model overlay. Switch
 
 Control Center reads usage from up to eight saved, usable accounts' isolated `CODEX_HOME` directories, prioritizing the selected account. It shows the weekly window when OpenAI reports one, otherwise the monthly window. Returning to another account reloads that account's quota and reset time.
 
+A saved account can be given a display label so two rows with the same email can be told apart. The label is stored on the existing account record and does not change the account id or login. A label the operator sets is shown even when it matches the generated “ChatGPT account N” pattern; an untouched generated label still yields the email as the row title. Clearing a label shows the email again, and the email stays visible beside a custom label. Enter in the rename field saves it, and Escape cancels.
+
 # Token refresh
 
 Authenticated account profiles are checked for near-expiry access tokens. When a token is close to expiry, Codex Router runs the official Codex login-status refresh against that account's isolated `CODEX_HOME`, with a retry interval and no credential output. Refreshing one account does not replace another account's profile.
