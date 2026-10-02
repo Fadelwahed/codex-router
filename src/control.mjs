@@ -3573,12 +3573,23 @@ async function handleChatGptAccountSwitch(action, value, completionLease) {
     return;
   }
   if (action === "label") {
-    if (!value || !/^acct_[A-Za-z0-9_-]{8,80}$/.test(value)) throw new Error("Account id is invalid.");
-    const nextLabel = chatGPTAccountLabelInput(completionLease ?? "");
-    const account = await withChatGPTAccountPoolLock(
-      () => renameChatGPTSubscriptionAccount(value, nextLabel),
-    );
-    process.stdout.write(`${JSON.stringify({ account })}\n`);
+    try {
+      if (!value || !/^acct_[A-Za-z0-9_-]{8,80}$/.test(value)) throw new Error("Account id is invalid.");
+      const nextLabel = chatGPTAccountLabelInput(completionLease ?? "");
+      const account = await withChatGPTAccountPoolLock(
+        () => renameChatGPTSubscriptionAccount(value, nextLabel),
+      );
+      process.stdout.write(`${JSON.stringify({ account })}\n`);
+    } catch (error) {
+      const message = error instanceof Error && error.message
+        ? error.message
+        : "Account label could not be saved.";
+      process.stderr.write(`${message}\n`);
+      if (process.env.DEBUG && error instanceof Error && error.stack) {
+        process.stderr.write(`${error.stack}\n`);
+      }
+      process.exit(1);
+    }
     return;
   }
   if (action === "home") {

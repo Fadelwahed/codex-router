@@ -10,6 +10,59 @@ export const ACCOUNT_LABEL_COLLISION = "Account label matches another account.";
 // Controls, line separators, and bidi overrides/isolates. A label is a display
 // name, so these can only spoof the row (RLO) or break the layout.
 const FORBIDDEN_LABEL_CHARACTERS = /[\u0000-\u001F\u007F-\u009F\u2028\u2029\u202A-\u202E\u2066-\u2069]/;
+// Electron's ipcMain rejection prefixes the message the handler threw.
+const REMOTE_METHOD_ERROR = /^Error invoking remote method 'router-control:[^']+': Error:\s*/;
+
+export function visibleRemoteError(message) {
+  return String(message ?? "").replace(REMOTE_METHOD_ERROR, "");
+}
+
+export function accountLabelRejection(message) {
+  const text = visibleRemoteError(message);
+  if (text === ACCOUNT_LABEL_FORBIDDEN) return "forbidden";
+  if (text === ACCOUNT_LABEL_TOO_LONG) return "too-long";
+  if (text === ACCOUNT_LABEL_COLLISION) return "collision";
+  if (text === ACCOUNT_LABEL_INVALID) return "invalid";
+  return "";
+}
+
+export function canonicalAccountLabel(label) {
+  return String(label ?? "").normalize("NFKC").replace(/\s+/g, " ").trim().toLowerCase();
+}
+
+// "ChatGPT account 1", "chatgpt  account  1", and full-width "１" are one name.
+export function generatedAccountNumber(label) {
+  const match = /^chatgpt account (\d+)$/.exec(canonicalAccountLabel(label));
+  if (!match) return undefined;
+  const number = Number(match[1]);
+  if (!Number.isSafeInteger(number) || number < 1) return undefined;
+  return number;
+}
+
+export function accountLabelIsUnsafe(value) {
+  const text = String(value ?? "");
+  return FORBIDDEN_LABEL_CHARACTERS.test(text) || accountLabelHasLoneSurrogate(text);
+}
+
+export function stripUnsafeAccountLabel(value) {
+  const text = String(value ?? "");
+  let cleaned = "";
+  for (let index = 0; index < text.length; index += 1) {
+    const code = text.charCodeAt(index);
+    if (code >= 0xD800 && code <= 0xDBFF) {
+      const next = text.charCodeAt(index + 1);
+      if (next >= 0xDC00 && next <= 0xDFFF) {
+        cleaned += text[index] + text[index + 1];
+        index += 1;
+      }
+      continue;
+    }
+    if (code >= 0xDC00 && code <= 0xDFFF) continue;
+    if (FORBIDDEN_LABEL_CHARACTERS.test(text[index])) continue;
+    cleaned += text[index];
+  }
+  return cleaned;
+}
 
 export function accountLabelHasLoneSurrogate(value) {
   const text = String(value);

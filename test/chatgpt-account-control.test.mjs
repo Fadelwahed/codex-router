@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawnSync } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync as rawWriteFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -122,6 +122,23 @@ test("a renamed ChatGPT account label persists across a new control process", ()
       (error) => /not registered/.test(stderrOf(error)),
     );
     assert.equal(runIsolated("chatgpt-account-pool", "status").accounts[added.id].label, "ChatGPT account 1");
+    const quietEnv = { ...isolatedEnv };
+    delete quietEnv.DEBUG;
+    const failed = spawnSync(process.execPath, [path.join(root, "src/control.mjs"), "chatgpt-account-pool", "label", added.id, "x".repeat(121)], {
+      env: quietEnv,
+      encoding: "utf8",
+    });
+    assert.notEqual(failed.status, 0);
+    const lines = String(failed.stderr || "").split(/\r?\n/).filter((line) => line.length > 0);
+    assert.deepEqual(lines, ["Account label is limited to 120 characters."]);
+    const debugEnv = { ...quietEnv, DEBUG: "1" };
+    const traced = spawnSync(process.execPath, [path.join(root, "src/control.mjs"), "chatgpt-account-pool", "label", added.id, "user\u202Eexe.txt"], {
+      env: debugEnv,
+      encoding: "utf8",
+    });
+    assert.notEqual(traced.status, 0);
+    assert.match(String(traced.stderr || ""), /Account label contains characters that are not allowed/);
+    assert.match(String(traced.stderr || ""), /\n\s+at /);
   } finally {
     rmSync(isolated, { recursive: true, force: true });
   }

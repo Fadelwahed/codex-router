@@ -37,7 +37,7 @@ const bridgeSource = String.raw`
   const staleAccountFailure = searchParams.get("staleAccountFailure") === "1";
   const staleProviderUsage = searchParams.get("staleProviderUsage") === "1";
   const fallbackUsage = searchParams.get("fallbackUsage") === "1";
-  const renameFails = searchParams.get("renameFails") === "1";
+  const renameFails = searchParams.get("renameFails") || "";
   const longAccountLabel = searchParams.get("longAccountLabel") === "1";
   const duplicateEmail = searchParams.get("duplicateEmail") === "1";
   const duplicateTitle = searchParams.get("duplicateTitle") === "1";
@@ -551,7 +551,16 @@ const bridgeSource = String.raw`
     },
     renameChatGptSubscriptionAccount: async (accountId, label = "") => {
       record("renameChatGptSubscriptionAccount", accountId, label);
-      if (renameFails) throw new Error("ENOSPC: no space left on device");
+      if (renameFails === "1") throw new Error("ENOSPC: no space left on device");
+      if (renameFails === "ipc") {
+        throw new Error("Error invoking remote method 'router-control:renameChatGptSubscriptionAccount': Error: Account label contains characters that are not allowed.");
+      }
+      if (renameFails === "ipc-collision") {
+        throw new Error("Error invoking remote method 'router-control:renameChatGptSubscriptionAccount': Error: Account label matches another account.");
+      }
+      if (renameFails === "ipc-long") {
+        throw new Error("Error invoking remote method 'router-control:renameChatGptSubscriptionAccount': Error: Account label is limited to 120 characters.");
+      }
       const account = accountPoolState.accounts[accountId];
       if (!account) throw new Error("Account id is not registered.");
       const raw = String(label);
@@ -579,9 +588,17 @@ const bridgeSource = String.raw`
       }
       if (graphemes > 120) throw new Error("Account label is limited to 120 characters.");
       const generated = /^ChatGPT account (\d+)$/;
+      const canonicalLabel = (value) => String(value || "").normalize("NFKC").replace(/\s+/g, " ").trim().toLowerCase();
+      const generatedNumber = (value) => {
+        const match = /^chatgpt account (\d+)$/.exec(canonicalLabel(value));
+        if (!match) return undefined;
+        const number = Number(match[1]);
+        return Number.isSafeInteger(number) && number >= 1 ? number : undefined;
+      };
       if (trimmed) {
-        const collision = generated.test(trimmed) && Object.values(accountPoolState.accounts).some((entry) => (
-          entry && entry.id !== accountId && entry.state !== "revoked" && String(entry.label || "").trim() === trimmed
+        const wanted = generatedNumber(trimmed);
+        const collision = wanted !== undefined && Object.values(accountPoolState.accounts).some((entry) => (
+          entry && entry.id !== accountId && entry.state !== "revoked" && generatedNumber(entry.label) === wanted
         ));
         if (collision) throw new Error("Account label matches another account.");
         account.label = trimmed;
@@ -589,16 +606,14 @@ const bridgeSource = String.raw`
       } else if (account.labelCustom === true || !generated.test(String(account.label || ""))) {
         delete account.labelCustom;
         delete account.label;
-        const used = new Set(Object.values(accountPoolState.accounts).filter((entry) => entry && entry.state !== "revoked").map((entry) => {
-          const match = generated.exec(String(entry.label || ""));
-          return match ? Number(match[1]) : undefined;
-        }).filter((value) => Number.isInteger(value)));
+        const used = new Set(Object.values(accountPoolState.accounts).filter((entry) => entry && entry.state !== "revoked").map((entry) => generatedNumber(entry.label)).filter((value) => Number.isInteger(value)));
         let numberValue = 1;
         while (used.has(numberValue)) numberValue += 1;
         account.label = "ChatGPT account " + numberValue;
       } else {
         delete account.labelCustom;
       }
+      if (accountMutationDelayMs > 0) await new Promise((resolve) => setTimeout(resolve, accountMutationDelayMs));
       return { account };
     },
     addChatGptSubscriptionAccount: async (label = "") => {
@@ -1403,15 +1418,10 @@ test("the production renderer exposes model discovery and picker actions", { tim
 
 test("ChatGPT account rows stay in the card and label edits are guarded", { timeout: 180_000 }, async () => {
   assert.ok(chromiumPath, "No Chromium executable is available for the Control Center renderer test.");
-  const { url, close } = await serveRenderer();
-  const browser = await chromium.launch({
-    executablePath: chromiumPath,
-    headless: true,
-    args: process.platform === "linux" ? ["--no-sandbox"] : [],
-  });
+  let browser;
+  let close;
   const longLabel = "Very long account label that keeps going and going and going and going and going and going and going and going";
-  const artifactDir = "/opt/cursor/artifacts/chatgpt-account-rows";
-  mkdirSync(artifactDir, { recursive: true });
+  const artifactRoot = process.env.CODEX_ROUTER_UI_ARTIFACTS;
   const inside = (inner, outer) => inner
     && outer
     && inner.x >= outer.x - 1
@@ -1425,6 +1435,16 @@ test("ChatGPT account rows stay in the card and label edits are guarded", { time
     return width > 1 && height > 1;
   };
   try {
+    const served = await serveRenderer();
+    close = served.close;
+    const { url } = served;
+    browser = await chromium.launch({
+      executablePath: chromiumPath,
+      headless: true,
+      args: process.platform === "linux" ? ["--no-sandbox"] : [],
+    });
+    const artifactDir = artifactRoot ? path.join(artifactRoot, "chatgpt-account-rows") : "";
+    if (artifactDir) mkdirSync(artifactDir, { recursive: true });
     const page = await newEnglishTestPage(browser, { viewport: { width: 1280, height: 760 } });
     page.setDefaultTimeout(10_000);
     await page.goto(`${url}?longAccountLabel=1`, { waitUntil: "domcontentloaded" });
@@ -1440,7 +1460,7 @@ test("ChatGPT account rows stay in the card and label edits are guarded", { time
     for (const [width, height] of sizes) {
       await page.setViewportSize({ width, height });
       await accounts.scrollIntoViewIfNeeded();
-      await page.screenshot({ path: path.join(artifactDir, `${width}x${height}.png`) });
+      if (artifactDir) await page.screenshot({ path: path.join(artifactDir, `${width}x${height}.png`) });
       const accountBox = await accounts.boundingBox();
       const desktopBox = await desktop.boundingBox();
       assert.ok(accountBox, `${width}x${height} account card`);
@@ -1480,6 +1500,17 @@ test("ChatGPT account rows stay in the card and label edits are guarded", { time
     await emailPage.getByRole("button", { name: "Save label", exact: true }).click();
     await emailPage.getByRole("alert").filter({ hasText: "Account label matches another account." }).waitFor();
     assert.equal(await emailPage.getByRole("dialog").count(), 1);
+    assert.equal(
+      await emailPage.evaluate(() => window.routerControlTest.calls()
+        .filter((call) => call.name === "renameChatGptSubscriptionAccount").length),
+      beforeCollision,
+    );
+    const lookalikes = ["chatgpt account 1", "ChatGPT  account  1", "ChatGPT account \uFF11"];
+    for (const lookalike of lookalikes) {
+      await emailPage.getByRole("textbox", { name: "ChatGPT account label", exact: true }).fill(lookalike);
+      await emailPage.getByRole("button", { name: "Save label", exact: true }).click();
+      await emailPage.getByRole("alert").filter({ hasText: "Account label matches another account." }).waitFor();
+    }
     assert.equal(
       await emailPage.evaluate(() => window.routerControlTest.calls()
         .filter((call) => call.name === "renameChatGptSubscriptionAccount").length),
@@ -1566,9 +1597,53 @@ test("ChatGPT account rows stay in the card and label edits are guarded", { time
       beforeForbidden,
     );
     await forbiddenPage.close();
+
+    const pendingPage = await newEnglishTestPage(browser, { viewport: { width: 1280, height: 840 } });
+    pendingPage.setDefaultTimeout(10_000);
+    await pendingPage.goto(`${url}?accountMutationDelayMs=800`, { waitUntil: "domcontentloaded" });
+    await pendingPage.getByRole("button", { name: "Settings", exact: true }).click();
+    await pendingPage.locator(".subscription-account-row").filter({ hasText: "Secondary account" })
+      .getByRole("button", { name: "Rename ChatGPT account: Secondary account", exact: true }).click();
+    await pendingPage.getByRole("textbox", { name: "ChatGPT account label", exact: true }).fill("Pending save");
+    const saveLabel = pendingPage.getByRole("button", { name: "Save label", exact: true });
+    await saveLabel.click();
+    await pendingPage.waitForFunction(() => {
+      const button = [...document.querySelectorAll("button")].find((element) => element.textContent?.trim() === "Save label");
+      return button instanceof HTMLButtonElement && button.disabled && button.getAttribute("aria-busy") === "true";
+    });
+    await pendingPage.getByRole("dialog").waitFor({ state: "hidden" });
+    await pendingPage.close();
+
+    const localized = [
+      ["en", "ipc", "Account label contains characters that are not allowed."],
+      ["zh-CN", "ipc-collision", "账户名称与另一个账户重复。"],
+      ["zh-TW", "ipc-long", "帳號標籤最多 120 個字元。"],
+    ];
+    for (const [language, mode, expected] of localized) {
+      const localePage = await newEnglishTestPage(browser, { viewport: { width: 1280, height: 840 } });
+      localePage.setDefaultTimeout(10_000);
+      await localePage.goto(`${url}?renameFails=${mode}`, { waitUntil: "domcontentloaded" });
+      await localePage.getByRole("button", { name: "Settings", exact: true }).click();
+      if (language !== "en") {
+        await localePage.getByRole("combobox", { name: "Interface language" }).selectOption(language);
+      }
+      const renameName = language === "zh-CN"
+        ? "重命名 ChatGPT 账户：Secondary account"
+        : language === "zh-TW"
+          ? "重新命名 ChatGPT 帳號：Secondary account"
+          : "Rename ChatGPT account: Secondary account";
+      const saveName = language === "zh-CN" ? "保存名称" : language === "zh-TW" ? "儲存標籤" : "Save label";
+      await localePage.locator(".subscription-account-row").filter({ hasText: "Secondary account" })
+        .getByRole("button", { name: renameName, exact: true }).click();
+      await localePage.getByRole("button", { name: saveName, exact: true }).click();
+      await localePage.getByRole("alert").filter({ hasText: expected }).waitFor();
+      assert.equal(await localePage.getByText("Error invoking remote method").count(), 0);
+      assert.equal(await localePage.getByRole("dialog").count(), 1);
+      await localePage.close();
+    }
   } finally {
-    await browser.close();
-    await close();
+    await browser?.close();
+    await close?.();
   }
 });
 

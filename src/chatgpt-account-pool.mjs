@@ -21,8 +21,11 @@ import {
 import { ensureNoSymlinkParents } from "./path-security.mjs";
 import {
   ACCOUNT_LABEL_COLLISION,
+  accountLabelIsUnsafe,
   assertAccountLabelText,
+  generatedAccountNumber,
   sliceAccountLabel,
+  stripUnsafeAccountLabel,
 } from "./account-label-text.mjs";
 
 export const CHATGPT_ACCOUNT_POOL_SCHEMA_VERSION = 1;
@@ -132,18 +135,30 @@ function normalizeSubscription(raw) {
     ...(raw.usage && typeof raw.usage === "object" ? { usage: { ...raw.usage } } : {}),
   };
 }
-function normalizeAccount(raw, id) {
+function readAccountLabel(rawLabel, needsGeneratedName, id) {
+  const raw = text(rawLabel);
+  if (!raw) return "";
+  if (!accountLabelIsUnsafe(raw)) return sliceAccountLabel(raw);
+  const stripped = stripUnsafeAccountLabel(raw).trim();
+  if (!stripped) {
+    needsGeneratedName?.add(id);
+    return "";
+  }
+  return sliceAccountLabel(stripped);
+}
+function normalizeAccount(raw, id, needsGeneratedName) {
   if (!raw || typeof raw !== "object" || Array.isArray(raw)) return undefined;
   const state = ["active", "paused", "revoked"].includes(raw.state) ? raw.state : "active";
   const identity = normalizeIdentity(raw.identity);
   const subscription = normalizeSubscription(raw.subscription);
+  const label = readAccountLabel(raw.label, needsGeneratedName, id);
   return {
     id,
     state,
     paused: raw.paused === true,
     priority: integer(raw.priority, 50, { min: 0, max: 100_000 }),
-    ...(text(raw.label) ? { label: sliceAccountLabel(text(raw.label)) } : {}),
-    ...(raw.labelCustom === true && text(raw.label) ? { labelCustom: true } : {}),
+    ...(label ? { label } : {}),
+    ...(raw.labelCustom === true && label ? { labelCustom: true } : {}),
     ...(iso(raw.createdAt) ? { createdAt: iso(raw.createdAt) } : {}),
     ...(identity ? { identity } : {}),
     ...(subscription ? { subscription } : {}),
@@ -210,10 +225,17 @@ function normalizeState(raw) {
   const result = emptyState();
   if (!raw || typeof raw !== "object" || Array.isArray(raw)) return result;
   result.policy = normalizePolicy(raw.policy);
+  const needsGeneratedName = new Set();
   for (const [id, value] of Object.entries(raw.accounts || {}).slice(0, MAX_ACCOUNTS)) {
     if (!ACCOUNT_ID.test(id)) continue;
-    const account = normalizeAccount(value, id);
+    const account = normalizeAccount(value, id, needsGeneratedName);
     if (account) result.accounts[id] = account;
+  }
+  for (const id of needsGeneratedName) {
+    const account = result.accounts[id];
+    if (!account || account.state === "revoked") continue;
+    delete account.labelCustom;
+    account.label = nextAccountLabel(result);
   }
   return result;
 }
@@ -282,23 +304,43 @@ function ensurePrivateAccountDirectory(target, homesDir) {
 const GENERATED_ACCOUNT_LABEL = /^ChatGPT account (\d+)$/;
 
 function nextAccountLabel(state) {
-  const used = new Set(Object.values(state.accounts).filter((account) => account?.state !== "revoked").map((account) => {
-    const match = GENERATED_ACCOUNT_LABEL.exec(account?.label || "");
-    return match ? Number(match[1]) : undefined;
-  }).filter(Number.isInteger));
+  const used = new Set();
+  for (const account of Object.values(state.accounts)) {
+    if (!account || account.state === "revoked") continue;
+    const number = generatedAccountNumber(account.label || "");
+    if (number !== undefined) used.add(number);
+  }
   let numberValue = 1;
   while (used.has(numberValue)) numberValue += 1;
   return `ChatGPT account ${numberValue}`;
 }
 
 function generatedLabelCollides(state, label, selfId) {
-  if (!GENERATED_ACCOUNT_LABEL.test(label)) return false;
+  const number = generatedAccountNumber(label);
+  if (number === undefined) return false;
   return Object.values(state.accounts).some((account) => (
     account
     && account.id !== selfId
     && account.state !== "revoked"
-    && account.label === label
+    && generatedAccountNumber(account.label) === number
   ));
+}
+
+function repairDisplayedGeneratedLabels(accounts) {
+  const used = new Set();
+  for (const account of Object.values(accounts)) {
+    if (!account || account.state === "revoked") continue;
+    const number = generatedAccountNumber(account.label || "");
+    if (number === undefined || !used.has(number)) {
+      if (number !== undefined) used.add(number);
+      continue;
+    }
+    let next = 1;
+    while (used.has(next)) next += 1;
+    used.add(next);
+    account.label = `ChatGPT account ${next}`;
+    delete account.labelCustom;
+  }
 }
 
 // Empty input clears a custom label only. A generated "ChatGPT account N"
@@ -750,9 +792,11 @@ export function sanitizeChatGPTAccount(account) {
 }
 export function sanitizeChatGPTAccountPool(state) {
   const normalized = normalizeState(state);
+  const accounts = Object.fromEntries(Object.entries(normalized.accounts).map(([id, account]) => [id, sanitizeChatGPTAccount(account)]));
+  repairDisplayedGeneratedLabels(accounts);
   return {
     version: CHATGPT_ACCOUNT_POOL_SCHEMA_VERSION, policy: { ...normalized.policy },
-    accounts: Object.fromEntries(Object.entries(normalized.accounts).map(([id, account]) => [id, sanitizeChatGPTAccount(account)])), sessions: {},
+    accounts, sessions: {},
   };
 }
 export async function withChatGPTAccountPoolLock(operation, { filePath = CHATGPT_ACCOUNT_POOL_PATH, waitMs = 120_000, retryMs = 25, staleMs = 10 * 60_000 } = {}) {

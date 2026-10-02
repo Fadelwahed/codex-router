@@ -1,14 +1,13 @@
 import { backendText } from "../backend-text";
 import { useEffect, useId, useMemo, useRef, useState } from "react";
 import {
-  ACCOUNT_LABEL_COLLISION,
-  ACCOUNT_LABEL_FORBIDDEN,
-  ACCOUNT_LABEL_INVALID,
   ACCOUNT_LABEL_LIMIT,
-  ACCOUNT_LABEL_TOO_LONG,
   accountLabelGraphemeLength,
+  accountLabelRejection,
   assertAccountLabelText,
+  generatedAccountNumber,
   sliceAccountLabel,
+  visibleRemoteError,
 } from "../../../../src/account-label-text.mjs";
 import { AppWindow, Check, Eye, LogIn, Moon, Pencil, Plus, RefreshCw, Server, ShieldCheck, Sun, Trash2, UserRound, Wrench } from "lucide-react";
 import { Badge, Button, Dialog, InlineNotice, PageHeader, SectionHeading, Toggle } from "../components";
@@ -86,11 +85,12 @@ function AccountLabelControl({ label, value, placeholder, onValue, t, selectOnFo
 
 function accountLabelErrorText(error: unknown, t: Translate): string {
   const message = error instanceof Error ? error.message : String(error ?? "");
-  if (message === ACCOUNT_LABEL_FORBIDDEN) return t("settings.accounts.labelForbidden");
-  if (message === ACCOUNT_LABEL_TOO_LONG) return t("settings.accounts.labelTooLong");
-  if (message === ACCOUNT_LABEL_COLLISION) return t("settings.accounts.labelCollision");
-  if (message === ACCOUNT_LABEL_INVALID) return t("settings.accounts.labelInvalid");
-  return message;
+  const rejection = accountLabelRejection(message);
+  if (rejection === "forbidden") return t("settings.accounts.labelForbidden");
+  if (rejection === "too-long") return t("settings.accounts.labelTooLong");
+  if (rejection === "collision") return t("settings.accounts.labelCollision");
+  if (rejection === "invalid") return t("settings.accounts.labelInvalid");
+  return visibleRemoteError(message);
 }
 
 type AccountOverlay =
@@ -106,11 +106,12 @@ function automaticAccountLabel(label: string): boolean {
 }
 
 function generatedLabelCollides(label: string, accounts: ChatGptSubscriptionAccount[], selfId: string): boolean {
-  if (!automaticAccountLabel(label)) return false;
+  const number = generatedAccountNumber(label);
+  if (number === undefined) return false;
   return accounts.some((account) => (
     account.id !== selfId
     && account.state !== "revoked"
-    && (account.label || "").trim() === label
+    && generatedAccountNumber(account.label || "") === number
   ));
 }
 
@@ -250,6 +251,7 @@ export function SettingsPage({ target, health, presence, chatgptSession, account
   const [renameAccountId, setRenameAccountId] = useState<string | null>(null);
   const [renameDraft, setRenameDraft] = useState("");
   const [renameError, setRenameError] = useState<string | null>(null);
+  const [renamePending, setRenamePending] = useState(false);
   const renameSubmitLock = useRef(false);
   const [loginPendingId, setLoginPendingId] = useState<string | null>(null);
   const [loginRetryingId, setLoginRetryingId] = useState<string | null>(null);
@@ -945,6 +947,7 @@ export function SettingsPage({ target, health, presence, chatgptSession, account
             return;
           }
           renameSubmitLock.current = true;
+          setRenamePending(true);
           void (async () => {
             try {
               await api.renameChatGptSubscriptionAccount(id, draft);
@@ -955,6 +958,7 @@ export function SettingsPage({ target, health, presence, chatgptSession, account
               setRenameError(accountLabelErrorText(error, t));
             } finally {
               renameSubmitLock.current = false;
+              setRenamePending(false);
             }
           })();
         }}>
@@ -976,7 +980,7 @@ export function SettingsPage({ target, health, presence, chatgptSession, account
               setRenameAccountId(null);
               setRenameError(null);
             }}>{t("settings.accounts.removeCancel")}</Button>
-            <Button type="submit" variant="primary" disabled={!api || !renameAccountId}>{t("settings.accounts.renameSave")}</Button>
+            <Button type="submit" variant="primary" disabled={!api || !renameAccountId || renamePending} aria-busy={renamePending || undefined}>{t("settings.accounts.renameSave")}</Button>
           </div>
         </form>
       </Dialog>
