@@ -1105,6 +1105,8 @@ export const zhTW = {
   "settings.accounts.defaultTitle": "ChatGPT 帳號",
   "settings.accounts.savingAccount": "儲存帳號中",
   "settings.accounts.remaining": "{period} · 剩餘 {percent}%",
+  "settings.accounts.windowHours": "{hours} 小時",
+  "settings.accounts.windowMinutes": "{minutes} 分鐘",
   "settings.accounts.usageUnavailable": "用量無法取得",
   "settings.accounts.tokenHours": " · {hours} 小時 token",
   "settings.accounts.select": "選取",

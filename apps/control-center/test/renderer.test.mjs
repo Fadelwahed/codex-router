@@ -231,7 +231,7 @@ const bridgeSource = String.raw`
     policy: { enabled: true, mode: "switch", selectedAccountId: "active" },
     accounts: {
       revoked: { id: "revoked", state: "revoked", paused: true, priority: 50, label: "Removed account", health: { state: "healthy" }, turns: 0, requests: 0 },
-      active: { id: "active", state: "active", paused: false, priority: 50, label: "Secondary account", subscription: { status: "usable", authenticated: true, usable: true, expired: false, email: "secondary@example.com" }, health: { state: "healthy" }, turns: 0, requests: 0 },
+      active: { id: "active", state: "active", paused: false, priority: 50, label: "Secondary account", subscription: { status: "usable", authenticated: true, usable: true, expired: false, email: "secondary@example.com", usage: { period: "weekly", remainingPercent: 70, windowDurationMins: 10080, planType: "plus", also: { period: "current", remainingPercent: 12, windowDurationMins: 300, resetsAt: 1700000000 } } }, health: { state: "healthy" }, turns: 0, requests: 0 },
       current: { id: "current", state: "active", paused: false, priority: 50, label: "Current account", subscription: terminalLoginFailure || loginStaysPending ? { status: "invalid", authenticated: false, usable: false, expired: false, email: "primary@example.com" } : { status: "usable", authenticated: true, usable: true, expired: false, email: "primary@example.com" }, health: { state: "healthy" }, turns: 0, requests: 0 },
     },
     get loginAttempts() {
@@ -1045,6 +1045,11 @@ test("the production renderer exposes model discovery and picker actions", { tim
     assert.equal(await accountRows.filter({ hasText: "secondary@example.com" }).count(), 1, "secondary email should be visible");
     const readySecondary = accountRows.filter({ hasText: "Secondary account" });
     assert.equal(await readySecondary.getByRole("button", { name: "Login", exact: true }).isDisabled(), true, "ready accounts cannot start a duplicate login");
+    const secondaryText = await readySecondary.innerText();
+    assert.match(secondaryText, /weekly · 70% remaining/);
+    assert.match(secondaryText, /5h · 12% remaining/);
+    assert.match(secondaryText, /Ready/);
+    assert.match(secondaryText, /Selected/);
     await page.getByRole("button", { name: "Select ChatGPT account: primary@example.com", exact: true }).click();
     await page.waitForFunction(() => window.routerControlTest.calls()
       .some((call) => call.name === "setChatGptAccountSelection" && call.args[0] === "current"));

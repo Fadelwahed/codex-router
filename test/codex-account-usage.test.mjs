@@ -119,7 +119,105 @@ test("weekly and monthly account usage windows are classified disjointly", async
       : { primary: { windowDurationMins: 30 * 24 * 60, remainingPercent: 30 } },
   });
   assert.equal(accounts.acct_weekly_0001.subscription.usage.period, "weekly");
+  assert.equal(accounts.acct_weekly_0001.subscription.usage.also, undefined);
   assert.equal(accounts.acct_monthly_001.subscription.usage.period, "monthly");
+  assert.equal(accounts.acct_monthly_001.subscription.usage.also, undefined);
+});
+
+test("a second rate-limit window is kept beside the weekly primary line", async () => {
+  const accounts = {
+    acct_both_000001: { id: "acct_both_000001", subscription: { usable: true } },
+  };
+  const pool = { policy: { selectedAccountId: "acct_both_000001" }, accounts };
+  await attachBoundedChatGPTAccountUsage(pool, {
+    accountHome: (id) => `/isolated/${id}`,
+    readUsage: async () => ({
+      planType: "plus",
+      primary: { windowDurationMins: 300, remainingPercent: 12, resetsAt: 1_700_000_000 },
+      secondary: { windowDurationMins: 7 * 24 * 60, remainingPercent: 70, resetsAt: 1_800_000_000 },
+    }),
+  });
+  assert.equal(pool.policy.selectedAccountId, "acct_both_000001");
+  assert.deepEqual(accounts.acct_both_000001.subscription.usage, {
+    period: "weekly",
+    remainingPercent: 70,
+    windowDurationMins: 7 * 24 * 60,
+    resetsAt: 1_800_000_000,
+    planType: "plus",
+    also: {
+      period: "current",
+      remainingPercent: 12,
+      windowDurationMins: 300,
+      resetsAt: 1_700_000_000,
+    },
+  });
+});
+
+test("same-class windows and a missing plan type add nothing beside the primary line", async () => {
+  const accounts = {
+    acct_same_000001: { id: "acct_same_000001", subscription: { usable: true } },
+    acct_month_00001: { id: "acct_month_00001", subscription: { usable: true } },
+  };
+  await attachBoundedChatGPTAccountUsage({ accounts }, {
+    accountHome: (id) => `/isolated/${id}`,
+    readUsage: async ({ codexHome }) => path.basename(codexHome) === "acct_same_000001"
+      ? {
+          planType: null,
+          primary: { windowDurationMins: 7 * 24 * 60, remainingPercent: 80 },
+          secondary: { windowDurationMins: 10 * 24 * 60, remainingPercent: 10 },
+        }
+      : {
+          primary: { windowDurationMins: 30 * 24 * 60, remainingPercent: 40, resetsAt: 1_900_000_000 },
+          secondary: { windowDurationMins: 7 * 24 * 60, remainingPercent: 55 },
+        },
+  });
+  assert.equal(accounts.acct_same_000001.subscription.usage.period, "weekly");
+  assert.equal(accounts.acct_same_000001.subscription.usage.remainingPercent, 80);
+  assert.equal(accounts.acct_same_000001.subscription.usage.also, undefined);
+  assert.equal(Object.hasOwn(accounts.acct_same_000001.subscription.usage, "planType"), false);
+  assert.deepEqual(accounts.acct_month_00001.subscription.usage, {
+    period: "weekly",
+    remainingPercent: 55,
+    windowDurationMins: 7 * 24 * 60,
+    also: {
+      period: "monthly",
+      remainingPercent: 40,
+      windowDurationMins: 30 * 24 * 60,
+      resetsAt: 1_900_000_000,
+    },
+  });
+});
+
+test("a drained short window does not replace the weekly line or the selected account", async () => {
+  const accounts = {
+    acct_drain_00001: { id: "acct_drain_00001", subscription: { usable: true } },
+  };
+  const pool = {
+    policy: { enabled: true, mode: "switch", selectedAccountId: "acct_drain_00001" },
+    accounts,
+  };
+  await attachBoundedChatGPTAccountUsage(pool, {
+    accountHome: (id) => `/isolated/${id}`,
+    readUsage: async () => ({
+      planType: "",
+      primary: { windowDurationMins: 300, remainingPercent: 0 },
+      secondary: { windowDurationMins: 7 * 24 * 60, remainingPercent: 100 },
+    }),
+  });
+  assert.equal(pool.policy.selectedAccountId, "acct_drain_00001");
+  assert.equal(pool.policy.mode, "switch");
+  assert.equal(accounts.acct_drain_00001.subscription.usable, true);
+  assert.equal(accounts.acct_drain_00001.paused, undefined);
+  assert.deepEqual(accounts.acct_drain_00001.subscription.usage, {
+    period: "weekly",
+    remainingPercent: 100,
+    windowDurationMins: 7 * 24 * 60,
+    also: {
+      period: "current",
+      remainingPercent: 0,
+      windowDurationMins: 300,
+    },
+  });
 });
 
 test("normalizes Codex limits and daily usage without account credentials", () => {

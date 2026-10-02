@@ -12,7 +12,7 @@ Each account keeps its own native model catalog and routed model overlay. Switch
 
 ## Usage
 
-Control Center reads usage from up to eight saved, usable accounts' isolated `CODEX_HOME` directories, prioritizing the selected account. It shows the weekly window when OpenAI reports one, otherwise the monthly window. Returning to another account reloads that account's quota and reset time.
+Control Center reads usage from up to eight saved, usable accounts' isolated `CODEX_HOME` directories, prioritizing the selected account. It shows the weekly window when OpenAI reports one, otherwise the monthly window. A second window of a different duration is shown beside that line, including the plan type when the probe returned one. A short window is not treated as exhaustion and does not change the selected account. Returning to another account reloads that account's quota and reset time.
 
 ## Token refresh
 

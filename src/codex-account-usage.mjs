@@ -104,6 +104,25 @@ export function normalizeCodexAccountUsage(rateLimitResponse, usageResponse, now
   };
 }
 
+function accountUsagePeriod(window) {
+  const minutes = window?.windowDurationMins;
+  if (typeof minutes !== "number" || !Number.isFinite(minutes)) return "current";
+  if (minutes >= 28 * 24 * 60) return "monthly";
+  if (minutes >= 7 * 24 * 60) return "weekly";
+  return "current";
+}
+
+function boundedAccountUsageWindow(window) {
+  return {
+    period: accountUsagePeriod(window),
+    remainingPercent: window.remainingPercent,
+    ...(Number.isFinite(window.windowDurationMins)
+      ? { windowDurationMins: window.windowDurationMins }
+      : {}),
+    ...(window.resetsAt ? { resetsAt: window.resetsAt } : {}),
+  };
+}
+
 export async function attachBoundedChatGPTAccountUsage(pool, {
   readUsage = readCodexAccountUsage,
   accountHome,
@@ -127,11 +146,17 @@ export async function attachBoundedChatGPTAccountUsage(pool, {
       );
       const selected = weekly || monthly || windows[0];
       if (selected) {
-        account.subscription.usage = {
-          period: selected === weekly ? "weekly" : selected === monthly ? "monthly" : "current",
-          remainingPercent: selected.remainingPercent,
-          ...(selected.resetsAt ? { resetsAt: selected.resetsAt } : {}),
-        };
+        const primary = boundedAccountUsageWindow(selected);
+        const other = windows.find((window) => window !== selected);
+        const secondary = other ? boundedAccountUsageWindow(other) : null;
+        // The other window is the rest of what the probe returned. It stays
+        // beside the weekly-or-monthly line and is not an exhaustion signal:
+        // a drained short window must not pause or switch the account.
+        if (secondary && secondary.period !== primary.period) primary.also = secondary;
+        if (typeof usage.planType === "string" && usage.planType) {
+          primary.planType = usage.planType;
+        }
+        account.subscription.usage = primary;
       }
     } catch {
       // Per-account usage is optional. Core account/session state remains

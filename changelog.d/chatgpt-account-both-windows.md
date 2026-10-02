@@ -1,0 +1,1 @@
+- **ChatGPT account rows show every distinct rate-limit window the probe returned.** The weekly window stays the primary line when OpenAI reports one, and a window of a different duration is shown beside it. Older clients that read only the primary usage fields keep working. A short window is not treated as exhaustion and does not switch accounts.

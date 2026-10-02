@@ -1051,6 +1051,8 @@ export const zhCN = {
   "settings.accounts.defaultTitle": "ChatGPT 账户",
   "settings.accounts.savingAccount": "正在保存账户",
   "settings.accounts.remaining": "{period} · 剩余 {percent}%",
+  "settings.accounts.windowHours": "{hours} 小时",
+  "settings.accounts.windowMinutes": "{minutes} 分钟",
   "settings.accounts.usageUnavailable": "用量不可用",
   "settings.accounts.tokenHours": " · 登录凭证剩余 {hours} 小时",
   "settings.accounts.select": "选择",

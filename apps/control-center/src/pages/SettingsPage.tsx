@@ -32,6 +32,18 @@ function isOptimisticAccountId(id: string): boolean {
   return id.startsWith("pending:");
 }
 
+function alsoWindowPeriodLabel(
+  window: { period: string; windowDurationMins?: number | null },
+  t: Translate,
+): string {
+  const minutes = window.windowDurationMins;
+  if (window.period === "current" && typeof minutes === "number" && Number.isFinite(minutes) && minutes > 0) {
+    if (minutes % 60 === 0) return t("settings.accounts.windowHours", { hours: minutes / 60 });
+    return t("settings.accounts.windowMinutes", { minutes: Math.round(minutes) });
+  }
+  return window.period;
+}
+
 function optimisticAccountPlaceholder(label: string, clientId: string): ChatGptSubscriptionAccount {
   return {
     id: clientId,
@@ -406,10 +418,19 @@ export function SettingsPage({ target, health, presence, chatgptSession, account
                 const title = account.subscription?.email || account.label || t("settings.accounts.defaultTitle");
                 const label = account.subscription?.email && account.label ? `${account.label} · ` : "";
                 const usage = account.subscription?.usage;
+                const primaryUsage = usage && Number.isFinite(usage.remainingPercent)
+                  ? t("settings.accounts.remaining", { period: usage.period, percent: Math.round(usage.remainingPercent) })
+                  : "";
+                const alsoUsage = usage?.also && Number.isFinite(usage.also.remainingPercent)
+                  ? t("settings.accounts.remaining", {
+                      period: alsoWindowPeriodLabel(usage.also, t),
+                      percent: Math.round(usage.also.remainingPercent),
+                    })
+                  : "";
                 const usageLabel = optimisticPending
                   ? t("settings.accounts.savingAccount")
-                  : usage && Number.isFinite(usage.remainingPercent)
-                    ? t("settings.accounts.remaining", { period: usage.period, percent: Math.round(usage.remainingPercent) })
+                  : primaryUsage
+                    ? [primaryUsage, alsoUsage].filter(Boolean).join(" · ")
                     : t("settings.accounts.usageUnavailable");
                 return (
                   <div

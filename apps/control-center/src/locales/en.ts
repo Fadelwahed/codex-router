@@ -1103,6 +1103,8 @@ export const en = {
   "settings.accounts.defaultTitle": "ChatGPT account",
   "settings.accounts.savingAccount": "Saving account",
   "settings.accounts.remaining": "{period} · {percent}% remaining",
+  "settings.accounts.windowHours": "{hours}h",
+  "settings.accounts.windowMinutes": "{minutes}m",
   "settings.accounts.usageUnavailable": "Usage unavailable",
   "settings.accounts.tokenHours": " · {hours}h token",
   "settings.accounts.select": "Select",
