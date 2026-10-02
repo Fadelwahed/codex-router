@@ -3489,8 +3489,10 @@ async function handleChatGptAccountSwitch(action, value, completionLease) {
   const {
     chatGPTSubscriptionAccountHome,
     chatGPTSubscriptionAccountPoolSnapshot,
+    chatGPTAccountLabelInput,
     createChatGPTSubscriptionAccount,
     readChatGPTAccountPoolState,
+    renameChatGPTSubscriptionAccount,
     refreshBoundedChatGPTSubscriptionAccounts,
     withChatGPTAccountPoolLock,
   } = await import("./chatgpt-account-pool.mjs");
@@ -3570,6 +3572,15 @@ async function handleChatGptAccountSwitch(action, value, completionLease) {
     process.stdout.write(`${JSON.stringify({ account, loginRequired: true })}\n`);
     return;
   }
+  if (action === "label") {
+    if (!value || !/^acct_[A-Za-z0-9_-]{8,80}$/.test(value)) throw new Error("Account id is invalid.");
+    const nextLabel = chatGPTAccountLabelInput(completionLease ?? "");
+    const account = await withChatGPTAccountPoolLock(
+      () => renameChatGPTSubscriptionAccount(value, nextLabel),
+    );
+    process.stdout.write(`${JSON.stringify({ account })}\n`);
+    return;
+  }
   if (action === "home") {
     const state = readChatGPTAccountPoolState();
     if (!value || !/^acct_[A-Za-z0-9_-]{8,80}$/.test(value)) throw new Error("Account id is invalid.");
@@ -3613,7 +3624,7 @@ async function handleChatGptAccountSwitch(action, value, completionLease) {
       return;
     }
   }
-  throw new Error("Usage: control chatgpt-account-pool status|add [label]|home <acct_id>|login-finalize <acct_id> <lease>|remove <acct_id>|select <acct_id>|profile status|profile reconcile");
+  throw new Error("Usage: control chatgpt-account-pool status|add [label]|label <acct_id> [label]|home <acct_id>|login-finalize <acct_id> <lease>|remove <acct_id>|select <acct_id>|profile status|profile reconcile");
 }
 
 // The public `/health` leaf intentionally contains only the router summary and
@@ -3732,7 +3743,16 @@ if (args.includes("--probe")) {
   if (args.length > 2) throw new Error("Usage: control chatgpt-session status|enable|disable");
   await handleChatGptSession(args[1]);
 } else if (args[0] === "chatgpt-account-pool") {
-  await handleChatGptAccountSwitch(args[1], args[2], args[3]);
+  try {
+    await handleChatGptAccountSwitch(args[1], args[2], args[3]);
+  } catch (error) {
+    const { accountPoolCommandFailureLine } = await import("./account-label-text.mjs");
+    process.stderr.write(`${accountPoolCommandFailureLine(error)}\n`);
+    if (process.env.DEBUG && error instanceof Error && error.stack) {
+      process.stderr.write(`${error.stack}\n`);
+    }
+    process.exit(1);
+  }
 } else if (args[0] === "activity") {
   if (args.length > 2) throw new Error("Usage: control activity [thread-id]");
   process.stdout.write(`${JSON.stringify(await readControlActivity({ threadId: args[1] }))}\n`);

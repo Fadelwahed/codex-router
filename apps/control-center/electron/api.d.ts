@@ -120,6 +120,7 @@ export interface ChatGptSubscriptionAccount {
   paused: boolean;
   priority: number;
   label?: string;
+  labelCustom?: boolean;
   createdAt?: string;
   subscription?: {
     status?: "pending" | "usable" | "expired" | "invalid" | string;
@@ -221,6 +222,7 @@ export interface RouterControl {
   setSignedRouting(enabled: boolean): Promise<unknown>;
   setChatGptSessionSharing(enabled: boolean): Promise<ChatGptSessionStatus>;
   addChatGptSubscriptionAccount(label?: string): Promise<unknown>;
+  renameChatGptSubscriptionAccount(accountId: string, label?: string): Promise<unknown>;
   loginChatGptSubscriptionAccount(accountId: string): Promise<unknown>;
   removeChatGptSubscriptionAccount(accountId: string): Promise<unknown>;
   setChatGptAccountSelection(selection: string): Promise<unknown>;

@@ -1412,6 +1412,7 @@ test("preload constructs exact positional IPC payloads", async () => {
     ["setDefaultModel", ["model"], { slug: "model" }],
     ["setSignedRouting", [false], { enabled: false }],
     ["addChatGptSubscriptionAccount", ["Work"], { label: "Work" }],
+    ["renameChatGptSubscriptionAccount", ["acct_example_123456", "Work laptop"], { accountId: "acct_example_123456", label: "Work laptop" }],
     ["loginChatGptSubscriptionAccount", ["acct_example_123456"], { accountId: "acct_example_123456" }],
     ["removeChatGptSubscriptionAccount", ["acct_example_123456"], { accountId: "acct_example_123456" }],
     ["setChatGptAccountSelection", ["acct_example_123456"], { selection: "acct_example_123456" }],
@@ -1560,6 +1561,9 @@ test("settings keeps model choice out and exposes durable app preferences", asyn
   assert.match(settings, /subscription-account-row/);
   assert.ok(settings.includes('t("settings.accounts.emptyTitle")'));
   assert.match(settings, /addChatGptSubscriptionAccount\(/);
+  assert.match(settings, /renameChatGptSubscriptionAccount\(/);
+  const ipc = await readFile(new URL("../apps/control-center/electron/ipc.mjs", import.meta.url), "utf8");
+  assert.match(ipc, /handleAction\("renameChatGptSubscriptionAccount"[\s\S]*chatGPTAccountLabelInput\(label\)[\s\S]*\["chatgpt-account-pool", "label", id, trimmed\]/);
   assert.match(settings, /loginChatGptSubscriptionAccount\(/);
   assert.match(settings, /removeChatGptSubscriptionAccount\(/);
   assert.doesNotMatch(settings, /access_token|refresh_token/);
