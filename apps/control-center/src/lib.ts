@@ -152,7 +152,7 @@ export type AccountResetProbeGate = {
   nextAllowedAt: number;
 };
 
-export function accountResetReprobeWait(streak: number): number {
+function accountResetReprobeWait(streak: number): number {
   const shift = Math.min(
     ACCOUNT_RESET_REPROBE_MAX_SHIFT,
     Number.isFinite(streak) && streak > 0 ? Math.floor(streak) : 0,
