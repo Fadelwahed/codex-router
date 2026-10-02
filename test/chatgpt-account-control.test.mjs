@@ -102,9 +102,11 @@ test("a renamed ChatGPT account label persists across a new control process", ()
     assert.equal(status.accounts[added.id].label, "Personal");
     const cleared = runIsolated("chatgpt-account-pool", "label", added.id, " \t ");
     assert.equal(cleared.account.id, added.id);
-    assert.equal(cleared.account.label, undefined);
+    assert.equal(cleared.account.label, "ChatGPT account 1");
+    assert.equal(cleared.account.labelCustom, undefined);
     const reread = runIsolated("chatgpt-account-pool", "status");
-    assert.equal(reread.accounts[added.id].label, undefined);
+    assert.equal(reread.accounts[added.id].label, "ChatGPT account 1");
+    assert.equal(reread.accounts[added.id].labelCustom, undefined);
     assert.equal(reread.accounts[added.id].id, added.id);
     const stderrOf = (error) => String(error?.stderr || error?.message || error);
     assert.throws(
@@ -115,7 +117,7 @@ test("a renamed ChatGPT account label persists across a new control process", ()
       () => runIsolated("chatgpt-account-pool", "label", "acct_missing1", "Name"),
       (error) => /not registered/.test(stderrOf(error)),
     );
-    assert.equal(runIsolated("chatgpt-account-pool", "status").accounts[added.id].label, undefined);
+    assert.equal(runIsolated("chatgpt-account-pool", "status").accounts[added.id].label, "ChatGPT account 1");
   } finally {
     rmSync(isolated, { recursive: true, force: true });
   }
