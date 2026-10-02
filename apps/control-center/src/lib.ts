@@ -140,10 +140,11 @@ export function accountResetProbeEpochs(
 }
 
 // A probe that answers with another reset a few seconds out used to arm the
-// next probe for those few seconds. The refresh covers every account, so the
-// wait is global: at least a minute, doubling while the answer is already
-// elapsed or closer than that minute, and cleared once every real reset is
-// at least a minute away. The cap is sixteen minutes.
+// next probe for those few seconds. Each account waits on its own: at least
+// a minute, doubling while that account's answer is already elapsed or closer
+// than that minute, and cleared once every real reset on that account is at
+// least a minute away. One account's wait does not hold another account's
+// first elapsed reset. The cap is sixteen minutes.
 export const ACCOUNT_RESET_REPROBE_MIN_MS = 60_000;
 const ACCOUNT_RESET_REPROBE_MAX_SHIFT = 4;
 
@@ -213,13 +214,47 @@ export function accountResetProbeStep(
   };
 }
 
+export type AccountResetClockAccount = {
+  id: string;
+  resetsAt: Array<number | string | null | undefined>;
+};
+
+export type AccountResetProbeGates = Record<string, AccountResetProbeGate>;
+
+// One pool probe if any account is due. Accounts that are not due keep the
+// wait they already have, including one that is still inside its backoff.
+export function accountResetProbePlan(
+  accounts: readonly AccountResetClockAccount[],
+  now: number,
+  gates: AccountResetProbeGates,
+): { probe: boolean; gates: AccountResetProbeGates; delay: number | null } {
+  if (!Number.isFinite(now)) return { probe: false, gates, delay: null };
+  const next: AccountResetProbeGates = {};
+  const seen = new Set<string>();
+  let probe = false;
+  let delay: number | null = null;
+  for (const account of accounts) {
+    if (!account || typeof account.id !== "string" || account.id === "" || seen.has(account.id)) continue;
+    seen.add(account.id);
+    const step = accountResetProbeStep(
+      account.resetsAt ?? [],
+      now,
+      gates[account.id] ?? { streak: 0, nextAllowedAt: 0 },
+    );
+    next[account.id] = step.gate;
+    if (step.probe) probe = true;
+    if (step.delay !== null && (delay === null || step.delay < delay)) delay = step.delay;
+  }
+  return { probe, gates: next, delay };
+}
+
 // One timer. A nested `arm` from `onProbe` is ignored, so the probe cannot
 // schedule a second one; the caller re-arms after the new resets arrive.
 export function bindAccountResetClock(options: {
-  getResets: () => Array<number | string | null | undefined>;
+  getAccounts: () => readonly AccountResetClockAccount[];
   onTick: (now: number) => void;
   onProbe: () => void;
-  gate: { current: AccountResetProbeGate };
+  gates: { current: AccountResetProbeGates };
   allow?: () => boolean;
   now?: () => number;
   schedule?: (fn: () => void, ms: number) => unknown;
@@ -246,15 +281,15 @@ export function bindAccountResetClock(options: {
       if (stopped || (options.allow && !options.allow())) return;
       const current = now();
       options.onTick(current);
-      const step = accountResetProbeStep(options.getResets(), current, options.gate.current);
-      options.gate.current = step.gate;
-      if (step.probe) options.onProbe();
+      const plan = accountResetProbePlan(options.getAccounts(), current, options.gates.current);
+      options.gates.current = plan.gates;
+      if (plan.probe) options.onProbe();
       if (stopped || (options.allow && !options.allow())) {
         clear();
         return;
       }
-      if (step.delay === null) return;
-      timer = { id: schedule(arm, step.delay) };
+      if (plan.delay === null) return;
+      timer = { id: schedule(arm, plan.delay) };
     } finally {
       arming = false;
     }

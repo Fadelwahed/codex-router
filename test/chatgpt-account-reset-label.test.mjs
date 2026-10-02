@@ -3,6 +3,7 @@ import test from "node:test";
 
 import {
   accountResetProbeEpochs,
+  accountResetProbePlan,
   accountResetProbeStep,
   accountResetTickDelay,
   accountUsageClause,
@@ -207,48 +208,57 @@ test("a near or missing reset keeps the wait, and a normal window clears it", ()
 
 function openResetClock(t, start, options = {}) {
   t.mock.timers.enable({ apis: ["setTimeout", "Date"], now: start });
-  let resets = options.resets ?? [start - 1_000];
+  const id = options.id ?? "account";
+  let accounts = options.accounts ?? [{ id, resetsAt: options.resets ?? [start - 1_000] }];
   let probes = 0;
   const live = new Set();
   const handles = new Map();
   let seq = 0;
   let lastDelay = null;
-  const gate = { current: { streak: 0, nextAllowedAt: 0 } };
+  const gates = { current: options.gates ?? {} };
   let clock;
   clock = bindAccountResetClock({
-    getResets: () => resets,
+    getAccounts: () => accounts,
     onTick: () => {},
     onProbe: () => {
       probes += 1;
       options.onProbe?.(() => { clock.arm(); });
     },
-    gate,
+    gates,
     schedule: (fn, ms) => {
       lastDelay = ms;
-      const id = ++seq;
-      live.add(id);
+      const handleId = ++seq;
+      live.add(handleId);
       const handle = setTimeout(() => {
-        if (!live.delete(id)) return;
-        handles.delete(id);
+        if (!live.delete(handleId)) return;
+        handles.delete(handleId);
         fn();
       }, ms);
-      handles.set(id, handle);
-      return id;
+      handles.set(handleId, handle);
+      return handleId;
     },
-    cancel: (id) => {
-      live.delete(id);
-      const handle = handles.get(id);
+    cancel: (handleId) => {
+      live.delete(handleId);
+      const handle = handles.get(handleId);
       if (handle !== undefined) {
         clearTimeout(handle);
-        handles.delete(id);
+        handles.delete(handleId);
       }
     },
   });
   return {
     clock,
-    gate,
+    gates,
+    get gate() {
+      return { current: gates.current[id] ?? { streak: 0, nextAllowedAt: 0 } };
+    },
     live,
-    setResets(next) { resets = next; },
+    setResets(next) {
+      accounts = accounts.map((account) => (
+        account.id === id ? { ...account, resetsAt: next } : account
+      ));
+    },
+    setAccounts(next) { accounts = next; },
     probes: () => probes,
     delay: () => lastDelay,
   };
@@ -325,6 +335,96 @@ test("a reset a few seconds ahead waits, backs off, and a normal window restores
   assert.equal(harness.live.size, 0);
   t.mock.timers.tick(60 * 60_000);
   assert.equal(harness.probes(), 5);
+  assert.equal(harness.live.size, 0);
+});
+
+test("a probe plan keeps each account's wait and drops an account that left", () => {
+  const rolling = { streak: 4, nextAllowedAt: NOW + 960_000 };
+  const gates = { rolling, gone: { streak: 3, nextAllowedAt: NOW + 120_000 } };
+  const plan = accountResetProbePlan([
+    { id: "", resetsAt: [NOW - 1] },
+    { id: "rolling", resetsAt: [NOW - 1] },
+    { id: "rolling", resetsAt: [NOW + 5_000] },
+    { id: "fresh", resetsAt: [NOW - 1] },
+  ], NOW, gates);
+  assert.equal(plan.probe, true);
+  assert.deepEqual(plan.gates.rolling, rolling);
+  assert.equal(plan.gates.fresh.streak, 1);
+  assert.equal(plan.gates.fresh.nextAllowedAt, NOW + 60_000);
+  assert.equal(plan.delay, 60_000);
+  assert.deepEqual(Object.keys(plan.gates).sort(), ["fresh", "rolling"]);
+  assert.equal(gates.rolling, rolling);
+  assert.equal(gates.gone.streak, 3);
+});
+
+test("one account's backoff does not delay another's first elapsed reset", (t) => {
+  const start = NOW;
+  const harness = openResetClock(t, start, {
+    accounts: [
+      { id: "rolling", resetsAt: [start - 1_000] },
+      { id: "fresh", resetsAt: [start - 1_000] },
+    ],
+    gates: {
+      rolling: { streak: 4, nextAllowedAt: start + 960_000 },
+    },
+  });
+  harness.clock.arm();
+  assert.equal(harness.probes(), 1);
+  assert.deepEqual(harness.gates.current.rolling, { streak: 4, nextAllowedAt: start + 960_000 });
+  assert.equal(harness.gates.current.fresh.streak, 1);
+  assert.equal(harness.gates.current.fresh.nextAllowedAt, start + 60_000);
+  assert.equal(harness.delay(), 60_000);
+  assert.equal(harness.live.size, 1);
+
+  harness.setAccounts([
+    { id: "rolling", resetsAt: [start - 1_000] },
+    { id: "fresh", resetsAt: [start - 1_000] },
+    { id: "other", resetsAt: [start - 1] },
+  ]);
+  harness.clock.arm();
+  assert.equal(harness.probes(), 2);
+  assert.deepEqual(harness.gates.current.rolling, { streak: 4, nextAllowedAt: start + 960_000 });
+  assert.equal(harness.gates.current.fresh.streak, 1);
+  assert.equal(harness.gates.current.fresh.nextAllowedAt, start + 60_000);
+  assert.equal(harness.gates.current.other.streak, 1);
+  assert.equal(harness.gates.current.other.nextAllowedAt, start + 60_000);
+  assert.equal(harness.live.size, 1);
+
+  t.mock.timers.tick(59_999);
+  assert.equal(harness.probes(), 2);
+  t.mock.timers.tick(1);
+  assert.equal(harness.probes(), 3);
+  assert.equal(harness.gates.current.fresh.streak, 2);
+  assert.equal(harness.gates.current.other.streak, 2);
+  assert.deepEqual(harness.gates.current.rolling, { streak: 4, nextAllowedAt: start + 960_000 });
+  assert.equal(harness.delay(), 120_000);
+  assert.equal(harness.live.size, 1);
+
+  const dueAt = start + 60_000;
+  harness.setAccounts([
+    { id: "rolling", resetsAt: [start - 1_000] },
+    { id: "fresh", resetsAt: [dueAt + 2 * HOUR] },
+    { id: "other", resetsAt: [start - 1] },
+  ]);
+  harness.clock.arm();
+  assert.equal(harness.probes(), 3);
+  assert.deepEqual(harness.gates.current.fresh, { streak: 0, nextAllowedAt: 0 });
+  assert.equal(harness.gates.current.other.streak, 2);
+  assert.equal(harness.gates.current.rolling.streak, 4);
+  assert.equal(harness.live.size, 1);
+
+  harness.clock.pause();
+  assert.equal(harness.live.size, 0);
+  t.mock.timers.tick(30_000);
+  assert.equal(harness.probes(), 3);
+  harness.clock.arm();
+  assert.equal(harness.probes(), 3);
+  assert.equal(harness.live.size, 1);
+
+  harness.clock.stop();
+  assert.equal(harness.live.size, 0);
+  t.mock.timers.tick(HOUR);
+  assert.equal(harness.probes(), 3);
   assert.equal(harness.live.size, 0);
 });
 
