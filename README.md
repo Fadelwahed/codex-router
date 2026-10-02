@@ -1569,7 +1569,9 @@ login remains saved, and switching never removes another account's session.
 Each account keeps its own native model catalog and routed overlay. Usage is
 read from up to eight saved, usable accounts' isolated `CODEX_HOME`
 directories, prioritizing the selected account and using the weekly
-window when available and the monthly window otherwise. This is an explicit
+window when available and the monthly window otherwise. A display label
+can be set on an account without changing its id or login; the email stays
+visible, and clearing the label shows the email again. This is an explicit
 switch-only feature: it does not perform automatic quota or round-robin
 routing. See [the account switching guide](docs/CHATGPT-ACCOUNT-MODES.md) for
 the safety and token-refresh details.

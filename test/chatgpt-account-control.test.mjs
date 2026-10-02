@@ -80,6 +80,47 @@ test("account selection persists without replacing another saved login", () => {
   );
 });
 
+test("a renamed ChatGPT account label persists across a new control process", () => {
+  const isolated = mkdtempSync(path.join(os.tmpdir(), "codex-account-rename-"));
+  const isolatedEnv = {
+    ...env,
+    CODEX_HOME: isolated,
+    MODEL_ROUTER_STATE_DIR: isolated,
+  };
+  const runIsolated = (...args) => JSON.parse(execFileSync(process.execPath, [path.join(root, "src/control.mjs"), ...args], {
+    env: isolatedEnv,
+    encoding: "utf8",
+  }));
+  try {
+    const added = runIsolated("chatgpt-account-pool", "add", "Shared inbox").account;
+    const renamed = runIsolated("chatgpt-account-pool", "label", added.id, "  Personal  ");
+    assert.equal(renamed.account.id, added.id);
+    assert.equal(renamed.account.label, "Personal");
+    assert.equal(renamed.account.state, added.state);
+    const status = runIsolated("chatgpt-account-pool", "status");
+    assert.equal(status.accounts[added.id].id, added.id);
+    assert.equal(status.accounts[added.id].label, "Personal");
+    const cleared = runIsolated("chatgpt-account-pool", "label", added.id, " \t ");
+    assert.equal(cleared.account.id, added.id);
+    assert.equal(cleared.account.label, undefined);
+    const reread = runIsolated("chatgpt-account-pool", "status");
+    assert.equal(reread.accounts[added.id].label, undefined);
+    assert.equal(reread.accounts[added.id].id, added.id);
+    const stderrOf = (error) => String(error?.stderr || error?.message || error);
+    assert.throws(
+      () => runIsolated("chatgpt-account-pool", "label", added.id, "x".repeat(121)),
+      (error) => /Account label is invalid/.test(stderrOf(error)),
+    );
+    assert.throws(
+      () => runIsolated("chatgpt-account-pool", "label", "acct_missing1", "Name"),
+      (error) => /not registered/.test(stderrOf(error)),
+    );
+    assert.equal(runIsolated("chatgpt-account-pool", "status").accounts[added.id].label, undefined);
+  } finally {
+    rmSync(isolated, { recursive: true, force: true });
+  }
+});
+
 test("no-discovery account reads never import account modules or create pool state", () => {
   const isolated = mkdtempSync(path.join(os.tmpdir(), "codex-account-no-discovery-"));
   const loader = path.join(isolated, "import-audit-loader.mjs");

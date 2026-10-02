@@ -282,6 +282,31 @@ function nextAccountLabel(state) {
   while (used.has(numberValue)) numberValue += 1;
   return `ChatGPT account ${numberValue}`;
 }
+// A display label is metadata on the existing account record. Empty input
+// clears it so the row falls back to the email. The stored field is already
+// capped at 120 characters by normalizeAccount; reject anything longer, or a
+// NUL, before that backstop so the caller sees the same limit as add.
+export function chatGPTAccountLabelInput(label) {
+  if (typeof label !== "string" || /[\u0000]/.test(label)) {
+    throw new Error("Account label is invalid.");
+  }
+  const trimmed = label.trim();
+  if (trimmed.length > 120) throw new Error("Account label is invalid.");
+  return trimmed;
+}
+
+export function renameChatGPTSubscriptionAccount(accountValue, label = "", { filePath = CHATGPT_ACCOUNT_POOL_PATH } = {}) {
+  const id = accountId(accountValue);
+  const nextLabel = chatGPTAccountLabelInput(label);
+  const state = readChatGPTAccountPoolState(filePath);
+  const account = state.accounts[id];
+  if (!account) throw new Error("Account id is not registered.");
+  if (nextLabel) account.label = nextLabel;
+  else delete account.label;
+  writeChatGPTAccountPoolState(state, filePath);
+  return sanitizeChatGPTAccount(readChatGPTAccountPoolState(filePath).accounts[id]);
+}
+
 export function createChatGPTSubscriptionAccount({ label = "", filePath = CHATGPT_ACCOUNT_POOL_PATH, homesDir = CHATGPT_ACCOUNT_HOMES_DIR, now = Date.now() } = {}) {
   const state = readChatGPTAccountPoolState(filePath);
   if (Object.values(state.accounts).filter((account) => account?.state !== "revoked").length >= MAX_ACCOUNTS) throw new Error(`The ChatGPT account list supports at most ${MAX_ACCOUNTS} accounts.`);

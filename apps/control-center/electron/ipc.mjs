@@ -36,6 +36,10 @@ const { spawnableCommand } = await import(spawnableCommandUrl);
 const loginLeaseUrl = import.meta.url.includes("/app.asar/")
   ? new URL("../../src/chatgpt-login-lease.mjs", import.meta.url)
   : new URL("../../../src/chatgpt-login-lease.mjs", import.meta.url);
+const accountLabelUrl = import.meta.url.includes("/app.asar/")
+  ? new URL("../../src/chatgpt-account-pool.mjs", import.meta.url)
+  : new URL("../../../src/chatgpt-account-pool.mjs", import.meta.url);
+const { chatGPTAccountLabelInput } = await import(accountLabelUrl);
 const {
   attachChatGPTLoginLease,
   chatGPTLoginAuthChanged,
@@ -2120,6 +2124,11 @@ export function registerIpcHandlers({
       throw new Error("Account label is invalid.");
     }
     return runJson(["chatgpt-account-pool", "add", label.trim()], { timeoutMs: 60_000 });
+  });
+  handleAction("renameChatGptSubscriptionAccount", async ({ accountId, label = "" } = {}) => {
+    const id = stringValue(accountId, "Account id", CHATGPT_ACCOUNT_ID);
+    const trimmed = chatGPTAccountLabelInput(label);
+    return runJson(["chatgpt-account-pool", "label", id, trimmed], { timeoutMs: 60_000 });
   });
   handleAction("loginChatGptSubscriptionAccount", async ({ accountId } = {}) => {
     const id = stringValue(accountId, "Account id", CHATGPT_ACCOUNT_ID);

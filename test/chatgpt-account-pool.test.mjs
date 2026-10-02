@@ -16,7 +16,9 @@ import {
   chatGPTSubscriptionAccountHome,
   chatGPTSubscriptionAccountPoolSnapshot,
   chatGPTSubscriptionAccountStatus,
+  chatGPTAccountLabelInput,
   createChatGPTSubscriptionAccount,
+  renameChatGPTSubscriptionAccount,
   readChatGPTAccountPoolState,
   refreshChatGPTSubscriptionAccount,
   refreshBoundedChatGPTSubscriptionAccounts,
@@ -88,6 +90,35 @@ test("saved accounts use isolated homes and never persist credentials in pool st
   assert.equal(chatGPTSubscriptionAccountHome(account.id, options), path.join(options.homesDir, account.id));
   assert.equal(readChatGPTAccountPoolState(options.filePath).accounts[account.id].subscription.status, "pending");
   assert.doesNotMatch(state, /access_token|refresh_token|id_token/);
+});
+
+test("renaming an account label persists without changing its identity", () => {
+  const options = fixture();
+  const account = createChatGPTSubscriptionAccount({ ...options, label: "First" });
+  const before = readChatGPTAccountPoolState(options.filePath).accounts[account.id];
+  const renamed = renameChatGPTSubscriptionAccount(account.id, "  Work laptop  ", options);
+  assert.equal(renamed.id, account.id);
+  assert.equal(renamed.label, "Work laptop");
+  assert.equal(renamed.state, before.state);
+  const stored = readChatGPTAccountPoolState(options.filePath).accounts[account.id];
+  assert.equal(stored.id, before.id);
+  assert.equal(stored.label, "Work laptop");
+  assert.equal(stored.state, before.state);
+  assert.deepEqual(stored.subscription, before.subscription);
+  assert.deepEqual(stored.identity, before.identity);
+
+  const cleared = renameChatGPTSubscriptionAccount(account.id, " \t ", options);
+  assert.equal(cleared.label, undefined);
+  assert.equal(readChatGPTAccountPoolState(options.filePath).accounts[account.id].label, undefined);
+  assert.equal(readChatGPTAccountPoolState(options.filePath).accounts[account.id].id, account.id);
+
+  assert.equal(chatGPTAccountLabelInput("  kept  "), "kept");
+  assert.equal(chatGPTAccountLabelInput(""), "");
+  assert.throws(() => renameChatGPTSubscriptionAccount(account.id, "x".repeat(121), options), /Account label is invalid/);
+  assert.throws(() => renameChatGPTSubscriptionAccount(account.id, "bad\u0000name", options), /Account label is invalid/);
+  assert.throws(() => chatGPTAccountLabelInput(12), /Account label is invalid/);
+  assert.throws(() => renameChatGPTSubscriptionAccount("acct_missing1", "Name", options), /not registered/);
+  assert.equal(readChatGPTAccountPoolState(options.filePath).accounts[account.id].label, undefined);
 });
 
 test("account labels reuse the first free number after a removed account", () => {

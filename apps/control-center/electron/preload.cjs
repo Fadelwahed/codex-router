@@ -66,6 +66,7 @@ const routerControl = Object.freeze({
   setSignedRouting: (enabled) => call("setSignedRouting", { enabled }),
   setChatGptSessionSharing: (enabled) => call("setChatGptSessionSharing", { enabled }),
   addChatGptSubscriptionAccount: (label) => call("addChatGptSubscriptionAccount", { label }),
+  renameChatGptSubscriptionAccount: (accountId, label) => call("renameChatGptSubscriptionAccount", { accountId, label }),
   loginChatGptSubscriptionAccount: (accountId) => call("loginChatGptSubscriptionAccount", { accountId }),
   removeChatGptSubscriptionAccount: (accountId) => call("removeChatGptSubscriptionAccount", { accountId }),
   setChatGptAccountSelection: (selection) => call("setChatGptAccountSelection", { selection }),

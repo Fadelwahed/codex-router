@@ -1,6 +1,6 @@
 import { backendText } from "../backend-text";
 import { useEffect, useMemo, useRef, useState } from "react";
-import { AppWindow, Check, Eye, LogIn, Moon, Plus, RefreshCw, Server, ShieldCheck, Sun, Trash2, UserRound, Wrench } from "lucide-react";
+import { AppWindow, Check, Eye, LogIn, Moon, Pencil, Plus, RefreshCw, Server, ShieldCheck, Sun, Trash2, UserRound, Wrench } from "lucide-react";
 import { Badge, Button, Dialog, InlineNotice, PageHeader, SectionHeading, Toggle } from "../components";
 import { compactNumber, effortLabel } from "../lib";
 import { LANGUAGE_OPTIONS, type LanguageId, type Translate } from "../i18n";
@@ -30,6 +30,21 @@ type AccountOverlay =
 
 function isOptimisticAccountId(id: string): boolean {
   return id.startsWith("pending:");
+}
+
+function automaticAccountLabel(label: string): boolean {
+  return /^ChatGPT account \d+$/.test(label);
+}
+
+function accountRowIdentity(account: ChatGptSubscriptionAccount, fallback: string): { title: string; prefix: string; editableLabel: string } {
+  const email = account.subscription?.email?.trim() || "";
+  const stored = account.label?.trim() || "";
+  const custom = stored && !automaticAccountLabel(stored) ? stored : "";
+  return {
+    title: custom || email || stored || fallback,
+    prefix: custom && email && custom !== email ? `${email} · ` : !custom && email && stored ? `${stored} · ` : "",
+    editableLabel: custom,
+  };
 }
 
 function optimisticAccountPlaceholder(label: string, clientId: string): ChatGptSubscriptionAccount {
@@ -81,6 +96,8 @@ export function SettingsPage({ target, health, presence, chatgptSession, account
   const [repairReport, setRepairReport] = useState<DoctorSnapshot | null>(null);
   const [newAccountLabel, setNewAccountLabel] = useState("");
   const [removeAccountId, setRemoveAccountId] = useState<string | null>(null);
+  const [renameAccountId, setRenameAccountId] = useState<string | null>(null);
+  const [renameDraft, setRenameDraft] = useState("");
   const [loginPendingId, setLoginPendingId] = useState<string | null>(null);
   const [loginRetryingId, setLoginRetryingId] = useState<string | null>(null);
   const [loginError, setLoginError] = useState<string | null>(null);
@@ -403,8 +420,9 @@ export function SettingsPage({ target, health, presence, chatgptSession, account
                     : account.subscription?.expired
                       ? t("settings.accounts.statusExpired")
                       : t("settings.accounts.statusSignInRequired");
-                const title = account.subscription?.email || account.label || t("settings.accounts.defaultTitle");
-                const label = account.subscription?.email && account.label ? `${account.label} · ` : "";
+                const identity = accountRowIdentity(account, t("settings.accounts.defaultTitle"));
+                const title = identity.title;
+                const label = identity.prefix;
                 const usage = account.subscription?.usage;
                 const usageLabel = optimisticPending
                   ? t("settings.accounts.savingAccount")
@@ -430,6 +448,15 @@ export function SettingsPage({ target, health, presence, chatgptSession, account
                         disabled={!api || optimisticPending}
                         onClick={() => api && void runAction(t("app.action.switchChatgptAccount"), () => api.setChatGptAccountSelection(account.id))}
                       >{accountSelection === account.id ? <><Check aria-hidden size={13} strokeWidth={1.9} /> {t("settings.accounts.selectedBadge")}</> : <><Check aria-hidden size={13} strokeWidth={1.9} /> {t("settings.accounts.select")}</>}</Button>
+                      <Button
+                        variant="ghost"
+                        aria-label={t("settings.accounts.renameAria", { name: title })}
+                        disabled={!api || optimisticPending}
+                        onClick={() => {
+                          setRenameDraft(identity.editableLabel);
+                          setRenameAccountId(account.id);
+                        }}
+                      ><Pencil aria-hidden size={13} strokeWidth={1.7} /> {t("settings.accounts.rename")}</Button>
                       <Button
                         variant="ghost"
                         disabled={!api || optimisticPending || account.state !== "active" || accountLoginAttempt?.retryable === false || (account.subscription?.usable === true && accountLoginAttempt?.status !== "failed") || loginPendingId === account.id}
@@ -710,6 +737,31 @@ export function SettingsPage({ target, health, presence, chatgptSession, account
             setConfirmTrayDisable(false);
             if (api) void runAction(t("app.action.disableTray"), () => api.controlTray("disable"));
           }}>{t("settings.desktop.disable")}</Button>
+        </div>
+      </Dialog>
+
+      <Dialog
+        open={Boolean(renameAccountId)}
+        title={t("settings.accounts.renameTitle")}
+        description={t("settings.accounts.renameDescription")}
+        onClose={() => setRenameAccountId(null)}
+      >
+        <input
+          aria-label={t("settings.accounts.renameInputAria")}
+          value={renameDraft}
+          maxLength={120}
+          placeholder={t("settings.accounts.renamePlaceholder")}
+          onChange={(event) => setRenameDraft(event.target.value)}
+        />
+        <p className="dialog-copy">{t("settings.accounts.renameHint")}</p>
+        <div className="dialog-actions">
+          <Button variant="secondary" onClick={() => setRenameAccountId(null)}>{t("settings.accounts.removeCancel")}</Button>
+          <Button variant="primary" disabled={!api || !renameAccountId} onClick={() => {
+            const id = renameAccountId;
+            const draft = renameDraft;
+            setRenameAccountId(null);
+            if (api && id) void runAction(t("settings.accounts.renameTitle"), () => api.renameChatGptSubscriptionAccount(id, draft));
+          }}>{t("settings.accounts.renameSave")}</Button>
         </div>
       </Dialog>
 

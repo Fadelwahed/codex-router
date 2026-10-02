@@ -1,0 +1,1 @@
+- **ChatGPT accounts can be given a display label.** The label is stored on the existing account record, so the account id and login stay the same. Clearing it shows the email again, and the email remains visible beside a custom label.

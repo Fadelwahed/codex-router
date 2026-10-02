@@ -511,6 +511,16 @@ const bridgeSource = String.raw`
       record("setChatGptAccountSelection", selection);
       return { ok: true };
     },
+    renameChatGptSubscriptionAccount: async (accountId, label = "") => {
+      record("renameChatGptSubscriptionAccount", accountId, label);
+      const account = accountPoolState.accounts[accountId];
+      if (!account) throw new Error("Account id is not registered.");
+      const trimmed = String(label).trim();
+      if (trimmed.length > 120 || trimmed.includes("\u0000")) throw new Error("Account label is invalid.");
+      if (trimmed) account.label = trimmed;
+      else delete account.label;
+      return { account };
+    },
     addChatGptSubscriptionAccount: async (label = "") => {
       record("addChatGptSubscriptionAccount", label);
       if (accountMutationDelayMs > 0) await new Promise((resolve) => setTimeout(resolve, accountMutationDelayMs));
@@ -1045,7 +1055,29 @@ test("the production renderer exposes model discovery and picker actions", { tim
     assert.equal(await accountRows.filter({ hasText: "secondary@example.com" }).count(), 1, "secondary email should be visible");
     const readySecondary = accountRows.filter({ hasText: "Secondary account" });
     assert.equal(await readySecondary.getByRole("button", { name: "Login", exact: true }).isDisabled(), true, "ready accounts cannot start a duplicate login");
-    await page.getByRole("button", { name: "Select ChatGPT account: primary@example.com", exact: true }).click();
+    const primaryRow = accountRows.filter({ hasText: "primary@example.com" });
+    assert.equal(await primaryRow.count(), 1, "primary email should stay visible beside its label");
+    await readySecondary.getByRole("button", { name: "Rename ChatGPT account: Secondary account", exact: true }).click();
+    await page.getByRole("textbox", { name: "ChatGPT account label" }).fill("  Work laptop  ");
+    await page.getByRole("button", { name: "Save label", exact: true }).click();
+    const renamed = accountRows.filter({ hasText: "Work laptop" });
+    await renamed.waitFor();
+    assert.match(await renamed.innerText(), /secondary@example.com/);
+    assert.equal(await page.evaluate(() => window.routerControlTest.calls().some((call) => (
+      call.name === "renameChatGptSubscriptionAccount"
+      && call.args[0] === "active"
+      && call.args[1] === "  Work laptop  "
+    ))), true);
+    await renamed.getByRole("button", { name: "Rename ChatGPT account: Work laptop", exact: true }).click();
+    await page.getByRole("textbox", { name: "ChatGPT account label" }).fill("   ");
+    await page.getByRole("button", { name: "Save label", exact: true }).click();
+    await page.waitForFunction(() => {
+      const row = [...document.querySelectorAll(".subscription-account-row")]
+        .find((node) => (node.textContent || "").includes("secondary@example.com"));
+      const text = row?.textContent || "";
+      return Boolean(row) && !text.includes("Work laptop") && !text.includes("Secondary account");
+    });
+    await page.getByRole("button", { name: "Select ChatGPT account: Current account", exact: true }).click();
     await page.waitForFunction(() => window.routerControlTest.calls()
       .some((call) => call.name === "setChatGptAccountSelection" && call.args[0] === "current"));
 
