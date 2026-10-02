@@ -70,25 +70,85 @@ export function formatDateTime(value: number | string | null | undefined, t: Tra
 // negative remainder.
 //
 // Two significant units, and no third. Under a day the label is hours and
-// minutes, or minutes alone. At day scale it is days and hours. Leftover
-// minutes are not a display unit there: 30 and above round up to the next
-// hour, and a carry of 24 hours becomes the next day ("2d 23h 30m" reads
-// "3d"). An exact number of days stays "2d". A remainder under 30 minutes
-// with a zero hour stays visible as "2d 0h", so it is not identical to an
-// exact day.
+// minutes, or minutes alone, and those minutes are floored: 50s remains
+// "<1m", and "<1m" lasts only while time remains. At day scale it is days
+// and hours. Leftover minutes are not a display unit there: 30 and above
+// round up to the next hour, and a carry of 24 hours becomes the next day
+// ("2d 23h 30m" reads "3d"). An exact number of days stays "2d". A remainder
+// under 30 minutes with a zero hour stays visible as "2d 0h", so it is not
+// identical to an exact day.
+const ACCOUNT_RESET_MINUTE_MS = 60_000;
+
+export function accountResetEpochMs(resetsAt: number | string | null | undefined): number | null {
+  if (resetsAt === null || resetsAt === undefined || resetsAt === "") return null;
+  const numeric = typeof resetsAt === "number" ? resetsAt : Number(resetsAt);
+  if (!Number.isFinite(numeric)) return null;
+  const epochMs = numeric < 10_000_000_000 ? numeric * 1_000 : numeric;
+  return Number.isFinite(epochMs) ? epochMs : null;
+}
+
+// A zero or negative stamp is not a reset that has passed; the probe drops
+// those before they reach the row. Only a real instant at or before `now`
+// has elapsed.
+export function accountResetElapsed(
+  resetsAt: number | string | null | undefined,
+  now = Date.now(),
+): boolean {
+  const epochMs = accountResetEpochMs(resetsAt);
+  if (epochMs === null || epochMs <= 0 || !Number.isFinite(now)) return false;
+  return epochMs <= now;
+}
+
+// The next paint is the soonest countdown minute boundary, or the reset
+// instant when that is sooner. An exact minute is already the bottom of its
+// floored bucket, so the following millisecond belongs to the lower label
+// and must not keep "1m" on screen while 50s remain.
+export function accountResetTickDelay(
+  resetsAt: Array<number | string | null | undefined>,
+  now = Date.now(),
+): number | null {
+  if (!Number.isFinite(now)) return null;
+  let delay: number | null = null;
+  for (const value of resetsAt) {
+    const epochMs = accountResetEpochMs(value);
+    if (epochMs === null || epochMs <= now) continue;
+    const remainingMs = epochMs - now;
+    const intoMinute = remainingMs % ACCOUNT_RESET_MINUTE_MS;
+    const until = remainingMs < ACCOUNT_RESET_MINUTE_MS
+      ? remainingMs
+      : (intoMinute === 0 ? 1 : intoMinute);
+    if (delay === null || until < delay) delay = until;
+  }
+  return delay;
+}
+
+export function accountResetProbeEpochs(
+  resetsAt: Array<number | string | null | undefined>,
+  now = Date.now(),
+  probed: ReadonlySet<number> = new Set(),
+): number[] {
+  if (!Number.isFinite(now)) return [];
+  const due: number[] = [];
+  const seen = new Set<number>();
+  for (const value of resetsAt) {
+    const epochMs = accountResetEpochMs(value);
+    if (epochMs === null || epochMs <= 0 || epochMs > now || probed.has(epochMs) || seen.has(epochMs)) continue;
+    seen.add(epochMs);
+    due.push(epochMs);
+  }
+  return due;
+}
+
 export function formatAccountReset(
   resetsAt: number | string | null | undefined,
   t: Translate = createTranslator(detectLanguage()),
   now = Date.now(),
 ): string {
-  if (resetsAt === null || resetsAt === undefined || resetsAt === "") return "";
-  const numeric = typeof resetsAt === "number" ? resetsAt : Number(resetsAt);
-  if (!Number.isFinite(numeric)) return "";
-  const epochMs = numeric < 10_000_000_000 ? numeric * 1_000 : numeric;
-  if (!Number.isFinite(epochMs) || !Number.isFinite(now)) return "";
+  const epochMs = accountResetEpochMs(resetsAt);
+  if (epochMs === null || !Number.isFinite(now)) return "";
   const remainingMs = epochMs - now;
   if (remainingMs <= 0) return "";
-  const totalMinutes = Math.floor(remainingMs / 60_000);
+  const totalMinutes = Math.floor(remainingMs / ACCOUNT_RESET_MINUTE_MS);
   if (!Number.isSafeInteger(totalMinutes)) return "";
   const when = totalMinutes < 1
     ? t("settings.accounts.resetUnderMinute")
@@ -142,7 +202,29 @@ export function accountWindowPeriodLabel(
     if (minutes % 60 === 0) return t("settings.accounts.windowHours", { hours: minutes / 60 });
     return t("settings.accounts.windowMinutes", { minutes: Math.round(minutes) });
   }
+  if (window.period === "current") return t("settings.accounts.periodCurrent");
   return window.period;
+}
+
+export function accountUsageClause(
+  window: {
+    period: string;
+    remainingPercent: number;
+    resetsAt?: number | string | null;
+    windowDurationMins?: number | null;
+  } | null | undefined,
+  t: Translate,
+  now = Date.now(),
+): string {
+  if (!window || typeof window !== "object" || Array.isArray(window)) return "";
+  if (typeof window.remainingPercent !== "number" || !Number.isFinite(window.remainingPercent)) return "";
+  if (accountResetElapsed(window.resetsAt, now)) return t("settings.accounts.resetRefreshing");
+  const remaining = t("settings.accounts.remaining", {
+    period: accountWindowPeriodLabel(window, t),
+    percent: Math.round(window.remainingPercent),
+  });
+  const reset = formatAccountReset(window.resetsAt, t, now);
+  return reset ? `${remaining} · ${reset}` : remaining;
 }
 
 export function formatDuration(milliseconds: number | null | undefined, t: Translate = createTranslator(detectLanguage())): string {

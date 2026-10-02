@@ -2,7 +2,7 @@ import { backendText } from "../backend-text";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { AppWindow, Check, Eye, LogIn, Moon, Plus, RefreshCw, Server, ShieldCheck, Sun, Trash2, UserRound, Wrench } from "lucide-react";
 import { Badge, Button, Dialog, InlineNotice, PageHeader, SectionHeading, Toggle } from "../components";
-import { accountWindowPeriodLabel, compactNumber, effortLabel, formatAccountReset } from "../lib";
+import { accountResetEpochMs, accountResetProbeEpochs, accountResetTickDelay, accountUsageClause, compactNumber, effortLabel } from "../lib";
 import { LANGUAGE_OPTIONS, type LanguageId, type Translate } from "../i18n";
 import type {
   ChatGptAccountPool,
@@ -32,58 +32,54 @@ function isOptimisticAccountId(id: string): boolean {
   return id.startsWith("pending:");
 }
 
-function accountUsageClause(
-  window: {
-    period: string;
-    remainingPercent: number;
-    resetsAt?: number | null;
-    windowDurationMins?: number | null;
-  },
-  period: string,
-  t: Translate,
-  now: number,
-): string {
-  if (!Number.isFinite(window.remainingPercent)) return "";
-  const remaining = t("settings.accounts.remaining", {
-    period,
-    percent: Math.round(window.remainingPercent),
-  });
-  const reset = formatAccountReset(window.resetsAt, t, now);
-  return reset ? `${remaining} · ${reset}` : remaining;
-}
-
-// Reset labels are minute-scale, and the account snapshot refreshes every
-// five minutes, so a countdown computed only on those renders can sit about a
-// minute behind the clock. Tick while this page is mounted and the document
-// is visible; drop the timer on unmount and while the document is hidden.
-const ACCOUNT_RESET_TICK_MS = 30_000;
-
-function useAccountResetClock(): number {
+// Minute labels change on a minute boundary, and "<1m" must end at the reset
+// instant rather than on the next fixed poll. Schedule that sooner instant
+// while this page is mounted and the document is visible. A reset that has
+// passed asks the existing refresh for a new probe, once per instant.
+function useAccountResetClock(
+  resetsAt: Array<number | string | null | undefined>,
+  onElapsed: () => void,
+): number {
   const [now, setNow] = useState(() => Date.now());
+  const onElapsedRef = useRef(onElapsed);
+  onElapsedRef.current = onElapsed;
+  const resetsRef = useRef(resetsAt);
+  resetsRef.current = resetsAt;
+  const probedRef = useRef(new Set<number>());
+  const scheduleKey = resetsAt.map((value) => accountResetEpochMs(value) ?? "").join("|");
+
   useEffect(() => {
     let timer: number | undefined;
-    const stop = () => {
+    let stopped = false;
+    const clear = () => {
       if (timer === undefined) return;
-      window.clearInterval(timer);
+      window.clearTimeout(timer);
       timer = undefined;
     };
-    const start = () => {
-      if (document.visibilityState === "hidden") return;
-      setNow(Date.now());
-      if (timer !== undefined) return;
-      timer = window.setInterval(() => setNow(Date.now()), ACCOUNT_RESET_TICK_MS);
+    const arm = () => {
+      clear();
+      if (stopped || document.visibilityState === "hidden") return;
+      const current = Date.now();
+      setNow(current);
+      const due = accountResetProbeEpochs(resetsRef.current, current, probedRef.current);
+      for (const epoch of due) probedRef.current.add(epoch);
+      if (due.length > 0) onElapsedRef.current();
+      const delay = accountResetTickDelay(resetsRef.current, current);
+      if (delay === null) return;
+      timer = window.setTimeout(arm, delay);
     };
     const onVisibility = () => {
-      if (document.visibilityState === "hidden") stop();
-      else start();
+      if (document.visibilityState === "hidden") clear();
+      else arm();
     };
     onVisibility();
     document.addEventListener("visibilitychange", onVisibility);
     return () => {
-      stop();
+      stopped = true;
+      clear();
       document.removeEventListener("visibilitychange", onVisibility);
     };
-  }, []);
+  }, [scheduleKey]);
   return now;
 }
 
@@ -201,7 +197,17 @@ export function SettingsPage({ target, health, presence, chatgptSession, account
     () => (repairReport?.checks ?? []).filter((check) => check.status === "fail"),
     [repairReport],
   );
-  const resetNow = useAccountResetClock();
+  const accountResetInstants = useMemo(() => {
+    const instants: Array<number | null | undefined> = [];
+    for (const account of Object.values(accountPool?.accounts ?? {})) {
+      const usage = account.subscription?.usage;
+      if (!usage || Array.isArray(usage)) continue;
+      instants.push(usage.resetsAt);
+      if (usage.also && !Array.isArray(usage.also)) instants.push(usage.also.resetsAt);
+    }
+    return instants;
+  }, [accountPool]);
+  const resetNow = useAccountResetClock(accountResetInstants, () => { void onRefresh(); });
   const sessionSharingEnabled = chatgptSession?.sharing === "enabled";
   const sessionLoginLabel = chatgptSession?.session === "usable"
     ? (typeof chatgptSession.expiresInHours === "number"
@@ -463,10 +469,10 @@ export function SettingsPage({ target, health, presence, chatgptSession, account
                 const label = account.subscription?.email && account.label ? `${account.label} · ` : "";
                 const usage = account.subscription?.usage;
                 const primaryUsage = usage
-                  ? accountUsageClause(usage, accountWindowPeriodLabel(usage, t), t, resetNow)
+                  ? accountUsageClause(usage, t, resetNow)
                   : "";
                 const alsoUsage = usage?.also
-                  ? accountUsageClause(usage.also, accountWindowPeriodLabel(usage.also, t), t, resetNow)
+                  ? accountUsageClause(usage.also, t, resetNow)
                   : "";
                 const usageLabel = optimisticPending
                   ? t("settings.accounts.savingAccount")
