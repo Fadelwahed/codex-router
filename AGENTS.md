@@ -3017,3 +3017,21 @@ start does not exist at request latency. The port has to already be open.
   hide checked-in assets such as tray icons and documentation screenshots.
 - Files that are meant to ship — icons, fixtures, docs assets — go in their
   real home under version control, not in `generated/`.
+
+## Cursor Cloud specific instructions
+
+- `npm run check` and `npm test` are the repository checks. Linux browser-panel
+  tests use Playwright Chromium, which the Cloud Agent install script installs.
+- The image Node at `/exec-daemon/node` is older than this repository's 22.19
+  floor. The environment install puts Node.js 24 on `/usr/local/bin` and links
+  `node`, `npm`, `npx`, and `corepack` from `/usr/local/cargo/bin`, which the
+  agent PATH searches first. `node --version` should report 24 before checks.
+- LiteLLM from the hash-locked `requirements/python.txt` lives in `.venv`
+  (`uv` is on `/usr/local/bin`). Do not run `./install.sh` against a real Codex
+  home as a development side effect. Router experiments belong in a scratch
+  `MODEL_ROUTER_STATE_DIR` and `CODEX_HOME`, with `CODEX_ROUTER_NO_DISCOVERY=1`
+  unless the task is about credential discovery.
+- The Control Center UI is `apps/control-center` (`npm run dev` or
+  `npm run build`). A Vite preview has no Electron bridge, so live router data
+  stays unavailable there. `npm run check` in that package is the typecheck.
+  The docs site dependencies are installed under `docs-site`.
