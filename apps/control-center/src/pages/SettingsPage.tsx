@@ -2,7 +2,7 @@ import { backendText } from "../backend-text";
 import { useEffect, useId, useMemo, useRef, useState } from "react";
 import { AppWindow, Check, Eye, LogIn, Moon, Pencil, Plus, RefreshCw, Server, ShieldCheck, Sun, Trash2, UserRound, Wrench } from "lucide-react";
 import { Badge, Button, Dialog, InlineNotice, PageHeader, SectionHeading, Toggle } from "../components";
-import { compactNumber, effortLabel } from "../lib";
+import { accountWindowPeriodLabel, compactNumber, effortLabel, formatAccountReset } from "../lib";
 import { LANGUAGE_OPTIONS, type LanguageId, type Translate } from "../i18n";
 import type {
   ChatGptAccountPool,
@@ -88,6 +88,61 @@ function accountRowIdentity(account: ChatGptSubscriptionAccount, fallback: strin
     prefix: custom && email && custom !== email ? `${email} · ` : !custom && email && stored ? `${stored} · ` : "",
     editableLabel: custom,
   };
+}
+
+function accountUsageClause(
+  window: {
+    period: string;
+    remainingPercent: number;
+    resetsAt?: number | null;
+    windowDurationMins?: number | null;
+  },
+  period: string,
+  t: Translate,
+  now: number,
+): string {
+  if (!Number.isFinite(window.remainingPercent)) return "";
+  const remaining = t("settings.accounts.remaining", {
+    period,
+    percent: Math.round(window.remainingPercent),
+  });
+  const reset = formatAccountReset(window.resetsAt, t, now);
+  return reset ? `${remaining} · ${reset}` : remaining;
+}
+
+// Reset labels are minute-scale, and the account snapshot refreshes every
+// five minutes, so a countdown computed only on those renders can sit about a
+// minute behind the clock. Tick while this page is mounted and the document
+// is visible; drop the timer on unmount and while the document is hidden.
+const ACCOUNT_RESET_TICK_MS = 30_000;
+
+function useAccountResetClock(): number {
+  const [now, setNow] = useState(() => Date.now());
+  useEffect(() => {
+    let timer: number | undefined;
+    const stop = () => {
+      if (timer === undefined) return;
+      window.clearInterval(timer);
+      timer = undefined;
+    };
+    const start = () => {
+      if (document.visibilityState === "hidden") return;
+      setNow(Date.now());
+      if (timer !== undefined) return;
+      timer = window.setInterval(() => setNow(Date.now()), ACCOUNT_RESET_TICK_MS);
+    };
+    const onVisibility = () => {
+      if (document.visibilityState === "hidden") stop();
+      else start();
+    };
+    onVisibility();
+    document.addEventListener("visibilitychange", onVisibility);
+    return () => {
+      stop();
+      document.removeEventListener("visibilitychange", onVisibility);
+    };
+  }, []);
+  return now;
 }
 
 function optimisticAccountPlaceholder(label: string, clientId: string): ChatGptSubscriptionAccount {
@@ -206,6 +261,7 @@ export function SettingsPage({ target, health, presence, chatgptSession, account
     () => (repairReport?.checks ?? []).filter((check) => check.status === "fail"),
     [repairReport],
   );
+  const resetNow = useAccountResetClock();
   const sessionSharingEnabled = chatgptSession?.sharing === "enabled";
   const sessionLoginLabel = chatgptSession?.session === "usable"
     ? (typeof chatgptSession.expiresInHours === "number"
@@ -467,10 +523,16 @@ export function SettingsPage({ target, health, presence, chatgptSession, account
                 const title = identity.title;
                 const label = identity.prefix;
                 const usage = account.subscription?.usage;
+                const primaryUsage = usage
+                  ? accountUsageClause(usage, accountWindowPeriodLabel(usage, t), t, resetNow)
+                  : "";
+                const alsoUsage = usage?.also
+                  ? accountUsageClause(usage.also, accountWindowPeriodLabel(usage.also, t), t, resetNow)
+                  : "";
                 const usageLabel = optimisticPending
                   ? t("settings.accounts.savingAccount")
-                  : usage && Number.isFinite(usage.remainingPercent)
-                    ? t("settings.accounts.remaining", { period: usage.period, percent: Math.round(usage.remainingPercent) })
+                  : primaryUsage
+                    ? [primaryUsage, alsoUsage].filter(Boolean).join(" · ")
                     : t("settings.accounts.usageUnavailable");
                 return (
                   <div

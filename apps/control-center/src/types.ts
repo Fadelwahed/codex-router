@@ -317,7 +317,19 @@ export interface ChatGptSubscriptionAccount {
     hasAccountId?: boolean;
     expiresInHours?: number;
     email?: string;
-    usage?: { period: "weekly" | "monthly" | "current"; remainingPercent: number; resetsAt?: number | null };
+    usage?: {
+      period: "weekly" | "monthly" | "current";
+      remainingPercent: number;
+      resetsAt?: number | null;
+      windowDurationMins?: number | null;
+      planType?: string;
+      also?: {
+        period: "weekly" | "monthly" | "current";
+        remainingPercent: number;
+        resetsAt?: number | null;
+        windowDurationMins?: number | null;
+      };
+    };
   };
   health?: { state?: string; lastStatus?: number; lastError?: string };
   turns: number;

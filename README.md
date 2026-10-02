@@ -1568,15 +1568,28 @@ login remains saved, and switching never removes another account's session.
 
 Each account keeps its own native model catalog and routed overlay. Usage is
 read from up to eight saved, usable accounts' isolated `CODEX_HOME`
-directories, prioritizing the selected account and using the weekly
-window when available and the monthly window otherwise. A display label
+directories, prioritizing the selected account. An exact seven-day
+window is the primary line when OpenAI reports one; otherwise a window
+of at least seven and under twenty-eight days, otherwise the monthly
+window. A window of a different duration is shown beside that line
+with its own label, so ten days reads `10d` rather than weekly. The
+plan type is shown when the probe returns a non-empty name. Each shown
+window includes a compact relative reset time when Codex reported a
+future reset. At day scale that label uses days and hours, rounding
+leftover minutes to the nearest hour (`2d 30m` reads “resets in 2d 1h”;
+under 30 minutes with no hour reads “resets in 2d 0h”). A missing,
+non-finite, negative, or past reset time is omitted. A short window is not
+treated as exhaustion and does not change the selected account. A display label
 can be set on an account without changing its id or login. A label the
 operator sets is shown even when it matches the generated “ChatGPT account N”
-pattern; an untouched generated label still yields the email. The email stays
-visible, and clearing the label shows the email again. Enter in the rename
-field saves it, and Escape cancels. This is an explicit
-switch-only feature: it does not perform automatic quota or round-robin
-routing. See [the account switching guide](docs/CHATGPT-ACCOUNT-MODES.md) for
+pattern; an untouched generated label still yields the email. The label
+field shows how many of its 120 characters are used and says when that
+limit is reached. Clearing a custom label restores the generated name,
+and the email stays visible beside it. A long name truncates, with the
+full label available on hover. Enter in the rename field saves it, and
+Escape cancels. This is
+an explicit switch-only feature: it does not perform automatic quota or
+round-robin routing. See [the account switching guide](docs/CHATGPT-ACCOUNT-MODES.md) for
 the safety and token-refresh details.
 ### Use a local model in Codex (experimental)
 
