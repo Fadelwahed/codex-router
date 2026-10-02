@@ -1584,7 +1584,9 @@ can be set on an account without changing its id or login. A label the
 operator sets is shown even when it matches the generated “ChatGPT account N”
 pattern; an untouched generated label still yields the email. The label
 field shows how many of its 120 characters are used and says when that
-limit is reached. Clearing a custom label restores the generated name,
+limit is reached. The 120 count is user-perceived characters. A typed name
+that matches another account's generated label is refused. Clearing a custom
+label restores a unique generated name,
 and the email stays visible beside it. A long name truncates, with the
 full label available on hover. Enter in the rename field saves it, and
 Escape cancels. This is

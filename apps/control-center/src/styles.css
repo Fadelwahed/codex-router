@@ -1878,12 +1878,18 @@ progress::-webkit-progress-value { border-radius: 999px; background: var(--accen
 }
 
 .subscription-account-row {
+  container-type: inline-size;
+  flex-wrap: wrap;
   min-height: 60px;
   padding-block: 16px;
 }
 
 .subscription-account-row > .settings-actions {
-  flex-shrink: 0;
+  flex: 0 1 auto;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  min-width: 0;
+  max-width: 100%;
   align-self: center;
   gap: 10px;
   margin-top: 0;
@@ -1891,8 +1897,17 @@ progress::-webkit-progress-value { border-radius: 999px; background: var(--accen
 }
 
 .subscription-account-row > .subscription-account-identity {
-  flex: 1 1 16rem;
-  min-width: 11rem;
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+/* Below this the four actions no longer fit beside the name, and a
+   non-wrapping row painted over the next card. Drop them onto their own line. */
+@container (max-width: 36rem) {
+  .subscription-account-row > .settings-actions {
+    flex: 1 0 100%;
+    justify-content: flex-start;
+  }
 }
 
 .subscription-account-identity strong {
@@ -1915,6 +1930,7 @@ progress::-webkit-progress-value { border-radius: 999px; background: var(--accen
 }
 
 .account-label-field {
+  position: relative;
   display: flex;
   flex-wrap: wrap;
   align-items: center;
@@ -1952,6 +1968,15 @@ progress::-webkit-progress-value { border-radius: 999px; background: var(--accen
   margin: 0;
   color: var(--danger);
   font-size: 11px;
+}
+
+.account-label-limit:empty {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  margin: 0;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
 }
 
 .surface-summary {

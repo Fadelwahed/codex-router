@@ -19,6 +19,11 @@ import {
   createChatGPTLoginLease,
 } from "./chatgpt-login-lease.mjs";
 import { ensureNoSymlinkParents } from "./path-security.mjs";
+import {
+  ACCOUNT_LABEL_COLLISION,
+  assertAccountLabelText,
+  sliceAccountLabel,
+} from "./account-label-text.mjs";
 
 export const CHATGPT_ACCOUNT_POOL_SCHEMA_VERSION = 1;
 
@@ -137,7 +142,7 @@ function normalizeAccount(raw, id) {
     state,
     paused: raw.paused === true,
     priority: integer(raw.priority, 50, { min: 0, max: 100_000 }),
-    ...(text(raw.label) ? { label: text(raw.label).slice(0, 120) } : {}),
+    ...(text(raw.label) ? { label: sliceAccountLabel(text(raw.label)) } : {}),
     ...(raw.labelCustom === true && text(raw.label) ? { labelCustom: true } : {}),
     ...(iso(raw.createdAt) ? { createdAt: iso(raw.createdAt) } : {}),
     ...(identity ? { identity } : {}),
@@ -286,18 +291,23 @@ function nextAccountLabel(state) {
   return `ChatGPT account ${numberValue}`;
 }
 
+function generatedLabelCollides(state, label, selfId) {
+  if (!GENERATED_ACCOUNT_LABEL.test(label)) return false;
+  return Object.values(state.accounts).some((account) => (
+    account
+    && account.id !== selfId
+    && account.state !== "revoked"
+    && account.label === label
+  ));
+}
+
 // Empty input clears a custom label only. A generated "ChatGPT account N"
-// name stays put, and a custom name is replaced with the next free generated
-// one, so a reset cannot leave the row without its number. The stored field
-// is already capped at 120 characters by normalizeAccount; reject anything
-// longer, or a NUL, before that backstop so the caller sees the same limit as add.
+// name that the operator never typed stays put. Any custom name, including
+// one that happens to match that pattern, is replaced with the next free
+// generated number so two rows cannot share it. A new custom label that
+// copies another account's generated name is refused.
 export function chatGPTAccountLabelInput(label) {
-  if (typeof label !== "string" || /[\u0000]/.test(label)) {
-    throw new Error("Account label is invalid.");
-  }
-  const trimmed = label.trim();
-  if (trimmed.length > 120) throw new Error("Account label is invalid.");
-  return trimmed;
+  return assertAccountLabelText(label);
 }
 
 export function renameChatGPTSubscriptionAccount(accountValue, label = "", { filePath = CHATGPT_ACCOUNT_POOL_PATH } = {}) {
@@ -307,26 +317,28 @@ export function renameChatGPTSubscriptionAccount(accountValue, label = "", { fil
   const account = state.accounts[id];
   if (!account) throw new Error("Account id is not registered.");
   if (nextLabel) {
+    if (generatedLabelCollides(state, nextLabel, id)) throw new Error(ACCOUNT_LABEL_COLLISION);
     account.label = nextLabel;
     account.labelCustom = true;
+  } else if (account.labelCustom === true || !GENERATED_ACCOUNT_LABEL.test(account.label || "")) {
+    delete account.labelCustom;
+    delete account.label;
+    account.label = nextAccountLabel(state);
   } else {
     delete account.labelCustom;
-    if (!GENERATED_ACCOUNT_LABEL.test(account.label || "")) {
-      delete account.label;
-      account.label = nextAccountLabel(state);
-    }
   }
   writeChatGPTAccountPoolState(state, filePath);
   return sanitizeChatGPTAccount(readChatGPTAccountPoolState(filePath).accounts[id]);
 }
 
 export function createChatGPTSubscriptionAccount({ label = "", filePath = CHATGPT_ACCOUNT_POOL_PATH, homesDir = CHATGPT_ACCOUNT_HOMES_DIR, now = Date.now() } = {}) {
+  const suppliedLabel = chatGPTAccountLabelInput(label);
   const state = readChatGPTAccountPoolState(filePath);
   if (Object.values(state.accounts).filter((account) => account?.state !== "revoked").length >= MAX_ACCOUNTS) throw new Error(`The ChatGPT account list supports at most ${MAX_ACCOUNTS} accounts.`);
+  if (suppliedLabel && generatedLabelCollides(state, suppliedLabel, "")) throw new Error(ACCOUNT_LABEL_COLLISION);
   const id = newAccountId(state);
   const home = chatGPTSubscriptionAccountHome(id, { homesDir });
   ensurePrivateAccountDirectory(home, homesDir);
-  const suppliedLabel = text(label).slice(0, 120);
   const account = normalizeAccount({
     id,
     state: "active",

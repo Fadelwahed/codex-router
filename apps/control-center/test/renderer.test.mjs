@@ -37,6 +37,11 @@ const bridgeSource = String.raw`
   const staleAccountFailure = searchParams.get("staleAccountFailure") === "1";
   const staleProviderUsage = searchParams.get("staleProviderUsage") === "1";
   const fallbackUsage = searchParams.get("fallbackUsage") === "1";
+  const renameFails = searchParams.get("renameFails") === "1";
+  const longAccountLabel = searchParams.get("longAccountLabel") === "1";
+  const duplicateEmail = searchParams.get("duplicateEmail") === "1";
+  const duplicateTitle = searchParams.get("duplicateTitle") === "1";
+  const collidingReset = searchParams.get("collidingReset") === "1";
   // The usage chart walks a rolling window of UTC days ending on the current
   // one (bucketRange in src/lib.ts), so a frozen bucket key silently ages out
   // of the 30-day default and the bars it feeds stop rendering -- the fixture
@@ -242,6 +247,30 @@ const bridgeSource = String.raw`
     sessions: { count: 0 },
     profile: { desired: "active", active: "active", pending: false, running: false },
   };
+  if (duplicateEmail) {
+    accountPoolState.accounts.active.label = "ChatGPT account 1";
+    delete accountPoolState.accounts.active.labelCustom;
+    accountPoolState.accounts.active.subscription.email = "same@example.com";
+    accountPoolState.accounts.current.label = "ChatGPT account 2";
+    delete accountPoolState.accounts.current.labelCustom;
+    accountPoolState.accounts.current.subscription.email = "same@example.com";
+  }
+  if (duplicateTitle) {
+    accountPoolState.accounts.active.label = "Shared inbox";
+    accountPoolState.accounts.active.labelCustom = true;
+    accountPoolState.accounts.current.label = "Shared inbox";
+    accountPoolState.accounts.current.labelCustom = true;
+  }
+  if (longAccountLabel) {
+    accountPoolState.accounts.current.label = "Very long account label that keeps going and going and going and going and going and going and going and going";
+    accountPoolState.accounts.current.labelCustom = true;
+  }
+  if (collidingReset) {
+    accountPoolState.accounts.active.label = "ChatGPT account 1";
+    delete accountPoolState.accounts.active.labelCustom;
+    accountPoolState.accounts.current.label = "ChatGPT account 1";
+    accountPoolState.accounts.current.labelCustom = true;
+  }
 
   window.routerControl = Object.freeze({
     platform: navigator.platform.toLowerCase().includes("mac") ? "darwin" : "linux",
@@ -522,25 +551,53 @@ const bridgeSource = String.raw`
     },
     renameChatGptSubscriptionAccount: async (accountId, label = "") => {
       record("renameChatGptSubscriptionAccount", accountId, label);
+      if (renameFails) throw new Error("ENOSPC: no space left on device");
       const account = accountPoolState.accounts[accountId];
       if (!account) throw new Error("Account id is not registered.");
-      const trimmed = String(label).trim();
-      if (trimmed.length > 120 || trimmed.includes("\u0000")) throw new Error("Account label is invalid.");
+      const raw = String(label);
+      const forbidden = /[\u0000-\u001F\u007F-\u009F\u2028\u2029\u202A-\u202E\u2066-\u2069]/;
+      const loneSurrogate = (value) => {
+        for (let index = 0; index < value.length; index += 1) {
+          const code = value.charCodeAt(index);
+          if (code >= 0xD800 && code <= 0xDBFF) {
+            const next = value.charCodeAt(index + 1);
+            if (!(next >= 0xDC00 && next <= 0xDFFF)) return true;
+            index += 1;
+          } else if (code >= 0xDC00 && code <= 0xDFFF) return true;
+        }
+        return false;
+      };
+      if (forbidden.test(raw) || loneSurrogate(raw)) {
+        throw new Error("Account label contains characters that are not allowed.");
+      }
+      const trimmed = raw.trim();
+      let graphemes = Array.from(trimmed).length;
+      if (typeof Intl !== "undefined" && typeof Intl.Segmenter === "function") {
+        graphemes = 0;
+        const segmenter = new Intl.Segmenter(undefined, { granularity: "grapheme" });
+        for (const _part of segmenter.segment(trimmed)) graphemes += 1;
+      }
+      if (graphemes > 120) throw new Error("Account label is limited to 120 characters.");
+      const generated = /^ChatGPT account (\d+)$/;
       if (trimmed) {
+        const collision = generated.test(trimmed) && Object.values(accountPoolState.accounts).some((entry) => (
+          entry && entry.id !== accountId && entry.state !== "revoked" && String(entry.label || "").trim() === trimmed
+        ));
+        if (collision) throw new Error("Account label matches another account.");
         account.label = trimmed;
         account.labelCustom = true;
+      } else if (account.labelCustom === true || !generated.test(String(account.label || ""))) {
+        delete account.labelCustom;
+        delete account.label;
+        const used = new Set(Object.values(accountPoolState.accounts).filter((entry) => entry && entry.state !== "revoked").map((entry) => {
+          const match = generated.exec(String(entry.label || ""));
+          return match ? Number(match[1]) : undefined;
+        }).filter((value) => Number.isInteger(value)));
+        let numberValue = 1;
+        while (used.has(numberValue)) numberValue += 1;
+        account.label = "ChatGPT account " + numberValue;
       } else {
         delete account.labelCustom;
-        if (!/^ChatGPT account \d+$/.test(String(account.label || ""))) {
-          const used = new Set(Object.values(accountPoolState.accounts).filter((entry) => entry && entry.state !== "revoked").map((entry) => {
-            const match = /^ChatGPT account (\d+)$/.exec(String(entry.label || ""));
-            return match ? Number(match[1]) : undefined;
-          }).filter((value) => Number.isInteger(value)));
-          delete account.label;
-          let numberValue = 1;
-          while (used.has(numberValue)) numberValue += 1;
-          account.label = "ChatGPT account " + numberValue;
-        }
       }
       return { account };
     },
@@ -1077,7 +1134,7 @@ test("the production renderer exposes model discovery and picker actions", { tim
     assert.equal(await accountRows.filter({ hasText: "Removed account" }).count(), 0, "revoked accounts stay hidden");
     assert.equal(await accountRows.filter({ hasText: "secondary@example.com" }).count(), 1, "secondary email should be visible");
     const readySecondary = accountRows.filter({ hasText: "Secondary account" });
-    assert.equal(await readySecondary.getByRole("button", { name: "Login", exact: true }).isDisabled(), true, "ready accounts cannot start a duplicate login");
+    assert.equal(await readySecondary.getByRole("button", { name: "Login ChatGPT account: Secondary account", exact: true }).isDisabled(), true, "ready accounts cannot start a duplicate login");
     await page.getByRole("button", { name: "Refresh Settings", exact: true }).click();
     await readySecondary.getByText("resets in 3h 12m", { exact: false }).waitFor();
     const secondaryText = await readySecondary.innerText();
@@ -1089,6 +1146,14 @@ test("the production renderer exposes model discovery and picker actions", { tim
     const primaryRow = accountRows.filter({ hasText: "primary@example.com" });
     assert.equal(await primaryRow.count(), 1, "primary email should stay visible beside its label");
     await readySecondary.getByRole("button", { name: "Rename ChatGPT account: Secondary account", exact: true }).click();
+    await page.waitForFunction(() => {
+      const input = document.activeElement;
+      return input instanceof HTMLInputElement
+        && input.getAttribute("aria-label") === "ChatGPT account label"
+        && input.selectionStart === 0
+        && input.selectionEnd === input.value.length
+        && input.value.length > 0;
+    });
     await page.getByRole("textbox", { name: "ChatGPT account label", exact: true }).fill("  Work laptop  ");
     await page.getByRole("textbox", { name: "ChatGPT account label", exact: true }).press("Enter");
     const renamed = accountRows.filter({ hasText: "Work laptop" });
@@ -1121,10 +1186,21 @@ test("the production renderer exposes model discovery and picker actions", { tim
       const row = [...document.querySelectorAll(".subscription-account-row")]
         .find((node) => (node.textContent || "").includes("secondary@example.com"));
       const text = row?.textContent || "";
-      return Boolean(row) && text.includes("ChatGPT account 2") && !text.includes("Work laptop") && !text.includes("Secondary account");
+      return Boolean(row) && text.includes("ChatGPT account 1") && !text.includes("ChatGPT account 2") && !text.includes("Work laptop") && !text.includes("Secondary account");
     });
+    await page.getByRole("dialog").waitFor({ state: "hidden" });
 
-    const newLabel = page.getByRole("textbox", { name: "New ChatGPT account label" });
+    const newLabel = page.getByRole("textbox", { name: "New ChatGPT account label", exact: true });
+    const limitLive = page.locator(".subscription-account-create .account-label-limit");
+    assert.equal(await limitLive.getAttribute("aria-live"), "polite");
+    assert.equal(await limitLive.getAttribute("role"), "status");
+    assert.equal((await limitLive.textContent())?.trim() || "", "");
+    await newLabel.fill("kept");
+    await newLabel.evaluate((el) => el.blur());
+    await newLabel.focus();
+    assert.equal(await newLabel.evaluate((el) => (
+      document.activeElement === el && el.value === "kept" && el.selectionStart === el.selectionEnd
+    )), true);
     await newLabel.fill("n".repeat(87));
     const belowLimit = await newLabel.evaluate((el) => {
       const ids = (el.getAttribute("aria-describedby") || "").split(/\s+/).filter(Boolean);
@@ -1155,6 +1231,10 @@ test("the production renderer exposes model discovery and picker actions", { tim
     assert.equal(atLimit.limit, "Character limit reached.");
     assert.equal(atLimit.flagged, "true");
     assert.equal(await page.getByRole("status").filter({ hasText: "Character limit reached." }).count(), 1);
+    await newLabel.fill("\u{1F44D}".repeat(130));
+    assert.equal((await newLabel.inputValue()).length, 240);
+    assert.equal(await newLabel.getAttribute("maxlength"), null);
+    assert.equal(await page.locator(".subscription-account-create .account-label-count").textContent(), "120/120");
     await newLabel.fill("");
 
     const currentTitle = page.locator(".subscription-account-row").filter({ hasText: "primary@example.com" }).locator(".subscription-account-title");
@@ -1162,7 +1242,7 @@ test("the production renderer exposes model discovery and picker actions", { tim
     assert.equal(await currentTitle.evaluate((el) => getComputedStyle(el).whiteSpace), "nowrap");
     assert.equal(await currentTitle.evaluate((el) => getComputedStyle(el).textOverflow), "ellipsis");
     const identityMin = await currentTitle.evaluate((el) => getComputedStyle(el.closest(".subscription-account-identity")).minWidth);
-    assert.ok(parseFloat(identityMin) >= 140, identityMin);
+    assert.equal(identityMin, "0px");
 
     await page.getByRole("button", { name: "Select ChatGPT account: Current account", exact: true }).click();
     await page.waitForFunction(() => window.routerControlTest.calls()
@@ -1191,7 +1271,7 @@ test("the production renderer exposes model discovery and picker actions", { tim
     });
     assert.equal(await optimisticAdd.getByText("Sign-in required", { exact: false }).count(), 1);
 
-    await optimisticAdd.getByRole("button", { name: "Remove", exact: true }).click();
+    await optimisticAdd.getByRole("button", { name: "Remove ChatGPT account: Optimistic Work", exact: true }).click();
     const removeStartedAt = Date.now();
     await optimisticPage.getByRole("button", { name: "Remove account", exact: true }).click();
     await optimisticAdd.waitFor({ state: "detached" });
@@ -1230,7 +1310,7 @@ test("the production renderer exposes model discovery and picker actions", { tim
     await cancelledLoginPage.goto(`${url}?terminalLoginFailure=1`, { waitUntil: "domcontentloaded" });
     await cancelledLoginPage.getByRole("button", { name: "Settings", exact: true }).click();
     const currentAccount = cancelledLoginPage.locator(".subscription-account-row").filter({ hasText: "Current account" });
-    await currentAccount.getByRole("button", { name: "Login", exact: true }).click();
+    await currentAccount.getByRole("button", { name: "Login ChatGPT account: Current account", exact: true }).click();
     await cancelledLoginPage.getByText("ChatGPT login did not complete", { exact: true }).waitFor();
     // One refresh may already be queued when React observes the terminal
     // projection. Give that in-flight poll one interval to settle, then prove
@@ -1245,7 +1325,7 @@ test("the production renderer exposes model discovery and picker actions", { tim
       readsAfterFailure,
       "a terminal backend login result must stop the 1.5 second renderer poll",
     );
-    await currentAccount.getByRole("button", { name: "Login", exact: true }).click();
+    await currentAccount.getByRole("button", { name: "Login ChatGPT account: Current account", exact: true }).click();
     await cancelledLoginPage.waitForFunction(() => window.routerControlTest.calls()
       .filter((call) => call.name === "loginChatGptSubscriptionAccount").length === 2);
     assert.deepEqual(cancelledLoginErrors, []);
@@ -1258,7 +1338,7 @@ test("the production renderer exposes model discovery and picker actions", { tim
     await rejectedLoginPage.goto(`${url}?terminalLoginFailure=1&rejectLoginImmediately=1`, { waitUntil: "domcontentloaded" });
     await rejectedLoginPage.getByRole("button", { name: "Settings", exact: true }).click();
     const rejectedAccount = rejectedLoginPage.locator(".subscription-account-row").filter({ hasText: "Current account" });
-    const rejectedLoginButton = rejectedAccount.getByRole("button", { name: "Login", exact: true });
+    const rejectedLoginButton = rejectedAccount.getByRole("button", { name: "Login ChatGPT account: Current account", exact: true });
     await rejectedLoginButton.click();
     await rejectedLoginPage.getByText("Codex login could not be launched.", { exact: true }).waitFor();
     await rejectedLoginButton.waitFor({ state: "visible" });
@@ -1284,11 +1364,11 @@ test("the production renderer exposes model discovery and picker actions", { tim
     await pendingRemovalPage.goto(`${url}?loginStaysPending=1`, { waitUntil: "domcontentloaded" });
     await pendingRemovalPage.getByRole("button", { name: "Settings", exact: true }).click();
     const pendingAccount = pendingRemovalPage.locator(".subscription-account-row").filter({ hasText: "Current account" });
-    await pendingAccount.getByRole("button", { name: "Login", exact: true }).click();
+    await pendingAccount.getByRole("button", { name: "Login ChatGPT account: Current account", exact: true }).click();
     await pendingRemovalPage.waitForFunction(() => window.routerControlTest.calls()
       .some((call) => call.name === "loginChatGptSubscriptionAccount"));
     assert.equal(
-      await pendingAccount.getByRole("button", { name: "Remove", exact: true }).isDisabled(),
+      await pendingAccount.getByRole("button", { name: "Remove ChatGPT account: Current account", exact: true }).isDisabled(),
       true,
       "an account with a detached OAuth lifecycle must not be removable",
     );
@@ -1315,6 +1395,177 @@ test("the production renderer exposes model discovery and picker actions", { tim
     assert.deepEqual(corruptPoolErrors, []);
     await corruptPoolPage.close();
     assert.deepEqual(pageErrors, [], `renderer errors: ${pageErrors.join("; ")}`);
+  } finally {
+    await browser.close();
+    await close();
+  }
+});
+
+test("ChatGPT account rows stay in the card and label edits are guarded", { timeout: 180_000 }, async () => {
+  assert.ok(chromiumPath, "No Chromium executable is available for the Control Center renderer test.");
+  const { url, close } = await serveRenderer();
+  const browser = await chromium.launch({
+    executablePath: chromiumPath,
+    headless: true,
+    args: process.platform === "linux" ? ["--no-sandbox"] : [],
+  });
+  const longLabel = "Very long account label that keeps going and going and going and going and going and going and going and going";
+  const artifactDir = "/opt/cursor/artifacts/chatgpt-account-rows";
+  mkdirSync(artifactDir, { recursive: true });
+  const inside = (inner, outer) => inner
+    && outer
+    && inner.x >= outer.x - 1
+    && inner.y >= outer.y - 1
+    && inner.x + inner.width <= outer.x + outer.width + 1
+    && inner.y + inner.height <= outer.y + outer.height + 1;
+  const overlaps = (left, right) => {
+    if (!left || !right) return false;
+    const width = Math.min(left.x + left.width, right.x + right.width) - Math.max(left.x, right.x);
+    const height = Math.min(left.y + left.height, right.y + right.height) - Math.max(left.y, right.y);
+    return width > 1 && height > 1;
+  };
+  try {
+    const page = await newEnglishTestPage(browser, { viewport: { width: 1280, height: 760 } });
+    page.setDefaultTimeout(10_000);
+    await page.goto(`${url}?longAccountLabel=1`, { waitUntil: "domcontentloaded" });
+    await page.getByRole("button", { name: "Settings", exact: true }).click();
+    const accounts = page.locator("section.panel-section").filter({
+      has: page.getByRole("heading", { level: 2, name: "ChatGPT accounts", exact: true }),
+    });
+    const desktop = page.locator("section.panel-section").filter({
+      has: page.getByRole("heading", { level: 2, name: "Desktop surfaces", exact: true }),
+    });
+    await accounts.waitFor();
+    const sizes = [[960, 640], [1024, 700], [1280, 760], [800, 600], [640, 380]];
+    for (const [width, height] of sizes) {
+      await page.setViewportSize({ width, height });
+      await accounts.scrollIntoViewIfNeeded();
+      await page.screenshot({ path: path.join(artifactDir, `${width}x${height}.png`) });
+      const accountBox = await accounts.boundingBox();
+      const desktopBox = await desktop.boundingBox();
+      assert.ok(accountBox, `${width}x${height} account card`);
+      const controls = accounts.locator(".subscription-account-row button, .subscription-account-title");
+      const count = await controls.count();
+      assert.ok(count >= 8, `${width}x${height} expected row controls, saw ${count}`);
+      for (let index = 0; index < count; index += 1) {
+        const box = await controls.nth(index).boundingBox();
+        const label = await controls.nth(index).evaluate((el) => el.getAttribute("aria-label") || el.textContent || el.className);
+        assert.ok(box, `${width}x${height} missing box for ${label}`);
+        assert.ok(inside(box, accountBox), `${width}x${height} ${label} extends past the account card`);
+        assert.equal(overlaps(box, desktopBox), false, `${width}x${height} ${label} overlaps Desktop surfaces`);
+      }
+    }
+    await page.setViewportSize({ width: 960, height: 640 });
+    const longTitle = accounts.locator(".subscription-account-title").nth(1);
+    assert.equal(await longTitle.getAttribute("title"), longLabel);
+    assert.equal(await longTitle.evaluate((el) => getComputedStyle(el).textOverflow), "ellipsis");
+    assert.equal(await longTitle.evaluate((el) => getComputedStyle(el).whiteSpace), "nowrap");
+    assert.equal(await longTitle.evaluate((el) => el.scrollWidth > el.clientWidth), true);
+    await page.close();
+
+    const emailPage = await newEnglishTestPage(browser, { viewport: { width: 1280, height: 840 } });
+    emailPage.setDefaultTimeout(10_000);
+    await emailPage.goto(`${url}?duplicateEmail=1`, { waitUntil: "domcontentloaded" });
+    await emailPage.getByRole("button", { name: "Settings", exact: true }).click();
+    await emailPage.getByRole("button", { name: "Selected ChatGPT account: same@example.com (ChatGPT account 1)", exact: true }).waitFor();
+    await emailPage.getByRole("button", { name: "Select ChatGPT account: same@example.com (ChatGPT account 2)", exact: true }).waitFor();
+    await emailPage.getByRole("button", { name: "Rename ChatGPT account: same@example.com (ChatGPT account 1)", exact: true }).waitFor();
+    await emailPage.getByRole("button", { name: "Login ChatGPT account: same@example.com (ChatGPT account 2)", exact: true }).waitFor();
+    await emailPage.getByRole("button", { name: "Remove ChatGPT account: same@example.com (ChatGPT account 1)", exact: true }).waitFor();
+    const currentEmail = emailPage.locator(".subscription-account-row").filter({ hasText: "ChatGPT account 2" });
+    await currentEmail.getByRole("button", { name: "Rename ChatGPT account: same@example.com (ChatGPT account 2)", exact: true }).click();
+    await emailPage.getByRole("textbox", { name: "ChatGPT account label", exact: true }).fill("ChatGPT account 1");
+    const beforeCollision = await emailPage.evaluate(() => window.routerControlTest.calls()
+      .filter((call) => call.name === "renameChatGptSubscriptionAccount").length);
+    await emailPage.getByRole("button", { name: "Save label", exact: true }).click();
+    await emailPage.getByRole("alert").filter({ hasText: "Account label matches another account." }).waitFor();
+    assert.equal(await emailPage.getByRole("dialog").count(), 1);
+    assert.equal(
+      await emailPage.evaluate(() => window.routerControlTest.calls()
+        .filter((call) => call.name === "renameChatGptSubscriptionAccount").length),
+      beforeCollision,
+    );
+    await emailPage.close();
+
+    const titlePage = await newEnglishTestPage(browser, { viewport: { width: 1280, height: 840 } });
+    titlePage.setDefaultTimeout(10_000);
+    await titlePage.goto(`${url}?duplicateTitle=1`, { waitUntil: "domcontentloaded" });
+    await titlePage.getByRole("button", { name: "Settings", exact: true }).click();
+    await titlePage.getByRole("button", { name: "Selected ChatGPT account: Shared inbox (1)", exact: true }).waitFor();
+    await titlePage.getByRole("button", { name: "Login ChatGPT account: Shared inbox (2)", exact: true }).waitFor();
+    await titlePage.getByRole("button", { name: "Remove ChatGPT account: Shared inbox (2)", exact: true }).waitFor();
+    assert.equal(await titlePage.locator(".subscription-account-title").filter({ hasText: "Shared inbox" }).count(), 2);
+    await titlePage.close();
+
+    const resetPage = await newEnglishTestPage(browser, { viewport: { width: 1280, height: 840 } });
+    resetPage.setDefaultTimeout(10_000);
+    await resetPage.goto(`${url}?collidingReset=1`, { waitUntil: "domcontentloaded" });
+    await resetPage.getByRole("button", { name: "Settings", exact: true }).click();
+    const copied = resetPage.locator(".subscription-account-row").filter({ hasText: "primary@example.com" });
+    await copied.getByRole("button", { name: "Rename ChatGPT account: ChatGPT account 1", exact: true }).click();
+    await resetPage.getByRole("textbox", { name: "ChatGPT account label", exact: true }).fill("   ");
+    await resetPage.getByRole("button", { name: "Save label", exact: true }).click();
+    await resetPage.waitForFunction(() => {
+      const rows = [...document.querySelectorAll(".subscription-account-row")];
+      const primary = rows.find((node) => (node.textContent || "").includes("primary@example.com"));
+      const secondary = rows.find((node) => (node.textContent || "").includes("secondary@example.com"));
+      const primaryText = primary?.textContent || "";
+      const secondaryText = secondary?.textContent || "";
+      return primaryText.includes("ChatGPT account 2")
+        && !primaryText.includes("ChatGPT account 1")
+        && secondaryText.includes("ChatGPT account 1")
+        && !secondaryText.includes("ChatGPT account 2");
+    });
+    await resetPage.close();
+
+    const errorPage = await newEnglishTestPage(browser, { viewport: { width: 1280, height: 840 } });
+    errorPage.setDefaultTimeout(10_000);
+    await errorPage.goto(`${url}?renameFails=1`, { waitUntil: "domcontentloaded" });
+    await errorPage.getByRole("button", { name: "Settings", exact: true }).click();
+    await errorPage.locator(".subscription-account-row").filter({ hasText: "Secondary account" })
+      .getByRole("button", { name: "Rename ChatGPT account: Secondary account", exact: true }).click();
+    const kept = errorPage.getByRole("textbox", { name: "ChatGPT account label", exact: true });
+    await kept.fill("Kept label");
+    await errorPage.getByRole("button", { name: "Save label", exact: true }).click();
+    await errorPage.getByRole("alert").filter({ hasText: "ENOSPC: no space left on device" }).waitFor();
+    assert.equal(await errorPage.getByRole("dialog").count(), 1);
+    assert.equal(await kept.inputValue(), "Kept label");
+    await errorPage.close();
+
+    const oncePage = await newEnglishTestPage(browser, { viewport: { width: 1280, height: 840 } });
+    oncePage.setDefaultTimeout(10_000);
+    await oncePage.goto(url, { waitUntil: "domcontentloaded" });
+    await oncePage.getByRole("button", { name: "Settings", exact: true }).click();
+    await oncePage.locator(".subscription-account-row").filter({ hasText: "Secondary account" })
+      .getByRole("button", { name: "Rename ChatGPT account: Secondary account", exact: true }).click();
+    await oncePage.getByRole("textbox", { name: "ChatGPT account label", exact: true }).fill("Once");
+    await oncePage.evaluate(() => {
+      const form = document.querySelector(".dialog-panel form");
+      for (let index = 0; index < 10; index += 1) form.requestSubmit();
+    });
+    await oncePage.getByRole("dialog").waitFor({ state: "hidden" });
+    assert.equal(await oncePage.evaluate(() => window.routerControlTest.calls()
+      .filter((call) => call.name === "renameChatGptSubscriptionAccount" && call.args[1] === "Once").length), 1);
+    await oncePage.close();
+
+    const forbiddenPage = await newEnglishTestPage(browser, { viewport: { width: 1280, height: 840 } });
+    forbiddenPage.setDefaultTimeout(10_000);
+    await forbiddenPage.goto(url, { waitUntil: "domcontentloaded" });
+    await forbiddenPage.getByRole("button", { name: "Settings", exact: true }).click();
+    await forbiddenPage.locator(".subscription-account-row").filter({ hasText: "Secondary account" })
+      .getByRole("button", { name: "Rename ChatGPT account: Secondary account", exact: true }).click();
+    await forbiddenPage.getByRole("textbox", { name: "ChatGPT account label", exact: true }).fill("user\u202Eexe.txt");
+    const beforeForbidden = await forbiddenPage.evaluate(() => window.routerControlTest.calls()
+      .filter((call) => call.name === "renameChatGptSubscriptionAccount").length);
+    await forbiddenPage.getByRole("button", { name: "Save label", exact: true }).click();
+    await forbiddenPage.getByRole("alert").filter({ hasText: "Account label contains characters that are not allowed." }).waitFor();
+    assert.equal(await forbiddenPage.getByRole("dialog").count(), 1);
+    assert.equal(
+      await forbiddenPage.evaluate(() => window.routerControlTest.calls()
+        .filter((call) => call.name === "renameChatGptSubscriptionAccount").length),
+      beforeForbidden,
+    );
+    await forbiddenPage.close();
   } finally {
     await browser.close();
     await close();

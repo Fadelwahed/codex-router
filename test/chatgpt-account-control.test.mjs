@@ -100,7 +100,7 @@ test("a renamed ChatGPT account label persists across a new control process", ()
     const status = runIsolated("chatgpt-account-pool", "status");
     assert.equal(status.accounts[added.id].id, added.id);
     assert.equal(status.accounts[added.id].label, "Personal");
-    const cleared = runIsolated("chatgpt-account-pool", "label", added.id, " \t ");
+    const cleared = runIsolated("chatgpt-account-pool", "label", added.id, "   ");
     assert.equal(cleared.account.id, added.id);
     assert.equal(cleared.account.label, "ChatGPT account 1");
     assert.equal(cleared.account.labelCustom, undefined);
@@ -111,7 +111,11 @@ test("a renamed ChatGPT account label persists across a new control process", ()
     const stderrOf = (error) => String(error?.stderr || error?.message || error);
     assert.throws(
       () => runIsolated("chatgpt-account-pool", "label", added.id, "x".repeat(121)),
-      (error) => /Account label is invalid/.test(stderrOf(error)),
+      (error) => /Account label is limited to 120 characters/.test(stderrOf(error)),
+    );
+    assert.throws(
+      () => runIsolated("chatgpt-account-pool", "label", added.id, "user\u202Eexe.txt"),
+      (error) => /Account label contains characters that are not allowed/.test(stderrOf(error)),
     );
     assert.throws(
       () => runIsolated("chatgpt-account-pool", "label", "acct_missing1", "Name"),

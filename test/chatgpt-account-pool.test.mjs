@@ -32,6 +32,7 @@ import {
   createChatGPTLoginLease,
 } from "../src/chatgpt-login-lease.mjs";
 import { protectPrivateFile } from "../src/file-security.mjs";
+import { accountLabelGraphemeLength } from "../src/account-label-text.mjs";
 
 function writeFileSync(target, contents, options) {
   rawWriteFileSync(target, contents, options);
@@ -107,7 +108,7 @@ test("renaming an account label persists without changing its identity", () => {
   assert.deepEqual(stored.subscription, before.subscription);
   assert.deepEqual(stored.identity, before.identity);
 
-  const cleared = renameChatGPTSubscriptionAccount(account.id, " \t ", options);
+  const cleared = renameChatGPTSubscriptionAccount(account.id, "   ", options);
   assert.equal(cleared.label, "ChatGPT account 1");
   assert.equal(cleared.labelCustom, undefined);
   assert.equal(readChatGPTAccountPoolState(options.filePath).accounts[account.id].label, "ChatGPT account 1");
@@ -116,8 +117,8 @@ test("renaming an account label persists without changing its identity", () => {
 
   assert.equal(chatGPTAccountLabelInput("  kept  "), "kept");
   assert.equal(chatGPTAccountLabelInput(""), "");
-  assert.throws(() => renameChatGPTSubscriptionAccount(account.id, "x".repeat(121), options), /Account label is invalid/);
-  assert.throws(() => renameChatGPTSubscriptionAccount(account.id, "bad\u0000name", options), /Account label is invalid/);
+  assert.throws(() => renameChatGPTSubscriptionAccount(account.id, "x".repeat(121), options), /Account label is limited to 120 characters/);
+  assert.throws(() => renameChatGPTSubscriptionAccount(account.id, "bad\u0000name", options), /Account label contains characters that are not allowed/);
   assert.throws(() => chatGPTAccountLabelInput(12), /Account label is invalid/);
   assert.throws(() => renameChatGPTSubscriptionAccount("acct_missing1", "Name", options), /not registered/);
   assert.equal(readChatGPTAccountPoolState(options.filePath).accounts[account.id].label, "ChatGPT account 1");
@@ -139,9 +140,9 @@ test("a user-set label that matches the generated pattern stays marked as custom
   assert.equal(stored.labelCustom, true);
 
   const cleared = renameChatGPTSubscriptionAccount(generated.id, "  ", options);
-  assert.equal(cleared.label, "ChatGPT account 2");
+  assert.equal(cleared.label, "ChatGPT account 1");
   assert.equal(cleared.labelCustom, undefined);
-  assert.equal(readChatGPTAccountPoolState(options.filePath).accounts[generated.id].label, "ChatGPT account 2");
+  assert.equal(readChatGPTAccountPoolState(options.filePath).accounts[generated.id].label, "ChatGPT account 1");
   assert.equal(readChatGPTAccountPoolState(options.filePath).accounts[generated.id].labelCustom, undefined);
 
   const explicit = createChatGPTSubscriptionAccount({ ...options, label: "  ChatGPT account 4  " });
@@ -156,7 +157,7 @@ test("a whitespace reset keeps a generated number and restores one after a custo
   assert.equal(generated.label, "ChatGPT account 1");
   assert.equal(generated.labelCustom, undefined);
 
-  const kept = renameChatGPTSubscriptionAccount(generated.id, " \n\t ", options);
+  const kept = renameChatGPTSubscriptionAccount(generated.id, "   ", options);
   assert.equal(kept.label, "ChatGPT account 1");
   assert.equal(kept.labelCustom, undefined);
   assert.equal(readChatGPTAccountPoolState(options.filePath).accounts[generated.id].label, "ChatGPT account 1");
@@ -177,6 +178,93 @@ test("a whitespace reset keeps a generated number and restores one after a custo
   assert.equal(stored.accounts[generated.id].labelCustom, undefined);
   assert.equal(stored.accounts[sibling.id].label, "ChatGPT account 1");
   assert.notEqual(stored.accounts[generated.id].label, stored.accounts[sibling.id].label);
+});
+
+test("a custom label that copies a sibling generated name is refused and resets to a free number", () => {
+  const options = fixture();
+  const first = createChatGPTSubscriptionAccount(options);
+  const second = createChatGPTSubscriptionAccount(options);
+  assert.equal(first.label, "ChatGPT account 1");
+  assert.equal(second.label, "ChatGPT account 2");
+  assert.throws(
+    () => renameChatGPTSubscriptionAccount(second.id, "ChatGPT account 1", options),
+    /Account label matches another account/,
+  );
+  assert.equal(readChatGPTAccountPoolState(options.filePath).accounts[second.id].label, "ChatGPT account 2");
+  assert.throws(
+    () => createChatGPTSubscriptionAccount({ ...options, label: "ChatGPT account 1" }),
+    /Account label matches another account/,
+  );
+  assert.equal(Object.keys(readChatGPTAccountPoolState(options.filePath).accounts).length, 2);
+
+  const seeded = readChatGPTAccountPoolState(options.filePath);
+  seeded.accounts[second.id].label = "ChatGPT account 1";
+  seeded.accounts[second.id].labelCustom = true;
+  writeChatGPTAccountPoolState(seeded, options.filePath);
+  const cleared = renameChatGPTSubscriptionAccount(second.id, "   ", options);
+  assert.equal(cleared.labelCustom, undefined);
+  assert.equal(cleared.label, "ChatGPT account 2");
+  assert.equal(readChatGPTAccountPoolState(options.filePath).accounts[first.id].label, "ChatGPT account 1");
+  assert.notEqual(cleared.label, readChatGPTAccountPoolState(options.filePath).accounts[first.id].label);
+
+  const shared = renameChatGPTSubscriptionAccount(second.id, "Work laptop", options);
+  const alsoShared = renameChatGPTSubscriptionAccount(first.id, "Work laptop", options);
+  assert.equal(shared.label, "Work laptop");
+  assert.equal(alsoShared.label, "Work laptop");
+});
+
+test("account labels reject controls, bidi marks, and lone surrogates and count graphemes", () => {
+  const options = fixture();
+  const account = createChatGPTSubscriptionAccount(options);
+  const rejected = [
+    "user\u202Eexe.txt",
+    "left\u202Ato\u202Cright",
+    "isolate\u2066text\u2069",
+    "line\nbreak",
+    "tab\there",
+    " \n\t ",
+    "para\u2028break",
+    "delete\u007F",
+    "c1\u009F",
+    "\uD800",
+    "\uDC00",
+    "lead\uD800trail",
+  ];
+  for (const label of rejected) {
+    assert.throws(
+      () => renameChatGPTSubscriptionAccount(account.id, label, options),
+      /Account label contains characters that are not allowed/,
+      label,
+    );
+  }
+  assert.equal(readChatGPTAccountPoolState(options.filePath).accounts[account.id].label, "ChatGPT account 1");
+  const emoji = "\u{1F44D}".repeat(120);
+  const renamed = renameChatGPTSubscriptionAccount(account.id, emoji, options);
+  assert.equal(accountLabelGraphemeLength(renamed.label), 120);
+  assert.equal(renamed.label.length, 240);
+  assert.throws(
+    () => renameChatGPTSubscriptionAccount(account.id, "\u{1F44D}".repeat(121), options),
+    /Account label is limited to 120 characters/,
+  );
+  const marks = "e\u0301".repeat(120);
+  const marked = renameChatGPTSubscriptionAccount(account.id, marks, options);
+  assert.equal(accountLabelGraphemeLength(marked.label), 120);
+  assert.equal(marked.label.length, 240);
+  assert.equal(accountLabelGraphemeLength("e\u0301".repeat(3), false), 6);
+  assert.equal(accountLabelGraphemeLength("e\u0301".repeat(3)), 3);
+  assert.equal(chatGPTAccountLabelInput("  kept  "), "kept");
+  assert.equal(chatGPTAccountLabelInput("   "), "");
+
+  const state = readChatGPTAccountPoolState(options.filePath);
+  state.accounts[account.id].label = "e\u0301".repeat(121);
+  writeFileSync(options.filePath, JSON.stringify(state), { mode: 0o600 });
+  const sliced = readChatGPTAccountPoolState(options.filePath).accounts[account.id];
+  assert.equal(accountLabelGraphemeLength(sliced.label), 120);
+  assert.equal(sliced.label.length, 240);
+  const kept = readChatGPTAccountPoolState(options.filePath);
+  kept.accounts[account.id].label = "user\u202Eexe.txt";
+  writeFileSync(options.filePath, JSON.stringify(kept), { mode: 0o600 });
+  assert.equal(readChatGPTAccountPoolState(options.filePath).accounts[account.id].label, "user\u202Eexe.txt");
 });
 
 test("account labels reuse the first free number after a removed account", () => {

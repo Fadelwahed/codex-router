@@ -2120,10 +2120,8 @@ export function registerIpcHandlers({
     );
   });
   handleAction("addChatGptSubscriptionAccount", async ({ label = "" } = {}) => {
-    if (typeof label !== "string" || label.length > 120 || /[\u0000]/.test(label)) {
-      throw new Error("Account label is invalid.");
-    }
-    return runJson(["chatgpt-account-pool", "add", label.trim()], { timeoutMs: 60_000 });
+    const trimmed = chatGPTAccountLabelInput(label);
+    return runJson(["chatgpt-account-pool", "add", trimmed], { timeoutMs: 60_000 });
   });
   handleAction("renameChatGptSubscriptionAccount", async ({ accountId, label = "" } = {}) => {
     const id = stringValue(accountId, "Account id", CHATGPT_ACCOUNT_ID);
