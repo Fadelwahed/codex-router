@@ -1897,3 +1897,79 @@ for (const [language, copy] of [
     } finally { await browser.close(); await close(); }
   });
 }
+
+// Matches ACCOUNT_RESET_TICK_MS in SettingsPage. The countdown is minute-scale,
+// so one tick past the fixture's 45s pad (3h 12m 45s) must become 3h 11m.
+const ACCOUNT_RESET_TICK_MS = 30_000;
+
+test("settings reset countdowns tick while visible and stop when hidden or left", { timeout: 120_000 }, async () => {
+  assert.equal(existsSync(path.join(dist, "index.html")), true, "npm test must build the renderer first");
+  assert.ok(chromiumPath, "No Chromium executable is available for the Control Center renderer test.");
+  const { url, close } = await serveRenderer();
+  const browser = await chromium.launch({
+    executablePath: chromiumPath,
+    headless: true,
+    args: process.platform === "linux" ? ["--no-sandbox"] : [],
+  });
+  const pageErrors = [];
+  try {
+    const page = await newEnglishTestPage(browser, { viewport: { width: 1280, height: 840 } });
+    page.setDefaultTimeout(10_000);
+    page.on("pageerror", (error) => pageErrors.push(error.message));
+    await page.clock.install();
+    await page.addInitScript((tickMs) => {
+      const nativeSet = window.setInterval.bind(window);
+      const nativeClear = window.clearInterval.bind(window);
+      const ids = new Set();
+      window.setInterval = (callback, delay, ...args) => {
+        const id = nativeSet(callback, delay, ...args);
+        if (delay === tickMs) ids.add(id);
+        return id;
+      };
+      window.clearInterval = (id) => {
+        ids.delete(id);
+        return nativeClear(id);
+      };
+      window.__accountResetTimers = () => ids.size;
+    }, ACCOUNT_RESET_TICK_MS);
+    await page.goto(`${url}?healthPollOnceMs=86400000`, { waitUntil: "domcontentloaded", timeout: 30_000 });
+    await page.getByRole("button", { name: "Settings", exact: true }).click();
+    const secondary = page.locator(".subscription-account-row").filter({ hasText: "Secondary account" });
+    await secondary.getByText("resets in 3h 12m", { exact: false }).waitFor();
+    assert.equal(await page.evaluate(() => window.__accountResetTimers()), 1, "settings should arm one reset tick");
+
+    await page.evaluate(() => {
+      const state = { value: "visible" };
+      const prototype = Document.prototype;
+      Object.defineProperty(prototype, "visibilityState", {
+        configurable: true,
+        get() { return state.value; },
+      });
+      Object.defineProperty(prototype, "hidden", {
+        configurable: true,
+        get() { return state.value === "hidden"; },
+      });
+      document.__resetVisibility = state;
+      window.__setResetVisibility = (value) => {
+        state.value = value;
+        document.dispatchEvent(new Event("visibilitychange"));
+      };
+    });
+    await page.evaluate(() => window.__setResetVisibility("hidden"));
+    assert.equal(await page.evaluate(() => window.__accountResetTimers()), 0, "hiding the document clears the tick");
+    await page.clock.fastForward(ACCOUNT_RESET_TICK_MS * 3);
+    assert.match(await secondary.innerText(), /resets in 3h 12m/);
+    assert.doesNotMatch(await secondary.innerText(), /resets in 3h 11m/);
+
+    await page.evaluate(() => window.__setResetVisibility("visible"));
+    await secondary.getByText("resets in 3h 11m", { exact: false }).waitFor();
+    assert.equal(await page.evaluate(() => window.__accountResetTimers()), 1, "showing the document arms the tick again");
+    await page.locator(".primary-nav button").nth(0).click();
+    await page.locator(".page-scroll-dashboard h1").waitFor();
+    assert.equal(await page.evaluate(() => window.__accountResetTimers()), 0, "leaving settings clears the tick");
+    assert.deepEqual(pageErrors, [], `renderer errors: ${pageErrors.join("; ")}`);
+  } finally {
+    await browser.close();
+    await close();
+  }
+});

@@ -1061,6 +1061,8 @@ export const zhCN = {
   "settings.accounts.windowDays": "{days} 天",
   "settings.accounts.windowHours": "{hours} 小时",
   "settings.accounts.windowMinutes": "{minutes} 分钟",
+  "settings.accounts.periodWeekly": "每周",
+  "settings.accounts.periodMonthly": "每月",
   "settings.accounts.usageUnavailable": "用量不可用",
   "settings.accounts.tokenHours": " · 登录凭证剩余 {hours} 小时",
   "settings.accounts.select": "选择",

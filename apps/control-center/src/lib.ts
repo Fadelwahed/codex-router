@@ -124,14 +124,16 @@ function accountResetWhen(totalMinutes: number, t: Translate): string {
 
 const ACCOUNT_WINDOW_DAY_MINUTES = 24 * 60;
 
-// "weekly" is an exact seven-day window. Any other duration keeps its own
+// "weekly" is an exact seven-day window and "monthly" is the named monthly
+// window. Both follow the active language. Any other duration keeps its own
 // length, in whole days when it has them, so a ten-day window reads "10d"
-// and is not collapsed into the weekly line.
+// (or "10 天") and is not collapsed into the weekly line.
 export function accountWindowPeriodLabel(
   window: { period: string; windowDurationMins?: number | null },
   t: Translate,
 ): string {
-  if (window.period === "weekly" || window.period === "monthly") return window.period;
+  if (window.period === "weekly") return t("settings.accounts.periodWeekly");
+  if (window.period === "monthly") return t("settings.accounts.periodMonthly");
   const minutes = window.windowDurationMins;
   if (typeof minutes === "number" && Number.isFinite(minutes) && minutes > 0) {
     if (minutes % ACCOUNT_WINDOW_DAY_MINUTES === 0) {

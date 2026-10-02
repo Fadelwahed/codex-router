@@ -1113,6 +1113,8 @@ export const en = {
   "settings.accounts.windowDays": "{days}d",
   "settings.accounts.windowHours": "{hours}h",
   "settings.accounts.windowMinutes": "{minutes}m",
+  "settings.accounts.periodWeekly": "weekly",
+  "settings.accounts.periodMonthly": "monthly",
   "settings.accounts.usageUnavailable": "Usage unavailable",
   "settings.accounts.tokenHours": " · {hours}h token",
   "settings.accounts.select": "Select",

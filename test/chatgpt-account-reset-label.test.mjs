@@ -45,7 +45,7 @@ test("day-scale leftovers round to the nearest hour", () => {
   assert.equal(formatAccountReset(at(2 * DAY + 29 * MINUTE), traditional, NOW), "2 天 0 小時後重設");
 });
 
-test("only an exact week is labeled weekly", () => {
+test("only an exact week is labeled weekly, in the active language", () => {
   const t = createTranslator("en");
   const simplified = createTranslator("zh-CN");
   const traditional = createTranslator("zh-TW");
@@ -54,8 +54,16 @@ test("only an exact week is labeled weekly", () => {
   assert.equal(accountWindowPeriodLabel({ period: "current", windowDurationMins: 10 * 24 * 60 }, t), "10d");
   assert.equal(accountWindowPeriodLabel({ period: "current", windowDurationMins: 300 }, t), "5h");
   assert.equal(accountWindowPeriodLabel({ period: "current", windowDurationMins: 90 }, t), "90m");
+  assert.equal(accountWindowPeriodLabel({ period: "weekly", windowDurationMins: 7 * 24 * 60 }, simplified), "每周");
+  assert.equal(accountWindowPeriodLabel({ period: "monthly", windowDurationMins: 30 * 24 * 60 }, simplified), "每月");
   assert.equal(accountWindowPeriodLabel({ period: "current", windowDurationMins: 10 * 24 * 60 }, simplified), "10 天");
+  assert.equal(accountWindowPeriodLabel({ period: "current", windowDurationMins: 300 }, simplified), "5 小时");
+  assert.equal(accountWindowPeriodLabel({ period: "weekly", windowDurationMins: 7 * 24 * 60 }, traditional), "每週");
+  assert.equal(accountWindowPeriodLabel({ period: "monthly", windowDurationMins: 30 * 24 * 60 }, traditional), "每月");
   assert.equal(accountWindowPeriodLabel({ period: "current", windowDurationMins: 10 * 24 * 60 }, traditional), "10 天");
+  assert.equal(accountWindowPeriodLabel({ period: "current", windowDurationMins: 300 }, traditional), "5 小時");
+  assert.equal(accountWindowPeriodLabel({ period: "weekly", windowDurationMins: 10 * 24 * 60 }, simplified), "每周");
+  assert.equal(accountWindowPeriodLabel({ period: "current", windowDurationMins: 10 * 24 * 60 }, t), "10d");
 });
 
 test("leftover seconds stay inside the current floor bucket", () => {

@@ -1115,6 +1115,8 @@ export const zhTW = {
   "settings.accounts.windowDays": "{days} 天",
   "settings.accounts.windowHours": "{hours} 小時",
   "settings.accounts.windowMinutes": "{minutes} 分鐘",
+  "settings.accounts.periodWeekly": "每週",
+  "settings.accounts.periodMonthly": "每月",
   "settings.accounts.usageUnavailable": "用量無法取得",
   "settings.accounts.tokenHours": " · {hours} 小時 token",
   "settings.accounts.select": "選取",
