@@ -1058,7 +1058,7 @@ test("the production renderer exposes model discovery and picker actions", { tim
     const primaryRow = accountRows.filter({ hasText: "primary@example.com" });
     assert.equal(await primaryRow.count(), 1, "primary email should stay visible beside its label");
     await readySecondary.getByRole("button", { name: "Rename ChatGPT account: Secondary account", exact: true }).click();
-    await page.getByRole("textbox", { name: "ChatGPT account label" }).fill("  Work laptop  ");
+    await page.getByRole("textbox", { name: "ChatGPT account label", exact: true }).fill("  Work laptop  ");
     await page.getByRole("button", { name: "Save label", exact: true }).click();
     const renamed = accountRows.filter({ hasText: "Work laptop" });
     await renamed.waitFor();
@@ -1069,7 +1069,7 @@ test("the production renderer exposes model discovery and picker actions", { tim
       && call.args[1] === "  Work laptop  "
     ))), true);
     await renamed.getByRole("button", { name: "Rename ChatGPT account: Work laptop", exact: true }).click();
-    await page.getByRole("textbox", { name: "ChatGPT account label" }).fill("   ");
+    await page.getByRole("textbox", { name: "ChatGPT account label", exact: true }).fill("   ");
     await page.getByRole("button", { name: "Save label", exact: true }).click();
     await page.waitForFunction(() => {
       const row = [...document.querySelectorAll(".subscription-account-row")]
