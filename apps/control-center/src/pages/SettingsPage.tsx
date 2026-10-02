@@ -2,7 +2,7 @@ import { backendText } from "../backend-text";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { AppWindow, Check, Eye, LogIn, Moon, Plus, RefreshCw, Server, ShieldCheck, Sun, Trash2, UserRound, Wrench } from "lucide-react";
 import { Badge, Button, Dialog, InlineNotice, PageHeader, SectionHeading, Toggle } from "../components";
-import { compactNumber, effortLabel } from "../lib";
+import { accountResetEpochMs, accountUsageClause, bindAccountResetClock, compactNumber, effortLabel } from "../lib";
 import { LANGUAGE_OPTIONS, type LanguageId, type Translate } from "../i18n";
 import type {
   ChatGptAccountPool,
@@ -30,6 +30,48 @@ type AccountOverlay =
 
 function isOptimisticAccountId(id: string): boolean {
   return id.startsWith("pending:");
+}
+
+// Minute labels change on a minute boundary, and "<1m" must end at the reset
+// instant rather than on the next fixed poll. One timer paints that sooner
+// instant while this page is visible. A passed reset asks the existing
+// refresh for a new probe, then that account waits at least a minute. The
+// wait grows while its own answer stays elapsed or only seconds away, and a
+// normal window clears it. Another account's wait does not hold this one.
+// The gates survive a new reset epoch so that epoch cannot arm a probe alone.
+function useAccountResetClock(
+  accounts: ReadonlyArray<{ id: string; resetsAt: Array<number | string | null | undefined> }>,
+  onElapsed: () => void,
+): number {
+  const [now, setNow] = useState(() => Date.now());
+  const onElapsedRef = useRef(onElapsed);
+  onElapsedRef.current = onElapsed;
+  const accountsRef = useRef(accounts);
+  accountsRef.current = accounts;
+  const gatesRef = useRef<Record<string, { streak: number; nextAllowedAt: number }>>({});
+  const scheduleKey = accounts.map((account) =>
+    `${account.id}=${account.resetsAt.map((value) => accountResetEpochMs(value) ?? "").join(",")}`,
+  ).join("|");
+
+  useEffect(() => {
+    const clock = bindAccountResetClock({
+      getAccounts: () => accountsRef.current,
+      onTick: setNow,
+      onProbe: () => { onElapsedRef.current(); },
+      gates: gatesRef,
+      allow: () => document.visibilityState !== "hidden",
+      schedule: (fn, ms) => window.setTimeout(fn, ms),
+      cancel: (id) => { window.clearTimeout(id as number); },
+    });
+    const onVisibility = () => { clock.arm(); };
+    onVisibility();
+    document.addEventListener("visibilitychange", onVisibility);
+    return () => {
+      clock.stop();
+      document.removeEventListener("visibilitychange", onVisibility);
+    };
+  }, [scheduleKey]);
+  return now;
 }
 
 function optimisticAccountPlaceholder(label: string, clientId: string): ChatGptSubscriptionAccount {
@@ -146,6 +188,18 @@ export function SettingsPage({ target, health, presence, chatgptSession, account
     () => (repairReport?.checks ?? []).filter((check) => check.status === "fail"),
     [repairReport],
   );
+  const accountResetInstants = useMemo(() => {
+    const accounts: Array<{ id: string; resetsAt: Array<number | null | undefined> }> = [];
+    for (const account of Object.values(accountPool?.accounts ?? {})) {
+      const usage = account.subscription?.usage;
+      if (!usage || Array.isArray(usage) || account.id === "") continue;
+      const resetsAt = [usage.resetsAt];
+      if (usage.also && !Array.isArray(usage.also)) resetsAt.push(usage.also.resetsAt);
+      accounts.push({ id: account.id, resetsAt });
+    }
+    return accounts;
+  }, [accountPool]);
+  const resetNow = useAccountResetClock(accountResetInstants, () => { void onRefresh(); });
   const sessionSharingEnabled = chatgptSession?.sharing === "enabled";
   const sessionLoginLabel = chatgptSession?.session === "usable"
     ? (typeof chatgptSession.expiresInHours === "number"
@@ -406,10 +460,16 @@ export function SettingsPage({ target, health, presence, chatgptSession, account
                 const title = account.subscription?.email || account.label || t("settings.accounts.defaultTitle");
                 const label = account.subscription?.email && account.label ? `${account.label} · ` : "";
                 const usage = account.subscription?.usage;
+                const primaryUsage = usage
+                  ? accountUsageClause(usage, t, resetNow)
+                  : "";
+                const alsoUsage = usage?.also
+                  ? accountUsageClause(usage.also, t, resetNow)
+                  : "";
                 const usageLabel = optimisticPending
                   ? t("settings.accounts.savingAccount")
-                  : usage && Number.isFinite(usage.remainingPercent)
-                    ? t("settings.accounts.remaining", { period: usage.period, percent: Math.round(usage.remainingPercent) })
+                  : primaryUsage
+                    ? [primaryUsage, alsoUsage].filter(Boolean).join(" · ")
                     : t("settings.accounts.usageUnavailable");
                 return (
                   <div

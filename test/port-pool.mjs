@@ -1,68 +1,220 @@
-import { readFileSync, readdirSync } from "node:fs";
+import { closeSync, mkdirSync, openSync, readFileSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { createServer } from "node:net";
+import { tmpdir } from "node:os";
 import path from "node:path";
-import { fileURLToPath } from "node:url";
 
-// Reserving a port by binding :0, reading the number, and closing the socket
-// hands that number straight back to the ephemeral pool -- and whatever is
-// meant to use it does not bind for another few milliseconds. `node --test`
-// runs every test file in its own process, in parallel, so a second file's
-// bind(0) could be handed the same number inside that window and whichever
-// bound second died:
+// Two failures stacked on the old fixed blocks.
 //
-//     Error: listen EADDRINUSE: address already in use 127.0.0.1:35011
+// `node --test` runs every file in its own process, and each file used to own
+// a port block chosen from the sorted list of files that import this module.
+// That listing is identical in two checkouts, so two worktrees running the
+// suite at once bound the same ports. The probe made it worse: it bound a
+// candidate, closed it, and only then returned the number. The caller's real
+// listen happened later, and the other worktree could win that gap
+// (`listen EADDRINUSE`).
 //
-// It failed CI at random, most often in startup-cleanup.test.mjs, which
-// reserves five ports before it spawns anything and so holds five of those
-// windows open at once. Eight test files had their own copy of the same helper.
+// Binding port 0 and closing it is the same race against the ephemeral pool,
+// which is why this helper stopped doing that. The ports stay in a private
+// range below every platform's ephemeral floor (Linux 32768, macOS and Windows
+// 49152), so an unrelated bind(0) is not handed one of them. What coordinates
+// *our* processes is a shared directory, not a per-checkout file list:
 //
-// The fix is to stop drawing from the pool everything else draws from. Each
-// test file gets a block of ports of its own, and the blocks sit *below* every
-// platform's ephemeral range (Linux from 32768, macOS and Windows from 49152),
-// so no other process's bind(0) can be handed one of ours and no other test
-// file using this helper shares a block. What remains is a leftover from an
-// earlier run of the same file, which the bind check catches by moving up the
-// block.
+//   1. An exclusive lock file (`allocation.lock`, created with `wx`) is held
+//      across the probe and the reservation write. The pid is written before
+//      any await. Waiters steal a lock only when that pid is dead. An empty
+//      lock (the creator has not written the pid yet, or died in that gap)
+//      is stolen only after it has sat for a second, so one waiter cannot
+//      unlink a lock another process is still creating. Releasing the lock
+//      unlinks it only when the file still names this pid, so a replacement
+//      lock is left alone.
+//   2. The chosen port is recorded as `reservations/<port>` containing the
+//      owner pid *before* the lock is released. Another pool process skips a
+//      reservation whose pid is still alive, so the gap between this probe's
+//      close and the caller's later listen is not a window another test can
+//      take.
+//   3. A `cursor` file in the same directory is the next port to try. It is
+//      read and advanced under the same lock, so a process does not walk
+//      every reservation already handed out (that scan blocked the test
+//      event loop long enough for a 5s health wait to expire). A reservation
+//      whose pid is dead is removed when the cursor lands on it, and that
+//      port may be drawn again.
+//   4. On process exit, this process deletes only the reservations it wrote.
+//      The cursor file stays, so the next process continues forward.
 //
-// Nothing here serializes: the blocks are disjoint by construction, so no test
-// file ever waits on another.
-// Keep the pool comfortably above the privileged/system-service range while
-// leaving enough non-ephemeral space for large integration files. The routing
-// suite now needs 75 distinct listeners; starting at 20,000 divided the range
-// into only 74 ports once the Control Center tests were added.
-const FIRST_PORT = 10_000;
+// The directory is `os.tmpdir()/codex-router-test-port-pool`, shared by every
+// checkout on the machine. `CODEX_ROUTER_TEST_PORT_POOL_DIR` points a single
+// process at a private directory; the suite itself leaves it unset so
+// concurrent worktrees keep coordinating. `CODEX_ROUTER_TEST_PORT_POOL_START`
+// is an optional integer cursor inside the window (invalid values are
+// ignored). It applies only when `cursor` does not already exist. Unset, the
+// first process starts at the bottom of the window.
+//
+// Nothing here draws from the OS ephemeral pool. Exhausting the private range
+// throws rather than falling back to bind(0).
+
+export const PORT_POOL_FIRST = 10_000;
 // One below Linux's default ephemeral floor of 32768.
-const LAST_PORT = 32_767;
-const MAX_BLOCK = 256;
-const MIN_BLOCK = 32;
+export const PORT_POOL_LAST = 32_767;
+const PORT_SPAN = PORT_POOL_LAST - PORT_POOL_FIRST + 1;
+const LOCK_WAIT_MS = 60_000;
+const LOCK_POLL_MS = 5;
+// Long enough for the creator's pid write to become visible, short enough
+// that a process killed between `wx` and that write does not wedge the pool.
+const LOCK_STALE_MS = 1_000;
 
-const TEST_DIR = path.dirname(fileURLToPath(import.meta.url));
+function initialCursor() {
+  const raw = process.env.CODEX_ROUTER_TEST_PORT_POOL_START;
+  if (raw === undefined || raw === "") return PORT_POOL_FIRST;
+  const value = Number(raw);
+  if (!Number.isInteger(value) || value < PORT_POOL_FIRST || value > PORT_POOL_LAST) {
+    return PORT_POOL_FIRST;
+  }
+  return value;
+}
 
-// The same listing in every process, so every file agrees on who owns what
-// without any shared state to coordinate. Files that never import this helper
-// do not consume address space: counting all of them shrank routing.test.mjs's
-// block below its real listener count as unrelated unit-test files were added.
-// Adding a port-pool consumer reshuffles the blocks, which is harmless: one run
-// sees one listing.
-function blockFor(entry) {
-  const files = readdirSync(TEST_DIR)
-    .filter((file) => file.endsWith(".test.mjs"))
-    .filter((file) =>
-      readFileSync(path.join(TEST_DIR, file), "utf8").includes("./port-pool.mjs"),
-    )
-    .sort();
-  const index = files.indexOf(path.basename(entry));
-  if (index === -1) return undefined;
-  const size = Math.max(
-    MIN_BLOCK,
-    Math.min(MAX_BLOCK, Math.floor((LAST_PORT - FIRST_PORT) / Math.max(files.length, 1))),
-  );
-  const start = FIRST_PORT + index * size;
-  // More port-consuming test files than the range can seat. Falling back keeps
-  // the suite working; it just stops being race-proof, which is what it was
-  // before.
-  if (start + size > LAST_PORT) return undefined;
-  return { start, size };
+const issued = new Set();
+const ownedReservations = new Set();
+let releaseHooked = false;
+
+function poolPaths() {
+  const root = process.env.CODEX_ROUTER_TEST_PORT_POOL_DIR
+    || path.join(tmpdir(), "codex-router-test-port-pool");
+  return {
+    root,
+    lock: path.join(root, "allocation.lock"),
+    reservations: path.join(root, "reservations"),
+  };
+}
+
+function pidAlive(pid) {
+  if (!Number.isInteger(pid) || pid <= 0) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    // EPERM means some live process owns the pid and we may not signal it.
+    // Treating that as dead would let us steal a port (or the lock) out from
+    // under a process that is still using it.
+    return error?.code === "EPERM";
+  }
+}
+
+function reservationFile(reservations, port) {
+  return path.join(reservations, String(port));
+}
+
+// True when a live process, including this one, already owns the port. A
+// missing, corrupt, or dead-pid file is removed and does not block the port.
+function reservationHeld(reservations, port) {
+  const file = reservationFile(reservations, port);
+  let text;
+  try {
+    text = readFileSync(file, "utf8");
+  } catch (error) {
+    if (error?.code === "ENOENT") return false;
+    throw error;
+  }
+  const pid = Number(String(text).trim());
+  if (pid === process.pid || pidAlive(pid)) return true;
+  try {
+    unlinkSync(file);
+  } catch (error) {
+    if (error?.code !== "ENOENT") throw error;
+  }
+  return false;
+}
+
+function hookRelease() {
+  if (releaseHooked) return;
+  releaseHooked = true;
+  process.on("exit", () => {
+    for (const file of ownedReservations) {
+      try {
+        unlinkSync(file);
+      } catch {
+        // The reservation is already gone, or the directory went away with it.
+      }
+    }
+    const { lock } = poolPaths();
+    try {
+      const owner = Number(String(readFileSync(lock, "utf8")).trim());
+      if (owner === process.pid) unlinkSync(lock);
+    } catch {
+      // Another process owns the lock, or it was already released.
+    }
+  });
+}
+
+function sleep(milliseconds) {
+  return new Promise((resolve) => {
+    setTimeout(resolve, milliseconds);
+  });
+}
+
+// True when the lock file names a dead pid, or has sat empty long enough that
+// its creator is not still in the `wx` → pid-write gap. A live pid, including
+// this process, is never stale.
+function lockIsStale(lockPath) {
+  let owner = Number.NaN;
+  let mtimeMs = 0;
+  try {
+    owner = Number(String(readFileSync(lockPath, "utf8")).trim());
+    mtimeMs = statSync(lockPath).mtimeMs;
+  } catch (error) {
+    if (error?.code === "ENOENT") return false;
+    throw error;
+  }
+  if (owner === process.pid || pidAlive(owner)) return false;
+  if (!Number.isInteger(owner) || owner <= 0) {
+    return Date.now() - mtimeMs > LOCK_STALE_MS;
+  }
+  return true;
+}
+
+async function withLock(fn) {
+  const paths = poolPaths();
+  mkdirSync(paths.root, { recursive: true });
+  mkdirSync(paths.reservations, { recursive: true });
+  const started = Date.now();
+  for (;;) {
+    let fd;
+    try {
+      fd = openSync(paths.lock, "wx");
+    } catch (error) {
+      if (error?.code !== "EEXIST") throw error;
+      if (lockIsStale(paths.lock)) {
+        try {
+          unlinkSync(paths.lock);
+        } catch {
+          // The owner released it, or another waiter stole it first.
+        }
+      }
+      if (Date.now() - started > LOCK_WAIT_MS) {
+        throw new Error(
+          "timed out waiting for the test port-pool lock; another test process " +
+            "is holding allocation.lock in the shared port-pool directory",
+        );
+      }
+      // Yield. A same-process waiter must return to the event loop so the
+      // holder can finish its bind probe.
+      // eslint-disable-next-line no-await-in-loop -- the lock is the queue
+      await sleep(LOCK_POLL_MS);
+      continue;
+    }
+    try {
+      writeFileSync(fd, String(process.pid));
+      // eslint-disable-next-line no-await-in-loop -- one critical section
+      return await fn(paths);
+    } finally {
+      closeSync(fd);
+      try {
+        const owner = Number(String(readFileSync(paths.lock, "utf8")).trim());
+        if (owner === process.pid) unlinkSync(paths.lock);
+      } catch {
+        // Exit cleanup, or a dead-pid steal, already removed it.
+      }
+    }
+  }
 }
 
 async function isFree(port) {
@@ -76,55 +228,78 @@ async function isFree(port) {
   return true;
 }
 
-// The old behaviour, kept for anything running outside `node --test` -- a file
-// executed directly, or imported by a tool that is not the test runner. It
-// carries the race, which is why it is the fallback rather than the path.
-async function ephemeralPort() {
-  const server = createServer();
-  await new Promise((resolve, reject) => {
-    server.once("error", reject);
-    server.listen(0, "127.0.0.1", resolve);
-  });
-  const { port } = server.address();
-  await new Promise((resolve) => server.close(resolve));
-  return port;
+function cursorFile(root) {
+  return path.join(root, "cursor");
 }
 
-let block;
-const issued = new Set();
+function readCursor(root) {
+  try {
+    const value = Number(String(readFileSync(cursorFile(root), "utf8")).trim());
+    if (Number.isInteger(value) && value >= PORT_POOL_FIRST && value <= PORT_POOL_LAST) return value;
+  } catch (error) {
+    if (error?.code !== "ENOENT") throw error;
+  }
+  return initialCursor();
+}
+
+function writeCursor(root, value) {
+  // A few bytes: one write is atomic on the platforms this suite runs on, so
+  // a reader never observes a torn integer.
+  writeFileSync(cursorFile(root), String(value));
+}
+
+function portAt(start, offset) {
+  const index = (start - PORT_POOL_FIRST + offset) % PORT_SPAN;
+  return PORT_POOL_FIRST + index;
+}
 
 /**
- * A port nothing else in this test run will take.
+ * A port nothing else using this helper will take, in this process or another.
  *
- * Still verified by binding it, because the only competitor left is this same
- * file's own leftovers from an earlier run. Ports are never handed out twice
- * within a file, since the caller binds later and a second check would find
- * the port still free.
+ * The number is inside the dedicated non-ephemeral window. It is reserved
+ * under the shared lock before it is returned, and the caller binds it later.
  */
 export async function freePort() {
-  if (block === undefined) block = blockFor(process.argv[1] || "") ?? null;
-  if (!block) return ephemeralPort();
-  for (let offset = 0; offset < block.size; offset += 1) {
-    const port = block.start + offset;
-    if (issued.has(port)) continue;
-    // Claimed before the probe, not after it. Callers draw several ports at
-    // once (`Promise.all(Array.from({ length: 6 }, freePort))`), and with the
-    // claim on the far side of the `await` every one of those starts at the
-    // same offset and they sort themselves out only by colliding on the bind:
-    // six draws deliberately provoke fifteen EADDRINUSE failures. That is
-    // wasteful everywhere and worse on Windows, where each losing bind is a
-    // socket the next attempt has to wait out. Claiming first makes concurrent
-    // draws walk disjoint offsets and never contend at all. A port that then
-    // probes busy stays claimed: it is not usable this run either way.
-    issued.add(port);
-    // eslint-disable-next-line no-await-in-loop -- probing in order is the point
-    if (!(await isFree(port))) continue;
-    return port;
-  }
-  throw new Error(
-    `${path.basename(process.argv[1] || "this file")} exhausted its ${block.size}-port ` +
-      `block at ${block.start}; raise MAX_BLOCK in test/port-pool.mjs or free the leftovers`,
-  );
+  hookRelease();
+  return withLock(async (paths) => {
+    const start = readCursor(paths.root);
+    for (let offset = 0; offset < PORT_SPAN; offset += 1) {
+      const port = portAt(start, offset);
+      if (issued.has(port)) continue;
+      if (reservationHeld(paths.reservations, port)) continue;
+      // Claimed before the probe. Callers draw several ports at once
+      // (`Promise.all`), and the file lock already serializes those draws;
+      // the set also keeps a port that probed busy from being tried again
+      // for the rest of this process.
+      issued.add(port);
+      // Yield on a long scan so a sibling test in this process can keep
+      // polling a server it already started. The common path tries one port.
+      if (offset > 0 && offset % 32 === 0) {
+        // eslint-disable-next-line no-await-in-loop -- the lock stays held
+        await sleep(0);
+      }
+      // eslint-disable-next-line no-await-in-loop -- probing in order is the point
+      if (!(await isFree(port))) continue;
+      const file = reservationFile(paths.reservations, port);
+      let fd;
+      try {
+        fd = openSync(file, "wx");
+      } catch (error) {
+        if (error?.code === "EEXIST") continue;
+        throw error;
+      }
+      writeFileSync(fd, String(process.pid));
+      closeSync(fd);
+      ownedReservations.add(file);
+      writeCursor(paths.root, port === PORT_POOL_LAST ? PORT_POOL_FIRST : port + 1);
+      return port;
+    }
+    throw new Error(
+      `test port pool exhausted its ${PORT_SPAN}-port window at ` +
+        `${PORT_POOL_FIRST}-${PORT_POOL_LAST}; free leftover listeners or ` +
+        "reservations in the shared port-pool directory",
+    );
+  });
 }
 
 // Both names were in use across the suite for the identical function.

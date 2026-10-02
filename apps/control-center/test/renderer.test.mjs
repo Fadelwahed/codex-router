@@ -231,7 +231,7 @@ const bridgeSource = String.raw`
     policy: { enabled: true, mode: "switch", selectedAccountId: "active" },
     accounts: {
       revoked: { id: "revoked", state: "revoked", paused: true, priority: 50, label: "Removed account", health: { state: "healthy" }, turns: 0, requests: 0 },
-      active: { id: "active", state: "active", paused: false, priority: 50, label: "Secondary account", subscription: { status: "usable", authenticated: true, usable: true, expired: false, email: "secondary@example.com" }, health: { state: "healthy" }, turns: 0, requests: 0 },
+      active: { id: "active", state: "active", paused: false, priority: 50, label: "Secondary account", subscription: { status: "usable", authenticated: true, usable: true, expired: false, email: "secondary@example.com", usage: { period: "weekly", remainingPercent: 70, windowDurationMins: 10080, planType: "plus", also: { period: "current", remainingPercent: 12, windowDurationMins: 300 } } }, health: { state: "healthy" }, turns: 0, requests: 0 },
       current: { id: "current", state: "active", paused: false, priority: 50, label: "Current account", subscription: terminalLoginFailure || loginStaysPending ? { status: "invalid", authenticated: false, usable: false, expired: false, email: "primary@example.com" } : { status: "usable", authenticated: true, usable: true, expired: false, email: "primary@example.com" }, health: { state: "healthy" }, turns: 0, requests: 0 },
     },
     get loginAttempts() {
@@ -254,6 +254,15 @@ const bridgeSource = String.raw`
       if (rejectAccountPool) throw new Error("The saved ChatGPT account list could not be read as JSON.");
       accountPoolReads += 1;
       if (terminalLoginFailure) record("getChatGptAccountPool", accountPoolReads);
+      const usage = accountPoolState.accounts.active.subscription?.usage;
+      if (usage) {
+        const now = Date.now();
+        // Day-scale leftovers of 30 minutes round up to the next hour, so the
+        // padding stays under that line. 3h 12m keeps a 45s pad because
+        // seconds are floored away.
+        usage.resetsAt = now + ((2 * 24 * 60) + (4 * 60) + 20) * 60_000;
+        usage.also.resetsAt = now + ((3 * 60) + 12) * 60_000 + 45_000;
+      }
       return JSON.parse(JSON.stringify(accountPoolState));
     },
     getProviders: async () => {
@@ -1045,6 +1054,14 @@ test("the production renderer exposes model discovery and picker actions", { tim
     assert.equal(await accountRows.filter({ hasText: "secondary@example.com" }).count(), 1, "secondary email should be visible");
     const readySecondary = accountRows.filter({ hasText: "Secondary account" });
     assert.equal(await readySecondary.getByRole("button", { name: "Login", exact: true }).isDisabled(), true, "ready accounts cannot start a duplicate login");
+    await page.getByRole("button", { name: "Refresh Settings", exact: true }).click();
+    await readySecondary.getByText("resets in 3h 12m", { exact: false }).waitFor();
+    const secondaryText = await readySecondary.innerText();
+    assert.match(secondaryText, /weekly · 70% remaining · resets in 2d 4h/);
+    assert.match(secondaryText, /5h · 12% remaining · resets in 3h 12m/);
+    assert.equal(secondaryText.includes("NaN"), false);
+    assert.match(secondaryText, /Ready/);
+    assert.match(secondaryText, /Selected/);
     await page.getByRole("button", { name: "Select ChatGPT account: primary@example.com", exact: true }).click();
     await page.waitForFunction(() => window.routerControlTest.calls()
       .some((call) => call.name === "setChatGptAccountSelection" && call.args[0] === "current"));
@@ -1880,3 +1897,84 @@ for (const [language, copy] of [
     } finally { await browser.close(); await close(); }
   });
 }
+
+// The armed timeout is the sooner minute boundary, which stays inside one
+// minute. 90s hidden is past the fixture's 45s pad, so 3h 12m becomes 3h 11m.
+const ACCOUNT_RESET_HIDDEN_MS = 90_000;
+
+test("settings reset countdowns tick while visible and stop when hidden or left", { timeout: 120_000 }, async () => {
+  assert.equal(existsSync(path.join(dist, "index.html")), true, "npm test must build the renderer first");
+  assert.ok(chromiumPath, "No Chromium executable is available for the Control Center renderer test.");
+  const { url, close } = await serveRenderer();
+  const browser = await chromium.launch({
+    executablePath: chromiumPath,
+    headless: true,
+    args: process.platform === "linux" ? ["--no-sandbox"] : [],
+  });
+  const pageErrors = [];
+  try {
+    const page = await newEnglishTestPage(browser, { viewport: { width: 1280, height: 840 } });
+    page.setDefaultTimeout(10_000);
+    page.on("pageerror", (error) => pageErrors.push(error.message));
+    await page.clock.install();
+    await page.addInitScript(() => {
+      const nativeSet = window.setTimeout.bind(window);
+      const nativeClear = window.clearTimeout.bind(window);
+      const ids = new Map();
+      window.setTimeout = (callback, delay, ...args) => {
+        const id = nativeSet(callback, delay, ...args);
+        if (typeof delay === "number" && delay >= 1 && delay <= 60_000) ids.set(id, delay);
+        return id;
+      };
+      window.clearTimeout = (id) => {
+        ids.delete(id);
+        return nativeClear(id);
+      };
+      window.__accountResetTimers = () => ids.size;
+      window.__accountResetDelay = () => (ids.size === 1 ? [...ids.values()][0] : null);
+    });
+    await page.goto(`${url}?healthPollOnceMs=86400000`, { waitUntil: "domcontentloaded", timeout: 30_000 });
+    await page.getByRole("button", { name: "Settings", exact: true }).click();
+    const secondary = page.locator(".subscription-account-row").filter({ hasText: "Secondary account" });
+    await secondary.getByText("resets in 3h 12m", { exact: false }).waitFor();
+    const initialDelay = await page.evaluate(() => window.__accountResetDelay());
+    assert.equal(await page.evaluate(() => window.__accountResetTimers()), 1, "settings should arm one reset tick");
+    assert.ok(initialDelay >= 1 && initialDelay <= 60_000, `the tick is the next minute boundary, got ${initialDelay}`);
+
+    await page.evaluate(() => {
+      const state = { value: "visible" };
+      const prototype = Document.prototype;
+      Object.defineProperty(prototype, "visibilityState", {
+        configurable: true,
+        get() { return state.value; },
+      });
+      Object.defineProperty(prototype, "hidden", {
+        configurable: true,
+        get() { return state.value === "hidden"; },
+      });
+      document.__resetVisibility = state;
+      window.__setResetVisibility = (value) => {
+        state.value = value;
+        document.dispatchEvent(new Event("visibilitychange"));
+      };
+    });
+    await page.evaluate(() => window.__setResetVisibility("hidden"));
+    assert.equal(await page.evaluate(() => window.__accountResetTimers()), 0, "hiding the document clears the tick");
+    await page.clock.fastForward(ACCOUNT_RESET_HIDDEN_MS);
+    assert.match(await secondary.innerText(), /resets in 3h 12m/);
+    assert.doesNotMatch(await secondary.innerText(), /resets in 3h 11m/);
+
+    await page.evaluate(() => window.__setResetVisibility("visible"));
+    await secondary.getByText("resets in 3h 11m", { exact: false }).waitFor();
+    const shownDelay = await page.evaluate(() => window.__accountResetDelay());
+    assert.equal(await page.evaluate(() => window.__accountResetTimers()), 1, "showing the document arms the tick again");
+    assert.ok(shownDelay >= 1 && shownDelay <= 60_000, `the tick stays on a minute boundary, got ${shownDelay}`);
+    await page.locator(".primary-nav button").nth(0).click();
+    await page.locator(".page-scroll-dashboard h1").waitFor();
+    assert.equal(await page.evaluate(() => window.__accountResetTimers()), 0, "leaving settings clears the tick");
+    assert.deepEqual(pageErrors, [], `renderer errors: ${pageErrors.join("; ")}`);
+  } finally {
+    await browser.close();
+    await close();
+  }
+});

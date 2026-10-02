@@ -43,8 +43,35 @@ function clampPercent(value) {
   return Math.max(0, Math.min(100, Number(value) || 0));
 }
 
-function normalizeWindow(window) {
-  if (!window || typeof window !== "object") return null;
+function plainObject(value) {
+  return Boolean(value) && typeof value === "object" && !Array.isArray(value);
+}
+
+const WEEK_MINUTES = 7 * 24 * 60;
+const MONTH_MINUTES = 28 * 24 * 60;
+
+// resetsAt is a Unix timestamp, seconds below the same 1e10 threshold the
+// control center uses. Anything that is not a future instant is dropped here,
+// while the probe is parsed, so a negative or already-elapsed value never
+// lands on the account row.
+function futureResetTimestamp(value, nowMs) {
+  if (typeof value !== "number" || !Number.isFinite(value) || value <= 0) return null;
+  const epochMs = value < 10_000_000_000 ? value * 1_000 : value;
+  if (!Number.isFinite(epochMs) || epochMs <= nowMs) return null;
+  return value;
+}
+
+function trimmedPlanType(value) {
+  if (typeof value !== "string") return null;
+  const trimmed = value.trim();
+  return trimmed || null;
+}
+
+function normalizeWindow(window, nowMs) {
+  if (!plainObject(window)) return null;
+  // A missing or non-finite used percent is not zero. Coercing it invented a
+  // full window ("100% remaining") for an array, NaN, or an absent field.
+  if (typeof window.usedPercent !== "number" || !Number.isFinite(window.usedPercent)) return null;
   const usedPercent = clampPercent(window.usedPercent);
   return {
     usedPercent,
@@ -52,7 +79,7 @@ function normalizeWindow(window) {
     windowDurationMins: Number.isFinite(window.windowDurationMins)
       ? window.windowDurationMins
       : null,
-    resetsAt: Number.isFinite(window.resetsAt) ? window.resetsAt : null,
+    resetsAt: futureResetTimestamp(window.resetsAt, nowMs),
   };
 }
 
@@ -87,12 +114,13 @@ export function normalizeCodexAccountUsage(rateLimitResponse, usageResponse, now
     : [];
   const limits = rateLimitResponse?.rateLimits || {};
   const summary = usageResponse?.summary || {};
+  const nowMs = now.getTime();
   return {
     fetchedAt: now.toISOString(),
-    planType: typeof limits.planType === "string" ? limits.planType : null,
+    planType: trimmedPlanType(limits.planType),
     limitId: typeof limits.limitId === "string" ? limits.limitId : null,
-    primary: normalizeWindow(limits.primary),
-    secondary: normalizeWindow(limits.secondary),
+    primary: normalizeWindow(limits.primary, nowMs),
+    secondary: normalizeWindow(limits.secondary, nowMs),
     dailyUsageBuckets: buckets,
     summary: {
       lifetimeTokens: Number.isFinite(summary.lifetimeTokens) ? summary.lifetimeTokens : null,
@@ -101,6 +129,37 @@ export function normalizeCodexAccountUsage(rateLimitResponse, usageResponse, now
         ? summary.currentStreakDays
         : null,
     },
+  };
+}
+
+function accountUsagePeriod(window) {
+  const minutes = window?.windowDurationMins;
+  if (typeof minutes !== "number" || !Number.isFinite(minutes)) return "current";
+  if (minutes === WEEK_MINUTES) return "weekly";
+  if (minutes >= MONTH_MINUTES) return "monthly";
+  return "current";
+}
+
+function selectAccountUsageWindow(windows) {
+  const exactWeekly = windows.find((window) => window.windowDurationMins === WEEK_MINUTES);
+  const weeklyBand = windows.find(
+    (window) => window.windowDurationMins >= WEEK_MINUTES
+      && window.windowDurationMins < MONTH_MINUTES,
+  );
+  const monthly = windows.find((window) => window.windowDurationMins >= MONTH_MINUTES);
+  return exactWeekly || weeklyBand || monthly || windows[0];
+}
+
+function boundedAccountUsageWindow(window) {
+  if (!plainObject(window)) return null;
+  if (typeof window.remainingPercent !== "number" || !Number.isFinite(window.remainingPercent)) return null;
+  return {
+    period: accountUsagePeriod(window),
+    remainingPercent: window.remainingPercent,
+    ...(Number.isFinite(window.windowDurationMins)
+      ? { windowDurationMins: window.windowDurationMins }
+      : {}),
+    ...(window.resetsAt ? { resetsAt: window.resetsAt } : {}),
   };
 }
 
@@ -119,19 +178,27 @@ export async function attachBoundedChatGPTAccountUsage(pool, {
   await Promise.all(candidates.map(async (account) => {
     try {
       const usage = await readUsage({ codexHome: accountHome(account.id), timeoutMs });
-      const windows = [usage.primary, usage.secondary].filter(Boolean);
-      const monthly = windows.find((window) => window.windowDurationMins >= 28 * 24 * 60);
-      const weekly = windows.find(
-        (window) => window.windowDurationMins >= 7 * 24 * 60
-          && window.windowDurationMins < 28 * 24 * 60,
-      );
-      const selected = weekly || monthly || windows[0];
+      const windows = [usage?.primary, usage?.secondary]
+        .map((window) => boundedAccountUsageWindow(window))
+        .filter(Boolean);
+      const selected = selectAccountUsageWindow(windows);
       if (selected) {
-        account.subscription.usage = {
-          period: selected === weekly ? "weekly" : selected === monthly ? "monthly" : "current",
-          remainingPercent: selected.remainingPercent,
-          ...(selected.resetsAt ? { resetsAt: selected.resetsAt } : {}),
-        };
+        const primary = selected;
+        const other = windows.find((window) => window !== selected);
+        const secondary = other ?? null;
+        // The other window is the rest of what the probe returned. It stays
+        // beside the primary line when its duration differs, and it is not an
+        // exhaustion signal: a drained short window must not pause or switch
+        // the account. Only an exact seven-day window is "weekly", so a
+        // ten-day window is not the same line.
+        if (
+          secondary
+          && (secondary.period !== primary.period
+            || secondary.windowDurationMins !== primary.windowDurationMins)
+        ) primary.also = secondary;
+        const planType = trimmedPlanType(usage.planType);
+        if (planType) primary.planType = planType;
+        account.subscription.usage = primary;
       }
     } catch {
       // Per-account usage is optional. Core account/session state remains
