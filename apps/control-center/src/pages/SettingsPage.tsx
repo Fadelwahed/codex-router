@@ -160,28 +160,30 @@ function accountRowIdentity(account: ChatGptSubscriptionAccount, fallback: strin
 // Minute labels change on a minute boundary, and "<1m" must end at the reset
 // instant rather than on the next fixed poll. One timer paints that sooner
 // instant while this page is visible. A passed reset asks the existing
-// refresh for a new probe, then waits at least a minute. The wait grows
-// while the answer stays elapsed or only seconds away, and a normal window
-// clears it. The gate survives a new reset epoch so that epoch cannot arm
-// another probe on its own.
+// refresh for a new probe, then that account waits at least a minute. The
+// wait grows while its own answer stays elapsed or only seconds away, and a
+// normal window clears it. Another account's wait does not hold this one.
+// The gates survive a new reset epoch so that epoch cannot arm a probe alone.
 function useAccountResetClock(
-  resetsAt: Array<number | string | null | undefined>,
+  accounts: ReadonlyArray<{ id: string; resetsAt: Array<number | string | null | undefined> }>,
   onElapsed: () => void,
 ): number {
   const [now, setNow] = useState(() => Date.now());
   const onElapsedRef = useRef(onElapsed);
   onElapsedRef.current = onElapsed;
-  const resetsRef = useRef(resetsAt);
-  resetsRef.current = resetsAt;
-  const gateRef = useRef({ streak: 0, nextAllowedAt: 0 });
-  const scheduleKey = resetsAt.map((value) => accountResetEpochMs(value) ?? "").join("|");
+  const accountsRef = useRef(accounts);
+  accountsRef.current = accounts;
+  const gatesRef = useRef<Record<string, { streak: number; nextAllowedAt: number }>>({});
+  const scheduleKey = accounts.map((account) =>
+    `${account.id}=${account.resetsAt.map((value) => accountResetEpochMs(value) ?? "").join(",")}`,
+  ).join("|");
 
   useEffect(() => {
     const clock = bindAccountResetClock({
-      getResets: () => resetsRef.current,
+      getAccounts: () => accountsRef.current,
       onTick: setNow,
       onProbe: () => { onElapsedRef.current(); },
-      gate: gateRef,
+      gates: gatesRef,
       allow: () => document.visibilityState !== "hidden",
       schedule: (fn, ms) => window.setTimeout(fn, ms),
       cancel: (id) => { window.clearTimeout(id as number); },
@@ -317,14 +319,15 @@ export function SettingsPage({ target, health, presence, chatgptSession, account
     [repairReport],
   );
   const accountResetInstants = useMemo(() => {
-    const instants: Array<number | null | undefined> = [];
+    const accounts: Array<{ id: string; resetsAt: Array<number | null | undefined> }> = [];
     for (const account of Object.values(accountPool?.accounts ?? {})) {
       const usage = account.subscription?.usage;
-      if (!usage || Array.isArray(usage)) continue;
-      instants.push(usage.resetsAt);
-      if (usage.also && !Array.isArray(usage.also)) instants.push(usage.also.resetsAt);
+      if (!usage || Array.isArray(usage) || account.id === "") continue;
+      const resetsAt = [usage.resetsAt];
+      if (usage.also && !Array.isArray(usage.also)) resetsAt.push(usage.also.resetsAt);
+      accounts.push({ id: account.id, resetsAt });
     }
-    return instants;
+    return accounts;
   }, [accountPool]);
   const resetNow = useAccountResetClock(accountResetInstants, () => { void onRefresh(); });
   const sessionSharingEnabled = chatgptSession?.sharing === "enabled";
