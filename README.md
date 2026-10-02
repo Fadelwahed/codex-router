@@ -1586,7 +1586,8 @@ pattern; an untouched generated label still yields the email. The label
 field shows how many of its 120 characters are used and says when that
 limit is reached. The 120 count is user-perceived characters. A typed name
 that matches another account's generated label is refused, including a name that
-differs only by case, spacing, or full-width digits. Clearing a custom
+differs only by case, spacing, full-width digits, a space in “Chat GPT”, or
+invisible characters. Clearing a custom
 label restores a unique generated name,
 and the email stays visible beside it. A long name truncates, with the
 full label available on hover. Enter in the rename field saves it, and

@@ -20,7 +20,8 @@ import {
 } from "./chatgpt-login-lease.mjs";
 import { ensureNoSymlinkParents } from "./path-security.mjs";
 import {
-  ACCOUNT_LABEL_COLLISION,
+  accountLabelError,
+  accountLabelIoError,
   accountLabelIsUnsafe,
   assertAccountLabelText,
   generatedAccountNumber,
@@ -357,9 +358,9 @@ export function renameChatGPTSubscriptionAccount(accountValue, label = "", { fil
   const nextLabel = chatGPTAccountLabelInput(label);
   const state = readChatGPTAccountPoolState(filePath);
   const account = state.accounts[id];
-  if (!account) throw new Error("Account id is not registered.");
+  if (!account) throw accountLabelError("unknown-id");
   if (nextLabel) {
-    if (generatedLabelCollides(state, nextLabel, id)) throw new Error(ACCOUNT_LABEL_COLLISION);
+    if (generatedLabelCollides(state, nextLabel, id)) throw accountLabelError("collision");
     account.label = nextLabel;
     account.labelCustom = true;
   } else if (account.labelCustom === true || !GENERATED_ACCOUNT_LABEL.test(account.label || "")) {
@@ -369,7 +370,11 @@ export function renameChatGPTSubscriptionAccount(accountValue, label = "", { fil
   } else {
     delete account.labelCustom;
   }
-  writeChatGPTAccountPoolState(state, filePath);
+  try {
+    writeChatGPTAccountPoolState(state, filePath);
+  } catch (error) {
+    throw accountLabelIoError(error);
+  }
   return sanitizeChatGPTAccount(readChatGPTAccountPoolState(filePath).accounts[id]);
 }
 
@@ -377,7 +382,7 @@ export function createChatGPTSubscriptionAccount({ label = "", filePath = CHATGP
   const suppliedLabel = chatGPTAccountLabelInput(label);
   const state = readChatGPTAccountPoolState(filePath);
   if (Object.values(state.accounts).filter((account) => account?.state !== "revoked").length >= MAX_ACCOUNTS) throw new Error(`The ChatGPT account list supports at most ${MAX_ACCOUNTS} accounts.`);
-  if (suppliedLabel && generatedLabelCollides(state, suppliedLabel, "")) throw new Error(ACCOUNT_LABEL_COLLISION);
+  if (suppliedLabel && generatedLabelCollides(state, suppliedLabel, "")) throw accountLabelError("collision");
   const id = newAccountId(state);
   const home = chatGPTSubscriptionAccountHome(id, { homesDir });
   ensurePrivateAccountDirectory(home, homesDir);
@@ -391,7 +396,12 @@ export function createChatGPTSubscriptionAccount({ label = "", filePath = CHATGP
     health: { state: "healthy" },
   }, id);
   state.accounts[id] = account;
-  try { writeChatGPTAccountPoolState(state, filePath); } catch (error) { rmSync(home, { recursive: true, force: true }); throw error; }
+  try {
+    writeChatGPTAccountPoolState(state, filePath);
+  } catch (error) {
+    rmSync(home, { recursive: true, force: true });
+    throw accountLabelIoError(error);
+  }
   return sanitizeChatGPTAccount(account);
 }
 export function chatGPTSubscriptionAccountHome(accountValue, { homesDir = CHATGPT_ACCOUNT_HOMES_DIR } = {}) { return path.join(homesDir, accountId(accountValue)); }

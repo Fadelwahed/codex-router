@@ -3573,23 +3573,12 @@ async function handleChatGptAccountSwitch(action, value, completionLease) {
     return;
   }
   if (action === "label") {
-    try {
-      if (!value || !/^acct_[A-Za-z0-9_-]{8,80}$/.test(value)) throw new Error("Account id is invalid.");
-      const nextLabel = chatGPTAccountLabelInput(completionLease ?? "");
-      const account = await withChatGPTAccountPoolLock(
-        () => renameChatGPTSubscriptionAccount(value, nextLabel),
-      );
-      process.stdout.write(`${JSON.stringify({ account })}\n`);
-    } catch (error) {
-      const message = error instanceof Error && error.message
-        ? error.message
-        : "Account label could not be saved.";
-      process.stderr.write(`${message}\n`);
-      if (process.env.DEBUG && error instanceof Error && error.stack) {
-        process.stderr.write(`${error.stack}\n`);
-      }
-      process.exit(1);
-    }
+    if (!value || !/^acct_[A-Za-z0-9_-]{8,80}$/.test(value)) throw new Error("Account id is invalid.");
+    const nextLabel = chatGPTAccountLabelInput(completionLease ?? "");
+    const account = await withChatGPTAccountPoolLock(
+      () => renameChatGPTSubscriptionAccount(value, nextLabel),
+    );
+    process.stdout.write(`${JSON.stringify({ account })}\n`);
     return;
   }
   if (action === "home") {
@@ -3754,7 +3743,16 @@ if (args.includes("--probe")) {
   if (args.length > 2) throw new Error("Usage: control chatgpt-session status|enable|disable");
   await handleChatGptSession(args[1]);
 } else if (args[0] === "chatgpt-account-pool") {
-  await handleChatGptAccountSwitch(args[1], args[2], args[3]);
+  try {
+    await handleChatGptAccountSwitch(args[1], args[2], args[3]);
+  } catch (error) {
+    const { accountPoolCommandFailureLine } = await import("./account-label-text.mjs");
+    process.stderr.write(`${accountPoolCommandFailureLine(error)}\n`);
+    if (process.env.DEBUG && error instanceof Error && error.stack) {
+      process.stderr.write(`${error.stack}\n`);
+    }
+    process.exit(1);
+  }
 } else if (args[0] === "activity") {
   if (args.length > 2) throw new Error("Usage: control activity [thread-id]");
   process.stdout.write(`${JSON.stringify(await readControlActivity({ threadId: args[1] }))}\n`);

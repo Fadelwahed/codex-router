@@ -40,6 +40,10 @@ const accountLabelUrl = import.meta.url.includes("/app.asar/")
   ? new URL("../../src/chatgpt-account-pool.mjs", import.meta.url)
   : new URL("../../../src/chatgpt-account-pool.mjs", import.meta.url);
 const { chatGPTAccountLabelInput } = await import(accountLabelUrl);
+const accountLabelTextUrl = import.meta.url.includes("/app.asar/")
+  ? new URL("../../src/account-label-text.mjs", import.meta.url)
+  : new URL("../../../src/account-label-text.mjs", import.meta.url);
+const { accountLabelPresentedError } = await import(accountLabelTextUrl);
 const {
   attachChatGPTLoginLease,
   chatGPTLoginAuthChanged,
@@ -2124,9 +2128,13 @@ export function registerIpcHandlers({
     return runJson(["chatgpt-account-pool", "add", trimmed], { timeoutMs: 60_000 });
   });
   handleAction("renameChatGptSubscriptionAccount", async ({ accountId, label = "" } = {}) => {
-    const id = stringValue(accountId, "Account id", CHATGPT_ACCOUNT_ID);
-    const trimmed = chatGPTAccountLabelInput(label);
-    return runJson(["chatgpt-account-pool", "label", id, trimmed], { timeoutMs: 60_000 });
+    try {
+      const id = stringValue(accountId, "Account id", CHATGPT_ACCOUNT_ID);
+      const trimmed = chatGPTAccountLabelInput(label);
+      return await runJson(["chatgpt-account-pool", "label", id, trimmed], { timeoutMs: 60_000 });
+    } catch (error) {
+      throw accountLabelPresentedError(error);
+    }
   });
   handleAction("loginChatGptSubscriptionAccount", async ({ accountId } = {}) => {
     const id = stringValue(accountId, "Account id", CHATGPT_ACCOUNT_ID);

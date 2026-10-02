@@ -32,7 +32,16 @@ import {
   createChatGPTLoginLease,
 } from "../src/chatgpt-login-lease.mjs";
 import { protectPrivateFile } from "../src/file-security.mjs";
-import { accountLabelGraphemeLength, accountLabelRejection, visibleRemoteError } from "../src/account-label-text.mjs";
+import {
+  accountLabelErrorCode,
+  accountLabelGraphemeLength,
+  accountLabelIoError,
+  accountLabelPresentedError,
+  accountLabelRejection,
+  accountLabelWireMessage,
+  accountPoolCommandFailureLine,
+  visibleRemoteError,
+} from "../src/account-label-text.mjs";
 
 function writeFileSync(target, contents, options) {
   rawWriteFileSync(target, contents, options);
@@ -278,14 +287,31 @@ test("account labels reject controls, bidi marks, and lone surrogates and count 
   assert.equal(replaced.labelCustom, undefined);
   assert.equal(readFileSync(options.filePath).equals(beforeLone), true);
 
-  const wrapped = "Error invoking remote method 'router-control:renameChatGptSubscriptionAccount': Error: Account label matches another account.";
+  const remotePrefix = "Error invoking remote method 'router-control:renameChatGptSubscriptionAccount': Error: ";
+  const wrapped = `${remotePrefix}Account label matches another account.\n`;
   assert.equal(accountLabelRejection(wrapped), "collision");
+  assert.equal(accountLabelErrorCode(wrapped), "collision");
   assert.equal(visibleRemoteError(wrapped), "Account label matches another account.");
-  assert.equal(accountLabelRejection("Error invoking remote method 'router-control:renameChatGptSubscriptionAccount': Error: Account label contains characters that are not allowed."), "forbidden");
-  assert.equal(accountLabelRejection("Error invoking remote method 'router-control:renameChatGptSubscriptionAccount': Error: Account label is limited to 120 characters."), "too-long");
-  assert.equal(accountLabelRejection("Error invoking remote method 'router-control:renameChatGptSubscriptionAccount': Error: Account label is invalid."), "invalid");
-  assert.equal(visibleRemoteError("Error invoking remote method 'router-control:renameChatGptSubscriptionAccount': Error: ENOSPC: no space left on device"), "ENOSPC: no space left on device");
-  assert.equal(accountLabelRejection("ENOSPC: no space left on device"), "");
+  assert.equal(accountLabelPresentedError(new Error(wrapped)).message, accountLabelWireMessage("collision"));
+  for (const code of ["invalid", "forbidden", "too-long", "collision", "unknown-id", "io", "cli", "unknown"]) {
+    const backend = `${accountLabelWireMessage(code)}\n`;
+    assert.equal(accountPoolCommandFailureLine(new Error(backend)), accountLabelWireMessage(code));
+    const presented = accountLabelPresentedError(new Error(`${remotePrefix}${backend}`));
+    assert.equal(presented.code, code);
+    assert.equal(accountLabelErrorCode(`${remotePrefix}${presented.message}\n`), code);
+  }
+  assert.equal(accountLabelErrorCode(`${remotePrefix}Account label contains characters that are not allowed.\n`), "forbidden");
+  assert.equal(accountLabelErrorCode(`${remotePrefix}Account label is limited to 120 characters.\n`), "too-long");
+  assert.equal(accountLabelErrorCode(`${remotePrefix}Account label is invalid.\n`), "invalid");
+  assert.equal(accountLabelErrorCode(`${remotePrefix}Account id is not registered.\n`), "unknown-id");
+  assert.equal(accountLabelErrorCode(`${remotePrefix}Account id is invalid.\n`), "unknown-id");
+  assert.equal(accountLabelErrorCode(`${remotePrefix}ENOSPC: no space left on device\n`), "io");
+  assert.equal(accountLabelErrorCode(`${remotePrefix}Router command failed (1).\n`), "cli");
+  assert.equal(accountLabelErrorCode(`${remotePrefix}account-label-error:not-a-code: raw backend text\n`), "unknown");
+  assert.equal(visibleRemoteError(`${remotePrefix}ENOSPC: no space left on device\n`), "ENOSPC: no space left on device");
+  const enospc = Object.assign(new Error("ENOSPC: no space left on device, write"), { code: "ENOSPC" });
+  assert.equal(accountLabelIoError(enospc).code, "io");
+  assert.equal(accountLabelIoError(enospc).message, accountLabelWireMessage("io"));
 });
 
 test("lookalike generated names collide and duplicate generated names stay unique on display", () => {
@@ -294,7 +320,7 @@ test("lookalike generated names collide and duplicate generated names stay uniqu
   const second = createChatGPTSubscriptionAccount(options);
   assert.equal(first.label, "ChatGPT account 1");
   assert.equal(second.label, "ChatGPT account 2");
-  for (const label of ["chatgpt account 1", "ChatGPT  account  1", "ChatGPT account \uFF11", "CHATGPT ACCOUNT 01"]) {
+  for (const label of ["chatgpt account 1", "ChatGPT  account  1", "ChatGPT account \uFF11", "CHATGPT ACCOUNT 01", "Chat GPT account 1", "Chat   GPT account 1"]) {
     assert.throws(
       () => renameChatGPTSubscriptionAccount(second.id, label, options),
       /Account label matches another account/,
@@ -307,6 +333,17 @@ test("lookalike generated names collide and duplicate generated names stay uniqu
     );
   }
   assert.equal(readChatGPTAccountPoolState(options.filePath).accounts[second.id].label, "ChatGPT account 2");
+  for (const label of ["ChatGPT\u200B account 1", "\uFEFFChatGPT account 1", "Chat\u2060GPT account 1", "Chat\u200CGPT account 1", "plain\u200Dtext"]) {
+    assert.throws(
+      () => renameChatGPTSubscriptionAccount(second.id, label, options),
+      /Account label contains characters that are not allowed/,
+      label,
+    );
+  }
+  const family = "\u{1F468}\u200D\u{1F469}\u200D\u{1F467}";
+  const joined = renameChatGPTSubscriptionAccount(second.id, family, options);
+  assert.equal(joined.label, family);
+  renameChatGPTSubscriptionAccount(second.id, "ChatGPT account 2", options);
 
   const seeded = readChatGPTAccountPoolState(options.filePath);
   seeded.accounts[second.id].label = "chatgpt account 1";

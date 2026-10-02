@@ -130,7 +130,24 @@ test("a renamed ChatGPT account label persists across a new control process", ()
     });
     assert.notEqual(failed.status, 0);
     const lines = String(failed.stderr || "").split(/\r?\n/).filter((line) => line.length > 0);
-    assert.deepEqual(lines, ["Account label is limited to 120 characters."]);
+    assert.deepEqual(lines, ["account-label-error:too-long: Account label is limited to 120 characters."]);
+    const collided = spawnSync(process.execPath, [path.join(root, "src/control.mjs"), "chatgpt-account-pool", "add", "Chat GPT account 1"], {
+      env: quietEnv,
+      encoding: "utf8",
+    });
+    assert.notEqual(collided.status, 0);
+    const collidedLines = String(collided.stderr || "").split(/\r?\n/).filter((line) => line.length > 0);
+    assert.deepEqual(collidedLines, ["account-label-error:collision: Account label matches another account."]);
+    assert.doesNotMatch(String(collided.stderr || ""), /\n\s+at /);
+    const usage = spawnSync(process.execPath, [path.join(root, "src/control.mjs"), "chatgpt-account-pool", "nope"], {
+      env: quietEnv,
+      encoding: "utf8",
+    });
+    assert.notEqual(usage.status, 0);
+    const usageLines = String(usage.stderr || "").split(/\r?\n/).filter((line) => line.length > 0);
+    assert.equal(usageLines.length, 1);
+    assert.match(usageLines[0], /^Usage: control chatgpt-account-pool /);
+    assert.doesNotMatch(String(usage.stderr || ""), /\n\s+at /);
     const debugEnv = { ...quietEnv, DEBUG: "1" };
     const traced = spawnSync(process.execPath, [path.join(root, "src/control.mjs"), "chatgpt-account-pool", "label", added.id, "user\u202Eexe.txt"], {
       env: debugEnv,

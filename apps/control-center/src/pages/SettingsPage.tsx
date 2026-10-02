@@ -2,12 +2,11 @@ import { backendText } from "../backend-text";
 import { useEffect, useId, useMemo, useRef, useState } from "react";
 import {
   ACCOUNT_LABEL_LIMIT,
+  accountLabelErrorCode,
   accountLabelGraphemeLength,
-  accountLabelRejection,
   assertAccountLabelText,
   generatedAccountNumber,
   sliceAccountLabel,
-  visibleRemoteError,
 } from "../../../../src/account-label-text.mjs";
 import { AppWindow, Check, Eye, LogIn, Moon, Pencil, Plus, RefreshCw, Server, ShieldCheck, Sun, Trash2, UserRound, Wrench } from "lucide-react";
 import { Badge, Button, Dialog, InlineNotice, PageHeader, SectionHeading, Toggle } from "../components";
@@ -33,13 +32,14 @@ import { useOptimisticValues, type RunAction } from "../useOptimisticValues";
 const RETENTION_DEFAULT_TTL_DAYS = 7;
 const RETENTION_CHOICES = [1, 3, 7, 14, 30, 90];
 
-function AccountLabelControl({ label, value, placeholder, onValue, t, selectOnFocus = false }: {
+function AccountLabelControl({ label, value, placeholder, onValue, t, selectOnFocus = false, readOnly = false }: {
   label: string;
   value: string;
   placeholder: string;
   onValue: (value: string) => void;
   t: Translate;
   selectOnFocus?: boolean;
+  readOnly?: boolean;
 }) {
   const counterId = useId();
   const limitId = useId();
@@ -64,6 +64,8 @@ function AccountLabelControl({ label, value, placeholder, onValue, t, selectOnFo
         ref={inputRef}
         aria-label={label}
         aria-describedby={atLimit ? `${counterId} ${limitId}` : counterId}
+        aria-readonly={readOnly || undefined}
+        readOnly={readOnly}
         value={value}
         placeholder={placeholder}
         onChange={(event) => onValue(sliceAccountLabel(event.target.value))}
@@ -83,14 +85,21 @@ function AccountLabelControl({ label, value, placeholder, onValue, t, selectOnFo
   );
 }
 
+const ACCOUNT_LABEL_ERROR_KEYS = {
+  invalid: "settings.accounts.labelInvalid",
+  forbidden: "settings.accounts.labelForbidden",
+  "too-long": "settings.accounts.labelTooLong",
+  collision: "settings.accounts.labelCollision",
+  "unknown-id": "settings.accounts.labelUnknownId",
+  io: "settings.accounts.labelIo",
+  cli: "settings.accounts.labelCli",
+} as const;
+
 function accountLabelErrorText(error: unknown, t: Translate): string {
   const message = error instanceof Error ? error.message : String(error ?? "");
-  const rejection = accountLabelRejection(message);
-  if (rejection === "forbidden") return t("settings.accounts.labelForbidden");
-  if (rejection === "too-long") return t("settings.accounts.labelTooLong");
-  if (rejection === "collision") return t("settings.accounts.labelCollision");
-  if (rejection === "invalid") return t("settings.accounts.labelInvalid");
-  return visibleRemoteError(message);
+  const code = accountLabelErrorCode(message);
+  const key = ACCOUNT_LABEL_ERROR_KEYS[code as keyof typeof ACCOUNT_LABEL_ERROR_KEYS];
+  return key ? t(key) : t("settings.accounts.labelFailed");
 }
 
 type AccountOverlay =
@@ -961,6 +970,7 @@ export function SettingsPage({ target, health, presence, chatgptSession, account
             }}
             t={t}
             selectOnFocus
+            readOnly={renamePending}
           />
           {renameError ? <p className="dialog-copy" role="alert">{renameError}</p> : null}
           <p className="dialog-copy">{t("settings.accounts.renameHint")}</p>
@@ -969,7 +979,7 @@ export function SettingsPage({ target, health, presence, chatgptSession, account
               setRenameAccountId(null);
               setRenameError(null);
             }}>{t("settings.accounts.removeCancel")}</Button>
-            <Button type="submit" variant="primary" disabled={!api || !renameAccountId || renamePending} aria-busy={renamePending || undefined}>{t("settings.accounts.renameSave")}</Button>
+            <Button type="submit" variant="primary" disabled={!api || !renameAccountId || renamePending} aria-busy={renamePending || undefined}>{renamePending ? t("settings.accounts.renameSaving") : t("settings.accounts.renameSave")}</Button>
           </div>
         </form>
       </Dialog>

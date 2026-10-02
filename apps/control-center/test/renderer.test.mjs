@@ -38,6 +38,7 @@ const bridgeSource = String.raw`
   const staleProviderUsage = searchParams.get("staleProviderUsage") === "1";
   const fallbackUsage = searchParams.get("fallbackUsage") === "1";
   const renameFails = searchParams.get("renameFails") || "";
+  let labelFailureIndex = 0;
   const longAccountLabel = searchParams.get("longAccountLabel") === "1";
   const duplicateEmail = searchParams.get("duplicateEmail") === "1";
   const duplicateTitle = searchParams.get("duplicateTitle") === "1";
@@ -551,15 +552,25 @@ const bridgeSource = String.raw`
     },
     renameChatGptSubscriptionAccount: async (accountId, label = "") => {
       record("renameChatGptSubscriptionAccount", accountId, label);
-      if (renameFails === "1") throw new Error("ENOSPC: no space left on device");
-      if (renameFails === "ipc") {
-        throw new Error("Error invoking remote method 'router-control:renameChatGptSubscriptionAccount': Error: Account label contains characters that are not allowed.");
-      }
-      if (renameFails === "ipc-collision") {
-        throw new Error("Error invoking remote method 'router-control:renameChatGptSubscriptionAccount': Error: Account label matches another account.");
-      }
-      if (renameFails === "ipc-long") {
-        throw new Error("Error invoking remote method 'router-control:renameChatGptSubscriptionAccount': Error: Account label is limited to 120 characters.");
+      const remotePrefix = "Error invoking remote method 'router-control:renameChatGptSubscriptionAccount': Error: ";
+      const labelFailures = [
+        remotePrefix + "account-label-error:invalid: Account label is invalid.\n",
+        remotePrefix + "account-label-error:forbidden: Account label contains characters that are not allowed.\n",
+        remotePrefix + "account-label-error:too-long: Account label is limited to 120 characters.\n",
+        remotePrefix + "account-label-error:collision: Account label matches another account.\n",
+        remotePrefix + "account-label-error:unknown-id: Account id is not registered.\n",
+        remotePrefix + "account-label-error:io: The account label could not be saved.\n",
+        remotePrefix + "account-label-error:cli: The account label command failed.\n",
+        remotePrefix + "account-label-error:not-a-code: raw backend text must stay hidden\n",
+        remotePrefix + "Account label matches another account.\n",
+        remotePrefix + "ENOSPC: no space left on device\n",
+        remotePrefix + "Account id is not registered.\n",
+      ];
+      if (renameFails === "1") throw new Error(remotePrefix + "ENOSPC: no space left on device\n");
+      if (renameFails === "matrix") {
+        const failure = labelFailures[Math.min(labelFailureIndex, labelFailures.length - 1)];
+        labelFailureIndex += 1;
+        throw new Error(failure);
       }
       const account = accountPoolState.accounts[accountId];
       if (!account) throw new Error("Account id is not registered.");
@@ -588,9 +599,9 @@ const bridgeSource = String.raw`
       }
       if (graphemes > 120) throw new Error("Account label is limited to 120 characters.");
       const generated = /^ChatGPT account (\d+)$/;
-      const canonicalLabel = (value) => String(value || "").normalize("NFKC").replace(/\s+/g, " ").trim().toLowerCase();
+      const canonicalLabel = (value) => String(value || "").normalize("NFKC").replace(/[\u200B-\u200D\u2060\uFEFF]/g, "").replace(/\s+/g, " ").trim().toLowerCase();
       const generatedNumber = (value) => {
-        const match = /^chatgpt account (\d+)$/.exec(canonicalLabel(value));
+        const match = /^chat ?gpt account (\d+)$/.exec(canonicalLabel(value));
         if (!match) return undefined;
         const number = Number(match[1]);
         return Number.isSafeInteger(number) && number >= 1 ? number : undefined;
@@ -1505,7 +1516,7 @@ test("ChatGPT account rows stay in the card and label edits are guarded", { time
         .filter((call) => call.name === "renameChatGptSubscriptionAccount").length),
       beforeCollision,
     );
-    const lookalikes = ["chatgpt account 1", "ChatGPT  account  1", "ChatGPT account \uFF11"];
+    const lookalikes = ["chatgpt account 1", "ChatGPT  account  1", "ChatGPT account \uFF11", "Chat GPT account 1", "Chat   GPT account 1"];
     for (const lookalike of lookalikes) {
       await emailPage.getByRole("textbox", { name: "ChatGPT account label", exact: true }).fill(lookalike);
       await emailPage.getByRole("button", { name: "Save label", exact: true }).click();
@@ -1558,7 +1569,10 @@ test("ChatGPT account rows stay in the card and label edits are guarded", { time
     const kept = errorPage.getByRole("textbox", { name: "ChatGPT account label", exact: true });
     await kept.fill("Kept label");
     await errorPage.getByRole("button", { name: "Save label", exact: true }).click();
-    await errorPage.getByRole("alert").filter({ hasText: "ENOSPC: no space left on device" }).waitFor();
+    const diskAlert = errorPage.getByRole("dialog").getByRole("alert");
+    await diskAlert.filter({ hasText: "The account label could not be saved because the disk is full or the file could not be written." }).waitFor();
+    assert.equal((await errorPage.getByRole("dialog").innerText()).includes("ENOSPC"), false);
+    assert.equal((await errorPage.getByRole("dialog").innerText()).includes("Error invoking remote method"), false);
     assert.equal(await errorPage.getByRole("dialog").count(), 1);
     assert.equal(await kept.inputValue(), "Kept label");
     await errorPage.close();
@@ -1608,21 +1622,62 @@ test("ChatGPT account rows stay in the card and label edits are guarded", { time
     const saveLabel = pendingPage.getByRole("button", { name: "Save label", exact: true });
     await saveLabel.click();
     await pendingPage.waitForFunction(() => {
-      const button = [...document.querySelectorAll("button")].find((element) => element.textContent?.trim() === "Save label");
-      return button instanceof HTMLButtonElement && button.disabled && button.getAttribute("aria-busy") === "true";
+      const button = [...document.querySelectorAll("button")].find((element) => element.textContent?.trim() === "Saving…");
+      const input = document.querySelector(".dialog-panel input");
+      return button instanceof HTMLButtonElement
+        && button.disabled
+        && button.getAttribute("aria-busy") === "true"
+        && input instanceof HTMLInputElement
+        && input.readOnly;
     });
     await pendingPage.getByRole("dialog").waitFor({ state: "hidden" });
     await pendingPage.close();
 
-    const localized = [
-      ["en", "ipc", "Account label contains characters that are not allowed."],
-      ["zh-CN", "ipc-collision", "账户名称与另一个账户重复。"],
-      ["zh-TW", "ipc-long", "帳號標籤最多 120 個字元。"],
-    ];
-    for (const [language, mode, expected] of localized) {
+    const localized = {
+      en: [
+        "Account label is invalid.",
+        "Account label contains characters that are not allowed.",
+        "Account label is limited to 120 characters.",
+        "Account label matches another account.",
+        "That ChatGPT account is no longer registered.",
+        "The account label could not be saved because the disk is full or the file could not be written.",
+        "The account label command failed.",
+        "The account label could not be saved.",
+        "Account label matches another account.",
+        "The account label could not be saved because the disk is full or the file could not be written.",
+        "That ChatGPT account is no longer registered.",
+      ],
+      "zh-CN": [
+        "账户名称无效。",
+        "账户名称包含不允许的字符。",
+        "账户名称最多 120 个字符。",
+        "账户名称与另一个账户重复。",
+        "该账户未注册。",
+        "账户名称无法保存，磁盘已满或文件无法写入。",
+        "账户名称命令失败。",
+        "账户名称无法保存。",
+        "账户名称与另一个账户重复。",
+        "账户名称无法保存，磁盘已满或文件无法写入。",
+        "该账户未注册。",
+      ],
+      "zh-TW": [
+        "帳號標籤無效。",
+        "帳號標籤包含不允許的字元。",
+        "帳號標籤最多 120 個字元。",
+        "帳號標籤與另一個帳號重複。",
+        "該帳號未註冊。",
+        "帳號標籤無法儲存，磁碟已滿或檔案無法寫入。",
+        "帳號標籤命令失敗。",
+        "帳號標籤無法儲存。",
+        "帳號標籤與另一個帳號重複。",
+        "帳號標籤無法儲存，磁碟已滿或檔案無法寫入。",
+        "該帳號未註冊。",
+      ],
+    };
+    for (const [language, messages] of Object.entries(localized)) {
       const localePage = await newEnglishTestPage(browser, { viewport: { width: 1280, height: 840 } });
       localePage.setDefaultTimeout(10_000);
-      await localePage.goto(`${url}?renameFails=${mode}`, { waitUntil: "domcontentloaded" });
+      await localePage.goto(`${url}?renameFails=matrix`, { waitUntil: "domcontentloaded" });
       await localePage.getByRole("button", { name: "Settings", exact: true }).click();
       if (language !== "en") {
         await localePage.getByRole("combobox", { name: "Interface language" }).selectOption(language);
@@ -1633,12 +1688,29 @@ test("ChatGPT account rows stay in the card and label edits are guarded", { time
           ? "重新命名 ChatGPT 帳號：Secondary account"
           : "Rename ChatGPT account: Secondary account";
       const saveName = language === "zh-CN" ? "保存名称" : language === "zh-TW" ? "儲存標籤" : "Save label";
+      const fieldName = language === "zh-CN"
+        ? "ChatGPT 账户名称"
+        : language === "zh-TW"
+          ? "ChatGPT 帳號標籤"
+          : "ChatGPT account label";
       await localePage.locator(".subscription-account-row").filter({ hasText: "Secondary account" })
         .getByRole("button", { name: renameName, exact: true }).click();
-      await localePage.getByRole("button", { name: saveName, exact: true }).click();
-      await localePage.getByRole("alert").filter({ hasText: expected }).waitFor();
-      assert.equal(await localePage.getByText("Error invoking remote method").count(), 0);
-      assert.equal(await localePage.getByRole("dialog").count(), 1);
+      for (let index = 0; index < messages.length; index += 1) {
+        const field = localePage.getByRole("textbox", { name: fieldName, exact: true });
+        await field.fill(`Kept label ${index}`);
+        await localePage.getByRole("button", { name: saveName, exact: true }).click();
+        const alert = localePage.getByRole("dialog").getByRole("alert");
+        await alert.filter({ hasText: messages[index] }).waitFor();
+        assert.equal(await alert.innerText(), messages[index]);
+        const dialogText = await localePage.getByRole("dialog").innerText();
+        assert.equal(dialogText.includes("Error invoking remote method"), false);
+        assert.equal(dialogText.includes("account-label-error"), false);
+        assert.equal(dialogText.includes("raw backend text"), false);
+        assert.equal(dialogText.includes("ENOSPC"), false);
+        assert.equal(dialogText.includes("Account id is not registered"), false);
+        assert.equal(await localePage.getByRole("dialog").count(), 1);
+        assert.equal(await field.inputValue(), `Kept label ${index}`);
+      }
       await localePage.close();
     }
   } finally {
