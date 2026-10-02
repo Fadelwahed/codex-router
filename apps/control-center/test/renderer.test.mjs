@@ -231,7 +231,7 @@ const bridgeSource = String.raw`
     policy: { enabled: true, mode: "switch", selectedAccountId: "active" },
     accounts: {
       revoked: { id: "revoked", state: "revoked", paused: true, priority: 50, label: "Removed account", health: { state: "healthy" }, turns: 0, requests: 0 },
-      active: { id: "active", state: "active", paused: false, priority: 50, label: "Secondary account", subscription: { status: "usable", authenticated: true, usable: true, expired: false, email: "secondary@example.com", usage: { period: "weekly", remainingPercent: 70, windowDurationMins: 10080, planType: "plus", also: { period: "current", remainingPercent: 12, windowDurationMins: 300, resetsAt: 1700000000 } } }, health: { state: "healthy" }, turns: 0, requests: 0 },
+      active: { id: "active", state: "active", paused: false, priority: 50, label: "Secondary account", subscription: { status: "usable", authenticated: true, usable: true, expired: false, email: "secondary@example.com", usage: { period: "weekly", remainingPercent: 70, windowDurationMins: 10080, planType: "plus", also: { period: "current", remainingPercent: 12, windowDurationMins: 300 } } }, health: { state: "healthy" }, turns: 0, requests: 0 },
       current: { id: "current", state: "active", paused: false, priority: 50, label: "Current account", subscription: terminalLoginFailure || loginStaysPending ? { status: "invalid", authenticated: false, usable: false, expired: false, email: "primary@example.com" } : { status: "usable", authenticated: true, usable: true, expired: false, email: "primary@example.com" }, health: { state: "healthy" }, turns: 0, requests: 0 },
     },
     get loginAttempts() {
@@ -254,6 +254,14 @@ const bridgeSource = String.raw`
       if (rejectAccountPool) throw new Error("The saved ChatGPT account list could not be read as JSON.");
       accountPoolReads += 1;
       if (terminalLoginFailure) record("getChatGptAccountPool", accountPoolReads);
+      const usage = accountPoolState.accounts.active.subscription?.usage;
+      if (usage) {
+        const now = Date.now();
+        // Floor stays at 2d 4h for half an hour, and at 3h 12m for 45s, so a
+        // settings assertion after the rest of this page still matches.
+        usage.resetsAt = now + ((2 * 24 * 60) + (4 * 60) + 30) * 60_000;
+        usage.also.resetsAt = now + ((3 * 60) + 12) * 60_000 + 45_000;
+      }
       return JSON.parse(JSON.stringify(accountPoolState));
     },
     getProviders: async () => {
@@ -1045,9 +1053,12 @@ test("the production renderer exposes model discovery and picker actions", { tim
     assert.equal(await accountRows.filter({ hasText: "secondary@example.com" }).count(), 1, "secondary email should be visible");
     const readySecondary = accountRows.filter({ hasText: "Secondary account" });
     assert.equal(await readySecondary.getByRole("button", { name: "Login", exact: true }).isDisabled(), true, "ready accounts cannot start a duplicate login");
+    await page.getByRole("button", { name: "Refresh Settings", exact: true }).click();
+    await readySecondary.getByText("resets in 3h 12m", { exact: false }).waitFor();
     const secondaryText = await readySecondary.innerText();
-    assert.match(secondaryText, /weekly · 70% remaining/);
-    assert.match(secondaryText, /5h · 12% remaining/);
+    assert.match(secondaryText, /weekly · 70% remaining · resets in 2d 4h/);
+    assert.match(secondaryText, /5h · 12% remaining · resets in 3h 12m/);
+    assert.equal(secondaryText.includes("NaN"), false);
     assert.match(secondaryText, /Ready/);
     assert.match(secondaryText, /Selected/);
     await page.getByRole("button", { name: "Select ChatGPT account: primary@example.com", exact: true }).click();

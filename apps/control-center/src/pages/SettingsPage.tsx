@@ -2,7 +2,7 @@ import { backendText } from "../backend-text";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { AppWindow, Check, Eye, LogIn, Moon, Plus, RefreshCw, Server, ShieldCheck, Sun, Trash2, UserRound, Wrench } from "lucide-react";
 import { Badge, Button, Dialog, InlineNotice, PageHeader, SectionHeading, Toggle } from "../components";
-import { compactNumber, effortLabel } from "../lib";
+import { compactNumber, effortLabel, formatAccountReset } from "../lib";
 import { LANGUAGE_OPTIONS, type LanguageId, type Translate } from "../i18n";
 import type {
   ChatGptAccountPool,
@@ -30,6 +30,25 @@ type AccountOverlay =
 
 function isOptimisticAccountId(id: string): boolean {
   return id.startsWith("pending:");
+}
+
+function accountUsageClause(
+  window: {
+    period: string;
+    remainingPercent: number;
+    resetsAt?: number | null;
+    windowDurationMins?: number | null;
+  },
+  period: string,
+  t: Translate,
+): string {
+  if (!Number.isFinite(window.remainingPercent)) return "";
+  const remaining = t("settings.accounts.remaining", {
+    period,
+    percent: Math.round(window.remainingPercent),
+  });
+  const reset = formatAccountReset(window.resetsAt, t);
+  return reset ? `${remaining} · ${reset}` : remaining;
 }
 
 function alsoWindowPeriodLabel(
@@ -418,14 +437,11 @@ export function SettingsPage({ target, health, presence, chatgptSession, account
                 const title = account.subscription?.email || account.label || t("settings.accounts.defaultTitle");
                 const label = account.subscription?.email && account.label ? `${account.label} · ` : "";
                 const usage = account.subscription?.usage;
-                const primaryUsage = usage && Number.isFinite(usage.remainingPercent)
-                  ? t("settings.accounts.remaining", { period: usage.period, percent: Math.round(usage.remainingPercent) })
+                const primaryUsage = usage
+                  ? accountUsageClause(usage, usage.period, t)
                   : "";
-                const alsoUsage = usage?.also && Number.isFinite(usage.also.remainingPercent)
-                  ? t("settings.accounts.remaining", {
-                      period: alsoWindowPeriodLabel(usage.also, t),
-                      percent: Math.round(usage.also.remainingPercent),
-                    })
+                const alsoUsage = usage?.also
+                  ? accountUsageClause(usage.also, alsoWindowPeriodLabel(usage.also, t), t)
                   : "";
                 const usageLabel = optimisticPending
                   ? t("settings.accounts.savingAccount")

@@ -64,6 +64,47 @@ export function formatDateTime(value: number | string | null | undefined, t: Tra
   }).format(date);
 }
 
+// Codex reports each rate-limit window's resetsAt as a Unix timestamp. The
+// same threshold formatDateTime uses distinguishes seconds from milliseconds.
+// A missing or past instant is omitted: the row must never show "NaN" or a
+// negative remainder.
+export function formatAccountReset(
+  resetsAt: number | string | null | undefined,
+  t: Translate = createTranslator(detectLanguage()),
+  now = Date.now(),
+): string {
+  if (resetsAt === null || resetsAt === undefined || resetsAt === "") return "";
+  const numeric = typeof resetsAt === "number" ? resetsAt : Number(resetsAt);
+  if (!Number.isFinite(numeric)) return "";
+  const epochMs = numeric < 10_000_000_000 ? numeric * 1_000 : numeric;
+  if (!Number.isFinite(epochMs) || !Number.isFinite(now)) return "";
+  const remainingMs = epochMs - now;
+  if (remainingMs <= 0) return "";
+  const totalMinutes = Math.floor(remainingMs / 60_000);
+  if (!Number.isSafeInteger(totalMinutes)) return "";
+  const when = totalMinutes < 1
+    ? t("settings.accounts.resetUnderMinute")
+    : accountResetWhen(totalMinutes, t);
+  return t("settings.accounts.resetsIn", { when });
+}
+
+function accountResetWhen(totalMinutes: number, t: Translate): string {
+  const days = Math.floor(totalMinutes / (60 * 24));
+  const hours = Math.floor((totalMinutes % (60 * 24)) / 60);
+  const minutes = totalMinutes % 60;
+  if (days > 0) {
+    return hours > 0
+      ? t("settings.accounts.resetDaysHours", { days, hours })
+      : t("settings.accounts.resetDays", { days });
+  }
+  if (hours > 0) {
+    return minutes > 0
+      ? t("settings.accounts.resetHoursMinutes", { hours, minutes })
+      : t("settings.accounts.resetHours", { hours });
+  }
+  return t("settings.accounts.resetMinutes", { minutes });
+}
+
 export function formatDuration(milliseconds: number | null | undefined, t: Translate = createTranslator(detectLanguage())): string {
   const value = Math.max(0, Number(milliseconds) || 0);
   if (value < 1_000) return t("common.durationMs", { count: Math.round(value) });

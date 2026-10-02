@@ -1570,7 +1570,9 @@ Each account keeps its own native model catalog and routed overlay. Usage is
 read from up to eight saved, usable accounts' isolated `CODEX_HOME`
 directories, prioritizing the selected account and using the weekly
 window when available and the monthly window otherwise. A second window
-of a different duration is shown beside that line. A short window is not
+of a different duration is shown beside that line. Each shown window
+includes a compact relative reset time when Codex reported a future reset,
+and a missing or past reset time is omitted. A short window is not
 treated as exhaustion and does not change the selected account. This is
 an explicit switch-only feature: it does not perform automatic quota or
 round-robin routing. See [the account switching guide](docs/CHATGPT-ACCOUNT-MODES.md) for

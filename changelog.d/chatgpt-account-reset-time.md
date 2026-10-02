@@ -1,0 +1,1 @@
+- **ChatGPT account rows show when each usage window resets.** A future reset time is rendered as a compact relative time, such as “resets in 2d 4h”, on the primary window and on a second window beside it. A missing or past reset time is left blank.
