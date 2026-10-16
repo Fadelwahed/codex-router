@@ -295,3 +295,25 @@ OAuth and API JSON/SSE/WebSocket. The SDK/LiteLLM stream-error negative control
 passed and is now wired into the three-platform protocol workflow. Catalog
 reload was reproduced with both local CLI 0.159 and bundled
 0.162.0-alpha.17.2. Remote CI remains separate evidence for the pushed revision.
+
+### Client decoder regression follow-up
+
+The first context-accounting patch removed `cached_tokens` but retained its
+`input_tokens_details` object. Codex requires that member when the object is
+present, so real turns failed with `failed to parse ResponseCompleted: missing
+field cached_tokens`. The initial unit and protocol fixtures incorrectly
+asserted absence; their green results did not establish client compatibility.
+
+The estimated context omits the entire optional input-details object: the
+current request cache breakdown is unknown, so neither a cumulative count nor
+a fabricated zero belongs there. Raw cumulative cache billing is unchanged.
+The existing offline app-server verifier now has `--usage-contract`: its negative
+control reproduces the exact decoder error, then the production transform's
+output must complete with 58,000 input tokens and no cache-details object.
+Codex defaults its own absent cache count to zero; Router does not send that
+number. The raw meter retains 500,000 cached tokens. Both responses use an isolated synthetic server,
+with retries disabled and no provider quota.
+
+```sh
+node scripts/verify-codex-catalog-reload.mjs /absolute/path/to/bundled/codex --usage-contract
+```

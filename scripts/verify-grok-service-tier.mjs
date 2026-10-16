@@ -215,7 +215,7 @@ async function run(model, tier, streaming) {
     assert.ok(Number.isSafeInteger(contextEstimate) && contextEstimate > 0, "provider request estimate survives locked LiteLLM");
     assert.equal(terminal.usage.input_tokens, contextEstimate, "client sees current context, not cumulative billing");
     assert.equal(terminal.usage.total_tokens, contextEstimate + 1000);
-    assert.equal(terminal.usage.input_tokens_details?.cached_tokens, undefined, "aggregate cache count is not current-context evidence");
+    assert.equal(terminal.usage.input_tokens_details, undefined, "unknown current-context cache omits the entire optional breakdown");
   } else {
     assert.equal(contextEstimate, undefined);
     assert.equal(terminal.usage.input_tokens, 10, "API prompt usage remains provider-measured");

@@ -28,7 +28,7 @@ test("cumulative billing is separated from client context across JSON and SSE", 
     const delivered = isJson ? JSON.parse(body) : JSON.parse(body.split("\r\n")[0].slice(6)).response;
     assert.equal(delivered.usage.input_tokens, 58000);
     assert.equal(delivered.usage.total_tokens, 62820);
-    assert.deepEqual(delivered.usage.input_tokens_details, { other: 7 });
+    assert.equal(delivered.usage.input_tokens_details, undefined, "unknown current-context cache omits the optional breakdown, not a required member");
     assert.equal(transform.tokenUsage().inputTokens, 572089);
     assert.equal(transform.tokenUsage().cachedInputTokens, 500000);
     assert.equal(transform.tokenUsage().billedInputTokens, 800000);

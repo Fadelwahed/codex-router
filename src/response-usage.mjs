@@ -337,15 +337,13 @@ function withEstimatedPromptTokens(usage, estimate, cumulativeInputUsage = false
     if (typeof usage[key] === "number" && Number.isFinite(usage[key]) && usage[key] >= 0) next[key] = estimate;
   }
   // Server-side agent steps repeatedly bill the same cached prefix. Their
-  // aggregate cache count is no more a current-prompt measurement than input.
-  // Keep it in the raw meter, but do not attach it to the client's estimate.
+  // aggregate input breakdown does not describe this estimated context.
+  // Omit the optional details object as a whole: a missing cached_tokens member
+  // is invalid in Codex, while inventing zero would imply a measured cache miss.
+  // Raw provider billing is observed before this client-only substitution.
   if (cumulativeInputUsage) {
-    for (const key of ["input_tokens_details", "prompt_tokens_details"]) {
-      if (next[key] && typeof next[key] === "object") {
-        const { cached_tokens: _cached, ...details } = next[key];
-        next[key] = details;
-      }
-    }
+    delete next.input_tokens_details;
+    delete next.prompt_tokens_details;
     delete next.prompt_cache_hit_tokens;
   }
   return next;
