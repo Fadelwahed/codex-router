@@ -1,6 +1,23 @@
 import {
   actualServiceTierFromValue,
 } from "./request-diagnostics.mjs";
+import { estimateInputTokens } from "./response-usage.mjs";
+import { DEFAULT_IMAGE_TOKEN_BOUND } from "./prompt-image-usage.mjs";
+
+// Count the final provider request, after tool alternatives, hosted tools and
+// repair instructions have been added. This is an explicit estimate, separate
+// from xAI's cumulative bill across internal inferences. Never tokenize sealed
+// reasoning as plaintext or treat it as a measured context count.
+export function grokContextFields(request, usage) {
+  const estimate = estimateInputTokens(JSON.stringify(request), {
+    minimumTokens: 0, maxTokensPerImage: DEFAULT_IMAGE_TOKEN_BOUND,
+  });
+  const fields = { grok_context_input_tokens: estimate };
+  for (const [source, target] of [["billed_prompt_tokens", "grok_billed_input_tokens"], ["billed_completion_tokens", "grok_billed_output_tokens"]]) {
+    if (Number.isSafeInteger(usage?.[source]) && usage[source] >= 0) fields[target] = usage[source];
+  }
+  return { provider_specific_fields: fields };
+}
 
 // SSE joins repeated `data:` fields with a line feed before dispatch.
 // Reading only the first field truncates multiline JSON.

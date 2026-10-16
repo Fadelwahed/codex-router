@@ -31,6 +31,10 @@ const expected = pieces.join("");
 let requested;
 let actual = "priority";
 let postTool = false;
+let aggregateUsage = false;
+let repair = false;
+let emptyReplies = 0;
+let provider = "grok-oauth";
 let upstreamRequests = 0;
 const automationSchema = CODEX_APP_TOOLS.find(tool => tool.name === "codex_app")
   .tools.find(tool => tool.name === "automation_update").inputSchema;
@@ -39,8 +43,32 @@ const upstream = http.createServer(async (req, res) => {
   const body = [];
   for await (const chunk of req) body.push(chunk);
   requested = JSON.parse(Buffer.concat(body));
+  if (req.url === "/v1/chat/completions") {
+    const usage = { prompt_tokens: 10, completion_tokens: 1000, total_tokens: 1010, prompt_tokens_details: { cached_tokens: 0 } };
+    const common = { id: "chatcmpl-api-fixture", model: requested.model, created: 1,
+      ...(actual !== undefined ? { service_tier: actual } : {}) };
+    if (!requested.stream) {
+      const data = JSON.stringify({ ...common, object: "chat.completion",
+        choices: [{ index: 0, message: { role: "assistant", content: expected }, finish_reason: "stop" }], usage });
+      res.writeHead(200, { "Content-Type": "application/json", "Content-Length": Buffer.byteLength(data) });
+      res.end(data);
+    } else {
+      res.writeHead(200, { "Content-Type": "text/event-stream" });
+      for (const delta of pieces) res.write(`data: ${JSON.stringify({ ...common, object: "chat.completion.chunk", choices: [{ index: 0, delta: { content: delta }, finish_reason: null }] })}\n\n`);
+      res.write(`data: ${JSON.stringify({ ...common, object: "chat.completion.chunk", choices: [{ index: 0, delta: {}, finish_reason: "stop" }] })}\n\n`);
+      res.write(`data: ${JSON.stringify({ ...common, object: "chat.completion.chunk", choices: [], usage })}\n\n`);
+      res.end("data: [DONE]\n\n");
+    }
+    return;
+  }
   res.writeHead(200, { "Content-Type": "text/event-stream" });
   const event = value => res.write(`event: ${value.type}\ndata: ${JSON.stringify(value)}\n\n`);
+  if (emptyReplies > 0) {
+    emptyReplies -= 1;
+    event({ type: "response.completed", response: { usage: { input_tokens: 572089, output_tokens: 0 } } });
+    res.end();
+    return;
+  }
   let output;
   if (postTool) {
     assert.equal(requested.max_output_tokens, 4096, "caller budget survives Router and locked LiteLLM");
@@ -67,7 +95,8 @@ const upstream = http.createServer(async (req, res) => {
   event({ type: "response.completed", response: {
     ...(output ? { output } : {}),
     ...(actual !== undefined ? { service_tier: actual } : {}),
-    usage: { input_tokens: 10, output_tokens: 1000 },
+    usage: { input_tokens: aggregateUsage ? 572089 : 10, output_tokens: 1000,
+      input_tokens_details: { cached_tokens: aggregateUsage ? 500000 : 0 } },
   } });
   res.end();
 });
@@ -86,6 +115,7 @@ let errors = "";
 forwarder.stderr.on("data", chunk => { errors = (errors + chunk).slice(-8000); });
 
 const gatewayPort = await openPort();
+const apiPort = await openPort();
 const routerPort = await openPort();
 const configPath = path.join(temp, "litellm.yaml");
 const callbacks = ["grok_service_tier_callback.grok_service_tier_callback", "litellm_stream_cleanup_callback.stream_cleanup_callback"];
@@ -94,10 +124,13 @@ for (const name of ["grok_service_tier_callback.py", "litellm_stream_cleanup_cal
   writeFileSync(path.join(temp, name), readFileSync(path.join(root, "src", name)), { mode: 0o600 });
 }
 writeFileSync(configPath, JSON.stringify({
-  model_list: ["grok-4.6", "grok-4.5"].map(model => ({
+  model_list: ["grok-4.6", "grok-4.5", "grok-4.7"].map(model => ({
     model_name: `grok-oauth-${model.replaceAll(".", "-")}`,
     litellm_params: { model: `openai/${model}`, api_base: `http://127.0.0.1:${port}/v1`, api_key: key, use_chat_completions_api: true },
-  })),
+  })).concat(["grok-4.5", "grok-4.7"].map(model => ({
+    model_name: `grok-api-${model.replaceAll(".", "-")}`,
+    litellm_params: { model: `openai/grok-api-${model.replaceAll(".", "-")}`, api_base: `http://127.0.0.1:${apiPort}/v1`, api_key: key, use_chat_completions_api: true },
+  }))),
   litellm_settings: { drop_params: true, callbacks },
   general_settings: { master_key: key, disable_spend_logs: true },
 }));
@@ -108,7 +141,7 @@ function start(executable, args, env) {
   child.stderr.on("data", c => processErrors.set(child, (processErrors.get(child) + c).slice(-8000)));
   return child;
 }
-let gateway, router;
+let gateway, router, apiForwarder;
 function usageRecords() {
   const file = path.join(temp, "usage-events.jsonl");
   if (!existsSync(file)) return [];
@@ -128,9 +161,10 @@ async function ready(url, child, headers = {}) {
   }
 }
 async function run(model, tier, streaming) {
+  emptyReplies = repair ? 1 : 0;
   const requestsBefore = upstreamRequests;
   const usageBefore = usageRecords().length;
-  const requestBody = { model: `grok-oauth/${model}`, input: [{ type: "message", role: "user", content: "synthetic fixture" }], stream: streaming !== false,
+  const requestBody = { model: `${provider}/${model}`, input: [{ type: "message", role: "user", content: "synthetic fixture" }], stream: streaming !== false,
     ...(tier === "omit" ? {} : { service_tier: tier }) };
   if (postTool) {
     requestBody.max_output_tokens = 4096;
@@ -176,25 +210,40 @@ async function run(model, tier, streaming) {
     terminal = delivered.find(e => e.type === "response.completed")?.response;
   } else terminal = JSON.parse(body);
   assert.ok(terminal, "terminal response required");
+  const contextEstimate = terminal.provider_specific_fields?.grok_context_input_tokens;
+  if (provider === "grok-oauth") {
+    assert.ok(Number.isSafeInteger(contextEstimate) && contextEstimate > 0, "provider request estimate survives locked LiteLLM");
+    assert.equal(terminal.usage.input_tokens, contextEstimate, "client sees current context, not cumulative billing");
+    assert.equal(terminal.usage.total_tokens, contextEstimate + 1000);
+    assert.equal(terminal.usage.input_tokens_details?.cached_tokens, undefined, "aggregate cache count is not current-context evidence");
+  } else {
+    assert.equal(contextEstimate, undefined);
+    assert.equal(terminal.usage.input_tokens, 10, "API prompt usage remains provider-measured");
+  }
+  if (aggregateUsage) assert.ok(contextEstimate < 100000, "572k billed tokens must not force compaction of a small request");
   assert.equal(terminal.output.filter(x => x.type === "message").flatMap(x => x.content).map(x => x.text || "").join(""), expectedText);
-  assert.equal(upstreamRequests - requestsBefore, 1, "exactly one upstream generation per successful turn");
+  assert.equal(upstreamRequests - requestsBefore, repair ? 2 : 1, "no generation beyond the bounded repair");
   assert.equal(terminal.output.some(item => item.type === "function_call"), false, "private final never reaches client dispatch");
   const known = actual === "default" || actual === "priority";
-  const want = model === "grok-4.6" ? (known ? actual : actual === undefined ? undefined : "unknown") : undefined;
+  const want = !repair ? (known ? actual : actual === undefined ? undefined : "unknown") : undefined;
   assert.equal(terminal.provider_specific_fields?.grok_service_tier, want);
-  assert.equal(tokenUsageFromPayload(terminal, { grokServiceTier: model === "grok-4.6" })?.serviceTier, known && model === "grok-4.6" ? actual : undefined);
-  assert.equal(requested.service_tier, model === "grok-4.6" && tier !== "omit" ? tier : undefined);
+  assert.equal(tokenUsageFromPayload(terminal, { grokServiceTier: true })?.serviceTier, known && !repair ? actual : undefined);
+  assert.equal(requested.service_tier, tier !== "omit" ? tier : undefined);
   const deadline = Date.now() + 2000;
   while (usageRecords().length === usageBefore && Date.now() < deadline) await new Promise(resolve => setTimeout(resolve, 20));
   const row = usageRecords().at(-1);
   assert.ok(usageRecords().length > usageBefore, "new usage row required");
-  assert.equal(row.requestedServiceTier, model === "grok-4.6" && tier !== "omit" ? tier : undefined);
-  assert.equal(row.serviceTier, known && model === "grok-4.6" ? actual : undefined);
+  assert.equal(row.requestedServiceTier, tier !== "omit" ? tier : undefined);
+  assert.equal(row.serviceTier, known && !repair ? actual : undefined);
   assert.equal(row.serviceTierUnknown, want === "unknown" ? true : undefined);
-  assert.equal(row.inputTokens, 10);
+  assert.equal(row.inputTokens, aggregateUsage ? 572089 : 10);
+  assert.equal(row.cachedInputTokens, aggregateUsage ? 500000 : 0);
+  assert.equal(row.estimatedInputTokens, contextEstimate);
+  assert.equal(row.billedInputTokens, repair ? 1144178 : undefined);
+  assert.equal(row.billedOutputTokens, repair ? 1000 : undefined);
   assert.equal(row.outputTokens, 1000);
   assert.equal(JSON.stringify(row).includes("synthetic fixture"), false);
-  console.log(JSON.stringify({ model, requested: tier, actual: want ?? "missing", streaming, postTool, upstreamRequests: 1, textPieces: 1000, textPreserved: true }));
+  console.log(JSON.stringify({ provider, model, requested: tier, actual: want ?? "missing", streaming, postTool, aggregateUsage, repair, contextEstimate, upstreamRequests: repair ? 2 : 1, textPieces: 1000, textPreserved: true }));
 }
 try {
   // Exercise the cross-process read boundary before the Router starts.
@@ -206,6 +255,15 @@ try {
   writeFileSync(ledgerFixture, '{"broken":}\n');
   assert.throws(usageRecords, SyntaxError);
   rmSync(ledgerFixture);
+  apiForwarder = start(process.execPath, [path.join(root, "src/api-forwarder.mjs")], {
+    MODEL_ROUTER_INTERNAL_KEY: key, MODEL_ROUTER_API_PORT: String(apiPort),
+    MODEL_ROUTER_STATE_DIR: temp, CODEX_ROUTER_STATE_DIR: temp,
+    MODEL_ROUTER_PROVIDER_CREDENTIAL_STORE: path.join(temp, "api-credentials.json"),
+    MODEL_ROUTER_API_KEY_POOL_PATH: path.join(temp, "api-pool.json"),
+    XAI_API_KEY: "synthetic-api-key", XAI_API_BASE_URL: `http://127.0.0.1:${upstream.address().port}/v1`,
+    MODEL_ROUTER_QUIET: "1",
+  });
+  await ready(`http://127.0.0.1:${apiPort}/health`, apiForwarder, { Authorization: `Bearer ${key}` });
   const deadline = Date.now() + 10000;
   while (true) {
     assert.equal(forwarder.exitCode, null, errors);
@@ -236,11 +294,31 @@ try {
     actual = "priority"; await run("grok-4.5", "priority", streaming);
   }
   postTool = true;
+  aggregateUsage = true;
   for (const streaming of [true, false, "ws"]) {
     actual = "default"; await run("grok-4.6", "default", streaming);
   }
+  repair = true;
+  for (const streaming of [true, false, "ws"]) {
+    actual = "default"; await run("grok-4.6", "default", streaming);
+  }
+  repair = false;
+  for (const streaming of [true, false, "ws"]) {
+    actual = "default"; await run("grok-4.7", "priority", streaming);
+    actual = "priority"; await run("grok-4.7", "priority", streaming);
+  }
+  provider = "grok-api";
+  postTool = false;
+  aggregateUsage = false;
+  for (const model of ["grok-4.5", "grok-4.7"]) {
+    for (const streaming of [true, false, "ws"]) {
+      for (const value of ["priority", "default", undefined]) {
+        actual = value; await run(model, "priority", streaming);
+      }
+    }
+  }
 } finally {
-  for (const child of [router, gateway]) {
+  for (const child of [router, gateway, apiForwarder]) {
     if (child?.exitCode === null && child.signalCode === null) {
       child.kill("SIGTERM");
       const timer = setTimeout(() => child.kill("SIGKILL"), 5000);

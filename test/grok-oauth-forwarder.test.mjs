@@ -1,6 +1,6 @@
 import { writeGrokVersionCli } from "./grok-version-fixture.mjs";
 import assert from "node:assert/strict";
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import http from "node:http";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import os from "node:os";
@@ -41,6 +41,17 @@ test("Grok preserves caller output budgets and sampling parameters", () => {
 
 function sse(events) {
   return `${events.map((e) => `event: ${e.type}\ndata: ${JSON.stringify(e)}`).join("\n\n")}\n\n`;
+}
+
+function assertChatStreamError(body) {
+  const errors = body.split(/\r?\n/).filter((line) => line.startsWith("data: ") && line !== "data: [DONE]")
+    .map((line) => JSON.parse(line.slice(6))).filter((item) => item.error || item.type === "error");
+  assert.equal(errors.length, 1);
+  assert.deepEqual(Object.keys(errors[0]), ["error"]);
+  assert.equal(errors[0].error.type, "api_error");
+  assert.equal(errors[0].error.code, "local_router_stream_failed");
+  assert.equal(typeof errors[0].error.message, "string");
+  assert.equal(errors[0].error.param, null);
 }
 
 async function mockBackend(handler) {
@@ -310,8 +321,42 @@ test("translates Chat Completions to Grok Responses and back (text + tools)", as
   }
 });
 
-test("emits one terminal SSE error when the upstream stream fails mid-turn", async () => {
+test("keeps terminal metadata on the finish chunk when upstream omits usage", async () => {
   const backend = await mockBackend((_req, res) => {
+    res.writeHead(200, { "Content-Type": "text/event-stream" });
+    res.end(sse([
+      { type: "response.output_text.delta", delta: "Done." },
+      { type: "response.completed", response: { status: "completed" } },
+    ]));
+  });
+  const port = await openPort();
+  const dir = mkdtempSync(path.join(os.tmpdir(), "grok-oauth-no-usage-"));
+  const child = startForwarder(port, backend.port, writeSession(dir));
+  try {
+    await waitHealth(`http://127.0.0.1:${port}`, child);
+    const response = await fetch(`http://127.0.0.1:${port}/v1/chat/completions`, {
+      method: "POST", headers: auth,
+      body: JSON.stringify({ model: "grok-4.7", messages: [{ role: "user", content: "finish" }], stream: true }),
+    });
+    const body = await response.text();
+    const chunks = body.split("\n").filter(line => line.startsWith("data: ") && line !== "data: [DONE]")
+      .map(line => JSON.parse(line.slice(6)));
+    assert.ok(chunks.every(chunk => chunk.choices?.length > 0), "metadata alone must not create an empty-choice chunk");
+    const finish = chunks.find(chunk => chunk.choices[0].finish_reason === "stop");
+    assert.ok(finish.provider_specific_fields.grok_context_input_tokens > 0);
+    assert.equal(chunks.some(chunk => Object.hasOwn(chunk, "usage")), false, "usage must not be invented");
+    assert.match(body, /data: \[DONE\]/);
+  } finally {
+    await stop(child);
+    await new Promise(resolve => backend.server.close(resolve));
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("emits one terminal SSE error when the upstream stream fails mid-turn", async () => {
+  let upstreamRequests = 0;
+  const backend = await mockBackend((_req, res) => {
+    upstreamRequests += 1;
     res.writeHead(200, { "Content-Type": "text/event-stream" });
     res.write(sse([{ type: "response.output_text.delta", delta: "partial" }]));
     // A real socket failure makes fetch's body reader reject after the first
@@ -365,7 +410,17 @@ test("emits one terminal SSE error when the upstream stream fails mid-turn", asy
     assert.match(result.body, /"content":"partial"/);
     assert.equal((result.body.match(/event: error/g) || []).length, 1);
     assert.match(result.body, /local_router_stream_failed/);
+    assertChatStreamError(result.body);
     assert.doesNotMatch(result.body, /data: \[DONE\]/);
+    assert.equal(upstreamRequests, 1, "a failed stream must not replay the provider request");
+    const python = process.env.MODEL_ROUTER_TEST_LITELLM_PYTHON;
+    if (python) {
+      const proof = spawnSync(python, [path.join(root, "scripts/verify-grok-chat-errors.py")], {
+        cwd: root, input: result.body, encoding: "utf8", timeout: 90_000,
+      });
+      assert.equal(proof.status, 0, proof.stderr || proof.stdout || proof.error?.message);
+      assert.match(proof.stdout, /PASS: legacy flat envelope reproduces IndexError/);
+    }
     await waitChildError(
       child,
       /upstream-phase-failed=true phase=attempt model=grok-4\.6 attempt_req=[0-9a-f-]{36} attempt_headers_ms=\d+ attempt_first_event_ms=\d+ attempt_total_ms=\d+ error=(?:TypeError|AbortError)/,
@@ -557,7 +612,12 @@ test("toResponsesRequest copies known service_tier and omits anything else", () 
     service_tier: "flex",
   });
   assert.equal("service_tier" in unknown, false);
-  assert.equal("service_tier" in toResponsesRequest({ model: "grok-4.5", messages: [], service_tier: "priority" }), false);
+  for (const model of ["grok-4.5", "grok-4.6", "grok-4.7"]) {
+    assert.equal(toResponsesRequest({ model, messages: [], service_tier: "priority" }).service_tier, "priority");
+    assert.equal(toResponsesRequest({ model, messages: [], service_tier: "default" }).service_tier, "default");
+    assert.equal(toResponsesRequest({ model, messages: [] }).service_tier, undefined);
+  }
+  assert.equal(toResponsesRequest({ model: "unknown", messages: [], service_tier: "priority" }).service_tier, undefined);
 });
 
 test("toResponsesRequest aliases view_image only at the Grok boundary", () => {
@@ -1569,6 +1629,7 @@ test("post-tool repair releases held actions only after a successful terminal", 
                   assert.equal(resp.status, 200);
                   assert.equal((body.match(/event: error/g) || []).length, 1);
                   assert.match(body, /local_router_stream_failed/);
+                  assertChatStreamError(body);
                 } else {
                   assert.equal(resp.status, 502);
                   assert.equal(JSON.parse(body).error.code, `grok_upstream_response_${["eof", "truncated"].includes(terminal) ? "missing" : terminal}`);
@@ -2728,6 +2789,7 @@ test("post-tool completion decides in one generation, preserves choices and reje
             assert.equal(resp.status, stream ? 200 : 502);
             assert.doesNotMatch(body, /Done\.|Status text|tool_calls|\[DONE\]/);
             assert.match(body, stream ? /event: error/ : /grok_post_tool_protocol_violation/);
+            if (stream) assertChatStreamError(body);
           } else {
             assert.equal(resp.status, 200);
             const payloads = stream ? body.split("\n").filter((line) => line.startsWith("data: {")).map((line) => JSON.parse(line.slice(6))) : [JSON.parse(body)];

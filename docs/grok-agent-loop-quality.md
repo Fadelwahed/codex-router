@@ -2,7 +2,8 @@
 
 Baseline: `8c5c128867d3b9f1bd359b9e9491d94cd65b90e1` (upstream main,
 2026-10-16). All experiments use synthetic fixtures and isolated loopback
-forwarders. The installed service and client configuration are unchanged.
+forwarders. Those campaigns left the installed service and client configuration
+unchanged; a later user-authorized installation enabled manual testing.
 
 ## Final implementation and acceptance boundary
 
@@ -216,3 +217,81 @@ normalization.
 Review-fix verification: `npm run check` passed; full local suite **5,415 passed,
 0 failed, 39 skipped** (5,454 total); targeted schema/provider tests **210/210**,
 resume bookkeeping **10/10**, and local Router/LiteLLM protocol proof **24/24**.
+
+## Manual-use follow-up: context accounting and stream failures
+
+Manual use exposed a different boundary from tool selection: xAI's agentic
+`prompt_tokens` is cumulative across server-side inference steps, including
+repeated history ([provider contract](https://docs.x.ai/developers/tools/tool-usage-details)).
+The client previously treated that billing count as the size of one context.
+That can trigger repeated compaction after a search even when the request is
+small. Historical Grok billing rows are no longer used to infer context capacity.
+
+The forwarder now estimates the final provider-facing request, including expanded
+operation schemas, hosted tools and repair instructions. Authenticated metadata
+carries that estimate through LiteLLM. Only Grok client input usage is rewritten;
+the original provider counters and aggregate cache counts remain in the meter.
+Repair billing is also carried explicitly because LiteLLM drops nonstandard Chat
+usage fields. The estimate is approximate, not a tokenizer measurement: images
+use the existing bound and encrypted reasoning is not counted as plaintext.
+It is not derived by dividing or capping the provider's cumulative bill.
+
+The loopback JSON/SSE/WebSocket proof includes a 572,089-input-token billing
+fixture whose translated request estimates 31,630 tokens. Each surface delivers
+the estimate to the client while retaining the full bill. A two-generation repair
+retains 1,144,178 billed input tokens and only the selected request's context
+estimate. No additional real-provider generations were used for this follow-up.
+
+A second reproduced failure followed a real mid-stream connection loss: a flat
+Responses error was sent over the forwarder's Chat Completions endpoint. The
+OpenAI SDK decoded it as a chunk without choices, and LiteLLM raised `IndexError`.
+All streamed error exits now use the nested Chat error envelope, without a false
+successful terminal or replay. A metadata-only terminal no longer emits an
+empty-choice usage chunk. `scripts/verify-grok-chat-errors.py` feeds captured mock
+forwarder output through the installed SDK/LiteLLM iterator; its old-envelope
+negative control reproduces the exact failure. Pre-header connection resets and
+connect timeouts remain transport errors; the existing bounded retry is unchanged.
+
+### Model window and desktop reload
+
+The bundled Codex app-server snapshots the static model catalog on startup.
+An isolated offline test reproduced startup at 256,000, rewriting the file to
+500,000, then creating a new thread: the effective window remained 243,200.
+A fresh process with the 500,000 catalog reported 475,000 (the 95% effective
+window). Creating a chat is therefore insufficient after this catalog change;
+fully quit and reopen Codex before retesting. Router does not terminate the app.
+
+The inspected official Grok model metadata advertises default 256,000 and available
+windows [256,000, 500,000]. Router retains its existing 500,000 preset and 440,000
+compaction threshold. The official CLI's window selection is local compaction
+configuration; `x-grok-context-window` is response metadata, not a request switch
+([source](https://github.com/xai-org/grok-build/blob/2bdd1d6a6369de0e8c68132ea4539e9abd9e14a8/crates/codegen/xai-grok-sampler/src/client.rs#L211)).
+This establishes catalog and client behavior, not a new live 500k capacity test.
+Before this follow-up Router declared priority processing for Grok OAuth 4.6
+only, so the observed Grok 4.7 session did not establish Fast processing.
+All five direct xAI presets now advertise Fast as an opt-in tier: OAuth
+4.5/4.6/4.7 and API 4.5/4.7. The selected `service_tier` survives the Responses
+to Chat bridge. Telemetry distinguishes requested priority, provider-confirmed
+priority, a standard-tier response, missing confirmation and an unknown tier.
+No paid default is introduced and reseller routes do not inherit a different
+provider's scheduling contract. This matches the documented
+[xAI priority parameter](https://docs.x.ai/developers/advanced-api-usage/priority-processing);
+the offline proofs do not establish actual availability or latency on an account.
+
+Additional offline reproduction commands:
+
+```sh
+MODEL_ROUTER_TEST_LITELLM_PYTHON=/absolute/path/to/locked-venv/python \
+  node --test --test-name-pattern='emits one terminal SSE error when the upstream stream fails mid-turn' test/grok-oauth-forwarder.test.mjs
+node scripts/verify-codex-catalog-reload.mjs /absolute/path/to/bundled/codex
+```
+
+Follow-up verification: `npm run check` passed; the full local run passed
+5,424 tests with 39 skipped and one changelog-format failure. Splitting the two
+release notes into separate fragments fixed that sole failure; all 9 changelog
+regressions then passed. Runtime sources were unchanged after the full run.
+The expanded Router/LiteLLM/forwarder proof passed **51/51** scenarios across
+OAuth and API JSON/SSE/WebSocket. The SDK/LiteLLM stream-error negative control
+passed and is now wired into the three-platform protocol workflow. Catalog
+reload was reproduced with both local CLI 0.159 and bundled
+0.162.0-alpha.17.2. Remote CI remains separate evidence for the pushed revision.

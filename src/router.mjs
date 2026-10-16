@@ -436,18 +436,18 @@ function fetchForRoute(route, url, init) {
 // it advertises that tier (checked-in or curated `serviceTiers`), so a failover
 // candidate or a compaction for another route never inherits a tier it did not
 // offer.
-// A Grok OAuth route that publishes a tier of its own. The registry entry
+// A first-party Grok route that publishes a tier of its own. The registry entry
 // decides, so a second Grok model joins by declaring `serviceTiers` rather
 // than by being named here.
-function offersGrokOauthServiceTier(route) {
-  return route?.provider === GROK_OAUTH_PROVIDER && Boolean(route.serviceTiers?.length);
+function offersGrokServiceTier(route) {
+  return [GROK_OAUTH_PROVIDER, "grok-api"].includes(route?.provider) && Boolean(route.serviceTiers?.length);
 }
 
 function applyRoutedServiceTier(body, payload, route) {
   if (!route?.serviceTiers?.some((entry) => entry?.id === payload.service_tier)) {
     delete body.service_tier;
   }
-  if (!offersGrokOauthServiceTier(route)) return body;
+  if (!offersGrokServiceTier(route)) return body;
   const tier = knownServiceTier(payload.service_tier);
   // Locked LiteLLM loses the Responses service_tier argument at its Chat
   // bridge. extra_body reaches the forwarder without changing other routes.
@@ -4645,7 +4645,7 @@ async function handleResponses(request, response, requestUrl) {
       ...activityMetadataFromHeaders(request.headers),
     });
     diagnostics.contextBytes = grokOauthIngressContextBytes(payload, route);
-    if (offersGrokOauthServiceTier(route)) diagnostics.requestedServiceTier = payload.service_tier;
+    if (offersGrokServiceTier(route)) diagnostics.requestedServiceTier = payload.service_tier;
     const compactV1 = /\/responses\/compact$/.test(requestUrl.pathname);
     // Codex remote compaction V2 uses the ordinary Responses endpoint with a
     // terminal trigger. Detect the protocol shape before route dispatch so the
@@ -4783,7 +4783,7 @@ async function handleResponses(request, response, requestUrl) {
       // serving row of another model must not inherit them.
       diagnostics.contextBytes = grokOauthIngressContextBytes(payload, route);
       diagnostics.requestedServiceTier =
-        offersGrokOauthServiceTier(route) ? payload.service_tier : undefined;
+        offersGrokServiceTier(route) ? payload.service_tier : undefined;
       // The tray Island has to name the model that is actually answering.
       activity.setRoute({
         provider: canonicalProviderId(route.provider),
@@ -5278,11 +5278,16 @@ async function handleResponses(request, response, requestUrl) {
     }
     const upstreamContentType = upstream.headers.get("content-type") || "";
     const createResponsePipeline = (contentType, preludeMs = EMPTY_COMPLETION_PRELUDE_MS) => {
+      // xAI agentic usage bills every internal search step, repeatedly counting
+      // the prompt. Preserve those raw counters for metering; Codex needs the
+      // current request's context size to decide when to compact.
+      const cumulativeInputUsage = route?.provider === "grok-oauth";
       const usageObserver = new ResponseUsageTransform(contentType, {
-        grokServiceTier: offersGrokOauthServiceTier(route),
+        cumulativeInputUsage,
+        grokServiceTier: offersGrokServiceTier(route),
         onEvent: (payload) => activity.progress.event(payload),
         estimatedInputTokens:
-          ZERO_INPUT_ESTIMATE && route
+          ZERO_INPUT_ESTIMATE && route && !cumulativeInputUsage
             ? estimateInputTokens(routedBody, {
                 contextWindow: route.contextWindow,
                 maxTokensPerImage: maxImageTokensForRoute(route),

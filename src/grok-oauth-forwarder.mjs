@@ -5,7 +5,6 @@ import { fileURLToPath } from "node:url";
 
 import {
   applyKeepAliveTimeouts,
-  endStreamedResponse,
   formatErrorChain,
   httpErrorStatus,
   installGracefulShutdown,
@@ -29,6 +28,7 @@ import {
   allowsAutomaticToolChoice,
   applyResponsesEvent,
   chatServiceTierFields,
+  grokContextFields,
   classifyAfterToolRepair,
   createTurnState,
   DEFAULT_PROGRESS_ONLY_MAX_TEXT,
@@ -577,6 +577,18 @@ const OPENAI_ROLE_CHUNK = (id, created, model, delta, finishReason = null, extra
     ...extra,
   })}\n\n`;
 
+// This listener speaks Chat Completions to the gateway, not Responses. The
+// OpenAI SDK recognizes a streamed failure only through the nested `error`
+// envelope. A flat Responses error is otherwise decoded as a chat chunk with
+// no choices and crashes LiteLLM's Responses bridge at choices[0]. Never send
+// a successful finish/[DONE] or replay an upstream attempt after this failure.
+function endChatCompletionStream(response, { message }) {
+  if (!response || response.writableEnded || response.destroyed) return;
+  const error = { type: "api_error", code: "local_router_stream_failed", message, param: null };
+  response.write(`\n\nevent: error\ndata: ${JSON.stringify({ error })}\n\n`);
+  response.end();
+}
+
 async function handleChatCompletions(request, response) {
   const chat = JSON.parse((await readRequestBody(request)).toString("utf8"));
   const wantsStream = chat.stream === true;
@@ -608,6 +620,7 @@ async function handleChatCompletions(request, response) {
     toolChoice: firstChat.tool_choice, maxTools: maxClientTools,
   });
   const responsesRequest = toResponsesRequest(firstChat, { hostedSearchEnabled, recallReasoning, toolAlternatives });
+  let contextRequest = responsesRequest;
   if (carryCounts.misses && !QUIET) {
     console.error(
       `[grok-oauth] reasoning-carry hits=${carryCounts.hits} misses=${carryCounts.misses} model=${model}`,
@@ -765,7 +778,7 @@ async function handleChatCompletions(request, response) {
       `[grok-oauth] upstream-terminal-failed=true phase=${phase} model=${model} terminal=${status}${counts} ${upstreamAttemptTiming(phase, attempt)}`,
     );
     if (wantsStream && streamStarted) {
-      endStreamedResponse(response, { message });
+      endChatCompletionStream(response, { message });
     } else {
       writeJson(response, 502, {
         error: { type: "api_error", code: `grok_upstream_response_${status}`, message },
@@ -920,6 +933,7 @@ async function handleChatCompletions(request, response) {
         `[grok-oauth] progress-only-retried=true retries=1 model=${model} prefer=${repair.action} ${upstreamAttemptTiming("attempt", firstAttempt)} ${upstreamAttemptTiming("repair", repairAttempt)}`,
       );
       if (repair.action === "tools") {
+        contextRequest = retryRequest;
         selectedOutputItems = secondOutputItems;
         const usage = postToolDecision
           ? selectedRetryUsage(turn.usage, second.usage)
@@ -945,6 +959,7 @@ async function handleChatCompletions(request, response) {
         };
         if (streamStarted) emittedDeltaCount = turn.deltas.length;
       } else if (repair.action === "final") {
+        contextRequest = retryRequest;
         turn = {
           contentText: repair.contentText,
           reasoningText: second.reasoningText,
@@ -979,7 +994,7 @@ async function handleChatCompletions(request, response) {
       `[grok-oauth] progress-only-unrepairable=true model=${model} code=${repairFailure.code} ${upstreamAttemptTiming("attempt", firstAttempt)} ${upstreamAttemptTiming("repair", repairAttempt)}`,
     );
     if (wantsStream && streamStarted) {
-      endStreamedResponse(response, { message: repairFailure.message });
+      endChatCompletionStream(response, { message: repairFailure.message });
       return;
     }
     writeJson(response, 502, {
@@ -1014,7 +1029,10 @@ async function handleChatCompletions(request, response) {
 
   // A repair may consume multiple tiers. Do not label aggregate billing with
   // one attempt's tier, even when the selected answer came from that attempt.
-  const tierFields = serviceTierEnabledFor(model) && !retried ? chatServiceTierFields(turn) : {};
+  const actualTierFields = serviceTierEnabledFor(model) && !retried ? chatServiceTierFields(turn) : {};
+  const contextFields = grokContextFields(contextRequest, turn.usage);
+  const tierFields = { ...actualTierFields, ...contextFields,
+    provider_specific_fields: { ...actualTierFields.provider_specific_fields, ...contextFields.provider_specific_fields } };
   if (wantsStream) {
     const wasStarted = streamStarted;
     startStream();
@@ -1027,7 +1045,10 @@ async function handleChatCompletions(request, response) {
       emittedDeltaCount = turn.deltas?.length || 0;
     }
     response.write(OPENAI_ROLE_CHUNK(id, created, model, {}, turn.finishReason, tierFields));
-    if (turn.usage || Object.keys(tierFields).length) {
+    // Empty choices is the Chat usage-only shape, not a metadata-only event.
+    // Metadata already accompanies the finish chunk. Without actual usage an
+    // empty-choice chunk is not recognized by the gateway's usage branch.
+    if (turn.usage) {
       response.write(
         `data: ${JSON.stringify({ id, object: "chat.completion.chunk", created, model, choices: [], usage: turn.usage, ...tierFields })}\n\n`,
       );
@@ -1038,6 +1059,11 @@ async function handleChatCompletions(request, response) {
     const message = { role: "assistant", content: turn.contentText || null };
     const actualTier = tierFields.provider_specific_fields?.grok_service_tier;
     if (actualTier) response.setHeader("x-codex-router-grok-service-tier", actualTier);
+    response.setHeader("x-codex-router-grok-context-input-tokens", tierFields.provider_specific_fields.grok_context_input_tokens);
+    for (const field of ["input", "output"]) {
+      const billed = tierFields.provider_specific_fields[`grok_billed_${field}_tokens`];
+      if (billed !== undefined) response.setHeader(`x-codex-router-grok-billed-${field}-tokens`, billed);
+    }
     if (turn.reasoningText) message.reasoning_content = turn.reasoningText;
     if (turn.toolCalls.length) message.tool_calls = turn.toolCalls;
     writeJson(response, 200, {
@@ -1111,7 +1137,7 @@ if (isMain) {
           },
         });
       } else if (!response.writableEnded) {
-        endStreamedResponse(response, {
+        endChatCompletionStream(response, {
           message: "The Grok OAuth forwarder lost the upstream response stream.",
         });
       }
