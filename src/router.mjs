@@ -1,4 +1,6 @@
 import { resolveGenerationOutcome } from "./response-outcome.mjs";
+import { createGrokRequestTiming, grokTimingHeaders, setGrokTimingRequestId } from "./grok-request-timing.mjs";
+import { grokReasoningBridgeBody } from "./grok-reasoning-effort.mjs";
 import { readFileSync } from "node:fs";
 import http from "node:http";
 import { createHash, randomUUID } from "node:crypto";
@@ -4068,6 +4070,9 @@ async function buildRoutedRequest({ request, payload, route, agedInput }) {
     );
   }
   applyRoutedServiceTier(routed, payload, route);
+  if (route.provider === "grok-oauth") {
+    routed.extra_headers = grokTimingHeaders(request, routed.extra_headers);
+  }
   routed = applyZenFreeIncludeCompatibility(routed, route);
   if (routedToolChoice !== payload.tool_choice) routed.tool_choice = routedToolChoice;
   // Codex chooses a child's model; this is where an operator gets to choose its
@@ -4107,7 +4112,14 @@ async function buildRoutedRequest({ request, payload, route, agedInput }) {
     delete routed.reasoning_effort;
   }
   if (rejectsWebSearchOptions(route)) delete routed.web_search_options;
+  // Adapt the final caller policy, including child effort overrides, at the
+  // Responses-to-Chat boundary so the bridge cannot retain an earlier effort.
+  if (route.provider === "grok-oauth") {
+    const bridgeBody = grokReasoningBridgeBody(routed);
+    if (bridgeBody) routed.extra_body = bridgeBody;
+  }
   const usageDiagnostics = {
+    requestedReasoningEffort: routed.reasoning?.effort ?? routed.reasoning_effort,
     reasoningEffort:
       routed.reasoning?.effort ??
       routed.reasoning_effort ??
@@ -4461,16 +4473,29 @@ async function handleResponses(request, response, requestUrl) {
   const startedAt = Date.now();
   const controller = new AbortController();
   const activity = beginRequestActivity({ request, response, controller });
+  setGrokTimingRequestId(request, activity.requestId);
+  const timing = createGrokRequestTiming({ layer: "router", requestId: activity.requestId });
+  const finishTiming = (outcome) => {
+    if (route?.provider === "grok-oauth") {
+      timing.identify(route.slug, requestedReasoningEffort);
+      timing.finish(outcome, response.statusCode);
+    }
+  };
+  response.once("finish", () => finishTiming("response_finished"));
+  response.once("close", () => finishTiming("connection_closed"));
   const fetchObservedUpstream = async (url, init) => {
+    timing.mark("firstGatewayDispatchMs");
     activity.progress.attempt();
     const upstream = await fetchForRoute(route, url, init);
     activity.progress.headers();
+    timing.mark("firstGatewayHeadersMs");
     return upstream;
   };
   const diagnostics = { requestId: activity.requestId };
   let clientGone = false;
   let requestedModel = "";
   let route;
+  let requestedReasoningEffort;
   let upstreamRetries;
   let upstreamStatus;
   let upstreamLatencyMs;
@@ -4748,6 +4773,8 @@ async function handleResponses(request, response, requestUrl) {
     let agedInput;
     let searchContract;
     const setRoutingDiagnostics = (built) => {
+      timing.mark("preparedMs");
+      requestedReasoningEffort = built.usageDiagnostics?.requestedReasoningEffort;
       diagnostics.reasoningEffort = built.usageDiagnostics?.reasoningEffort;
       diagnostics.providerToolCount = built.usageDiagnostics?.providerToolCount;
       diagnostics.providerToolSchemaBytes = built.usageDiagnostics?.providerToolSchemaBytes;
@@ -5439,6 +5466,11 @@ async function handleResponses(request, response, requestUrl) {
       // discarded attempt never announces its identity to this observer.
       const failureMetadata = responsesStreamFailureTransform(response, contentType);
       if (failureMetadata) transforms.push(failureMetadata);
+      if (route?.provider === "grok-oauth") {
+        // Observe the actual client-facing stream after every holding stage.
+        // Default observer mode passes bytes through without rewriting usage.
+        transforms.push(new ResponseUsageTransform(contentType, { onEvent: event => timing.event(event) }));
+      }
       return { transforms, usageObserver, guard, leakedToolCalls };
     };
     // The guard's pre-content budget scales with this request's size: a large

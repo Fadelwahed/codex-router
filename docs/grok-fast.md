@@ -55,3 +55,6 @@ grant/fallback/missing/unknown tiers, omitted/default requests, all three OAuth
 models, usage privacy, and exact preservation of 1000 text fragments. API
 forwarder fixtures cover both API presets and keep other providers unchanged.
 This is protocol correctness evidence, not a comparative speed benchmark.
+
+For reasoning preservation and correlated latency stages, see
+[Grok request diagnostics](grok-request-diagnostics.md).

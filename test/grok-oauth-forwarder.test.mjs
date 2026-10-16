@@ -1656,7 +1656,10 @@ test("post-tool repair releases held actions only after a successful terminal", 
 test("an unsuccessful post-tool first turn emits one error without leaking or replaying its client tool", async (t) => {
   let terminal;
   let inbound;
+  let sequence = 0;
+  let leakedCorrelation;
   const backend = await mockBackend(async (_req, res) => {
+    leakedCorrelation = _req.headers["x-codex-router-request-id"];
     inbound += 1;
     res.writeHead(200, { "Content-Type": "text/event-stream" });
     res.write(sse(TOOL_EVENTS.filter((event) => event.type !== "response.completed")));
@@ -1672,8 +1675,9 @@ test("an unsuccessful post-tool first turn emits one error without leaking or re
       for (const stream of [false, true]) {
         await t.test(`${stream ? "SSE" : "JSON"}: ${terminal}`, async () => {
           inbound = 0;
+          const requestId = `01234567-89ab-4cde-8fab-0123456789ab:${++sequence}`;
           const resp = await fetch(`${base}/v1/chat/completions`, {
-            method: "POST", headers: auth,
+            method: "POST", headers: { ...auth, "x-codex-router-request-id": requestId },
             body: JSON.stringify({
               model: "grok-4.6",
               messages: [
@@ -1686,6 +1690,14 @@ test("an unsuccessful post-tool first turn emits one error without leaking or re
           });
           const body = await resp.text();
           assert.equal(inbound, 1);
+          assert.equal(leakedCorrelation, undefined, "local correlation header terminates at the forwarder");
+          const logs = await waitChildError(child, new RegExp(`\\[grok-timing\\].*${requestId}"`));
+          const timing = logs.split("\n").filter(line => line.startsWith("[grok-timing] "))
+            .map(line => JSON.parse(line.slice("[grok-timing] ".length))).find(row => row.requestId === requestId);
+          assert.equal(timing.attempts.length, 1);
+          assert.equal(timing.attempts[0].terminal, terminal === "missing" ? undefined : terminal);
+          assert.equal(timing.firstActionMs, undefined, "uncertified tool remains withheld");
+          assert.doesNotMatch(JSON.stringify(timing), /rendered page|exec_command/);
           assert.doesNotMatch(body, /"finish_reason":"(?:stop|tool_calls)"|\[DONE\]/);
           if (stream) {
             assert.equal(resp.status, 200);
@@ -2863,6 +2875,14 @@ test("cancelling a pending post-tool decision closes upstream without action or 
       controller.abort();
       await closed.promise;
       assert.equal(inbound, 1);
+      const logs = await waitChildError(child, /\[grok-timing\].*"connection_closed"/);
+      const timing = JSON.parse(logs.split("\n").find(line => line.startsWith("[grok-timing] ")).slice("[grok-timing] ".length));
+      assert.equal(timing.attempts.length, 1);
+      assert.equal(timing.attempts[0].outcome, "cancelled");
+      assert.equal(timing.attempts[0].terminal, undefined);
+      assert.ok(Number.isInteger(timing.attempts[0].firstReasoningMs));
+      assert.equal(timing.firstActionMs, undefined);
+      assert.doesNotMatch(JSON.stringify(timing), /Pending final|Waiting for completion/);
     })(), new Promise((_, reject) => { timeout = setTimeout(() => reject(new Error("cancellation did not close upstream")), 2_000); })]);
   } finally {
     clearTimeout(timeout);

@@ -3,6 +3,8 @@ import path from "node:path";
 import { createHash, randomUUID } from "node:crypto";
 import { fileURLToPath } from "node:url";
 
+import { normalizeGrokReasoningEffort } from "./grok-reasoning-effort.mjs";
+import { createGrokRequestTiming, GROK_TIMING_HEADER } from "./grok-request-timing.mjs";
 import {
   applyKeepAliveTimeouts,
   formatErrorChain,
@@ -197,11 +199,7 @@ function messageContentParts(content, textType) {
 }
 
 function mapEffort(effort, model) {
-  if (effort === "minimal") return "low";
-  if (["none", "low"].includes(effort)) return "low";
-  if (effort === "xhigh") return xhighEnabledFor(model) ? "xhigh" : "high";
-  if (effort === "max") return "high";
-  return ["medium", "high"].includes(effort) ? effort : undefined;
+  return normalizeGrokReasoningEffort(effort, { xhigh: xhighEnabledFor(model) });
 }
 
 // Merge client function tools with bare hosted search tools.
@@ -590,7 +588,11 @@ function endChatCompletionStream(response, { message }) {
 }
 
 async function handleChatCompletions(request, response) {
+  const timing = createGrokRequestTiming({ layer: "forwarder", requestId: request.headers[GROK_TIMING_HEADER] });
+  response.once("finish", () => timing.finish("response_finished", response.statusCode));
+  response.once("close", () => timing.finish("connection_closed", response.statusCode));
   const chat = JSON.parse((await readRequestBody(request)).toString("utf8"));
+  timing.mark("parsedMs");
   const wantsStream = chat.stream === true;
   const model = typeof chat.model === "string" ? chat.model : "";
   const hostedSearchEnabled = hostedSearchEnabledFor(model);
@@ -620,6 +622,8 @@ async function handleChatCompletions(request, response) {
     toolChoice: firstChat.tool_choice, maxTools: maxClientTools,
   });
   const responsesRequest = toResponsesRequest(firstChat, { hostedSearchEnabled, recallReasoning, toolAlternatives });
+  timing.identify(model, chat.reasoning_effort, responsesRequest.reasoning?.effort);
+  timing.mark("preparedMs");
   let contextRequest = responsesRequest;
   if (carryCounts.misses && !QUIET) {
     console.error(
@@ -652,10 +656,13 @@ async function handleChatCompletions(request, response) {
       requestId: randomUUID(),
       startedAt: Date.now(),
     };
+    attempt.timing = timing.attempt(attempt.requestId);
     let release;
     try {
       const clientVersion = await readGrokClientVersion();
+      attempt.timing.mark("queuedMs");
       release = await grokInflight.acquire(controller.signal);
+      attempt.timing.mark("dispatchMs");
       attempt.response = await fetch(`${GROK_BASE}/responses`, {
         method: "POST",
         headers: upstreamHeaders(accessToken, model, chat?.messages, attempt.requestId, clientVersion),
@@ -663,6 +670,8 @@ async function handleChatCompletions(request, response) {
         signal: controller.signal,
       });
       attempt.headersAt = Date.now();
+      attempt.timing.headers(attempt.response.status);
+      if (!attempt.response.ok) attempt.timing.end("http_error");
       if (attempt.response.body) {
         attempt.response = responseWithInflightRelease(attempt.response, release);
       } else {
@@ -673,6 +682,7 @@ async function handleChatCompletions(request, response) {
     } catch (error) {
       release?.();
       attempt.endedAt = Date.now();
+      attempt.timing.end(controller.signal.aborted ? "cancelled" : "transport_error");
       if (error && typeof error === "object") {
         try {
           error.grokUpstreamAttempt = attempt;
@@ -745,6 +755,10 @@ async function handleChatCompletions(request, response) {
   });
   let emittedDeltaCount = 0;
   let streamStarted = false;
+  const writeDelta = (delta) => {
+    timing.delta(delta);
+    response.write(OPENAI_ROLE_CHUNK(id, created, model, delta));
+  };
 
   const startStream = () => {
     if (!wantsStream || streamStarted) return;
@@ -805,9 +819,7 @@ async function handleChatCompletions(request, response) {
       ) {
         return;
       }
-      response.write(
-        OPENAI_ROLE_CHUNK(id, created, model, delta),
-      );
+      writeDelta(delta);
       emittedDeltaCount += 1;
     }
   };
@@ -816,6 +828,7 @@ async function handleChatCompletions(request, response) {
   try {
     await consumeResponsesStream(upstream.body, (event) => {
       firstAttempt.firstEventAt ??= Date.now();
+      firstAttempt.timing.event(event);
       applyResponsesEvent(turnState, event);
       if (event?.type === "response.output_item.done" && event.item && !turnState.terminalStatus) {
         upstreamOutputItems.push(event.item);
@@ -823,8 +836,10 @@ async function handleChatCompletions(request, response) {
       emitPendingDeltas();
     });
     firstAttempt.endedAt = Date.now();
+    firstAttempt.timing.end("stream_end");
   } catch (error) {
     firstAttempt.endedAt = Date.now();
+    firstAttempt.timing.end(controller.signal.aborted ? "cancelled" : "transport_error");
     logUpstreamPhaseFailure("attempt", model, firstAttempt, error);
     throw error;
   }
@@ -891,6 +906,7 @@ async function handleChatCompletions(request, response) {
       try {
         await consumeResponsesStream(secondUpstream.body, (event) => {
           repairAttempt.firstEventAt ??= Date.now();
+          repairAttempt.timing.event(event);
           applyResponsesEvent(secondState, event);
           if (event?.type === "response.output_item.done" && event.item && !secondState.terminalStatus) {
             secondOutputItems.push(event.item);
@@ -899,15 +915,17 @@ async function handleChatCompletions(request, response) {
             while (emittedRepairDeltaCount < secondState.deltas.length) {
               const delta = secondState.deltas[emittedRepairDeltaCount];
               if (Object.hasOwn(delta, "reasoning_content")) {
-                response.write(OPENAI_ROLE_CHUNK(id, created, model, delta));
+                writeDelta(delta);
               }
               emittedRepairDeltaCount += 1;
             }
           }
         });
         repairAttempt.endedAt = Date.now();
+        repairAttempt.timing.end("stream_end");
       } catch (error) {
         repairAttempt.endedAt = Date.now();
+        repairAttempt.timing.end(controller.signal.aborted ? "cancelled" : "transport_error");
         logUpstreamPhaseFailure("repair", model, repairAttempt, error);
         throw error;
       }
@@ -941,7 +959,7 @@ async function handleChatCompletions(request, response) {
         if (wantsStream && streamStarted && !postToolDecision) {
           // The optional pre-tool retry's calls are emitted only on success.
           for (const delta of toolCallDeltas(second)) {
-            response.write(OPENAI_ROLE_CHUNK(id, created, model, delta));
+            writeDelta(delta);
           }
         }
         turn = {
@@ -1015,7 +1033,7 @@ async function handleChatCompletions(request, response) {
     if (wantsStream && streamStarted) {
       for (const delta of turn.deltas || []) {
         if (!Object.hasOwn(delta, "reasoning_content")) {
-          response.write(OPENAI_ROLE_CHUNK(id, created, model, delta));
+          writeDelta(delta);
         }
       }
       selectedOutputEmitted = true;
@@ -1040,7 +1058,7 @@ async function handleChatCompletions(request, response) {
       emitPendingDeltas();
     } else if (!wasStarted) {
       for (const delta of turn.deltas || []) {
-        response.write(OPENAI_ROLE_CHUNK(id, created, model, delta));
+        writeDelta(delta);
       }
       emittedDeltaCount = turn.deltas?.length || 0;
     }
@@ -1066,6 +1084,7 @@ async function handleChatCompletions(request, response) {
     }
     if (turn.reasoningText) message.reasoning_content = turn.reasoningText;
     if (turn.toolCalls.length) message.tool_calls = turn.toolCalls;
+    timing.delta(message);
     writeJson(response, 200, {
       id,
       object: "chat.completion",

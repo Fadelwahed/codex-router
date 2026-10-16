@@ -1,7 +1,7 @@
 import { writeGrokVersionCli } from "../test/grok-version-fixture.mjs";
 // Synthetic loopback-only proof using the repository's locked LiteLLM runtime.
 import assert from "node:assert/strict";
-import { spawn } from "node:child_process";
+import { execFileSync, spawn } from "node:child_process";
 import { once } from "node:events";
 import { existsSync, mkdtempSync, readFileSync, writeFileSync, rmSync } from "node:fs";
 import http from "node:http";
@@ -17,6 +17,7 @@ import { tokenUsageFromPayload } from "../src/response-usage.mjs";
 import { openPort } from "../test/port-pool.mjs";
 import { CODEX_APP_TOOLS } from "../src/codex-app-tools.mjs";
 import { grokToolSchema } from "../src/grok-tool-schema.mjs";
+import { MODELS } from "../src/model-registry.mjs";
 
 assert.ok(process.argv[2], "pass the locked venv Python executable");
 const python = path.resolve(process.argv[2]);
@@ -33,6 +34,7 @@ let actual = "priority";
 let postTool = false;
 let aggregateUsage = false;
 let repair = false;
+let terminalDelayMs = 0;
 let emptyReplies = 0;
 let provider = "grok-oauth";
 let upstreamRequests = 0;
@@ -92,6 +94,7 @@ const upstream = http.createServer(async (req, res) => {
   } else {
     for (const delta of pieces) event({ type: "response.output_text.delta", delta });
   }
+  if (terminalDelayMs) await new Promise(resolve => setTimeout(resolve, terminalDelayMs));
   event({ type: "response.completed", response: {
     ...(output ? { output } : {}),
     ...(actual !== undefined ? { service_tier: actual } : {}),
@@ -108,7 +111,7 @@ const forwarder = spawn(process.execPath, [path.join(root, "src/grok-oauth-forwa
   cwd: root,
   env: { ...process.env, MODEL_ROUTER_INTERNAL_KEY: key, MODEL_ROUTER_GROK_OAUTH_PORT: String(port),
     GROK_CLI_CHAT_PROXY_BASE_URL: `http://127.0.0.1:${upstream.address().port}`,
-    GROK_AUTH_PATH: authPath, GROK_CLI: writeGrokVersionCli(temp), MODEL_ROUTER_QUIET: "1" },
+    GROK_AUTH_PATH: authPath, GROK_CLI: writeGrokVersionCli(temp), CODEX_ROUTER_GROK_REASONING_CARRY: "1", MODEL_ROUTER_QUIET: "1" },
   stdio: ["ignore", "ignore", "pipe"],
 });
 let errors = "";
@@ -123,17 +126,22 @@ assert.ok(renderLiteLlmConfig().includes(`callbacks: [${callbacks.join(", ")}]`)
 for (const name of ["grok_service_tier_callback.py", "litellm_stream_cleanup_callback.py"]) {
   writeFileSync(path.join(temp, name), readFileSync(path.join(root, "src", name)), { mode: 0o600 });
 }
-writeFileSync(configPath, JSON.stringify({
-  model_list: ["grok-4.6", "grok-4.5", "grok-4.7"].map(model => ({
-    model_name: `grok-oauth-${model.replaceAll(".", "-")}`,
-    litellm_params: { model: `openai/${model}`, api_base: `http://127.0.0.1:${port}/v1`, api_key: key, use_chat_completions_api: true },
-  })).concat(["grok-4.5", "grok-4.7"].map(model => ({
-    model_name: `grok-api-${model.replaceAll(".", "-")}`,
-    litellm_params: { model: `openai/grok-api-${model.replaceAll(".", "-")}`, api_base: `http://127.0.0.1:${apiPort}/v1`, api_key: key, use_chat_completions_api: true },
-  }))),
-  litellm_settings: { drop_params: true, callbacks },
-  general_settings: { master_key: key, disable_spend_logs: true },
+// Parse the actual publisher output with the locked gateway's YAML reader.
+// Only endpoint substitution and catalog selection isolate this proof; provider
+// parameter policy, callbacks, timeouts and router settings are production's.
+const gatewayConfig = JSON.parse(execFileSync(python, ["-c",
+  "import json,sys,yaml; print(json.dumps(yaml.safe_load(sys.stdin.read())))"], {
+  input: renderLiteLlmConfig(), encoding: "utf8",
 }));
+gatewayConfig.model_list = gatewayConfig.model_list.filter(route =>
+  /^grok-(oauth|api)-grok-4-[567]$/.test(route.model_name));
+assert.equal(gatewayConfig.model_list.length, 5, "all published Grok presets are covered");
+for (const route of gatewayConfig.model_list) {
+  route.litellm_params.api_base = `http://127.0.0.1:${route.model_name.startsWith("grok-oauth-") ? port : apiPort}/v1`;
+  route.litellm_params.api_key = key;
+}
+gatewayConfig.general_settings.master_key = key;
+writeFileSync(configPath, JSON.stringify(gatewayConfig), { mode: 0o600 });
 const processErrors = new Map();
 function start(executable, args, env) {
   const child = spawn(executable, args, { cwd: temp, env: { ...process.env, ...env }, stdio: ["ignore", "ignore", "pipe"] });
@@ -142,6 +150,11 @@ function start(executable, args, env) {
   return child;
 }
 let gateway, router, apiForwarder;
+function timingRecords(child) {
+  const output = child === forwarder ? errors : processErrors.get(child) || "";
+  return output.split("\n").filter(line => line.startsWith("[grok-timing] "))
+    .map(line => JSON.parse(line.slice("[grok-timing] ".length)));
+}
 function usageRecords() {
   const file = path.join(temp, "usage-events.jsonl");
   if (!existsSync(file)) return [];
@@ -160,12 +173,13 @@ async function ready(url, child, headers = {}) {
     await new Promise(resolve => setTimeout(resolve, 100));
   }
 }
-async function run(model, tier, streaming) {
+async function run(model, tier, streaming, reasoning, reasoningForm = "responses") {
   emptyReplies = repair ? 1 : 0;
   const requestsBefore = upstreamRequests;
   const usageBefore = usageRecords().length;
   const requestBody = { model: `${provider}/${model}`, input: [{ type: "message", role: "user", content: "synthetic fixture" }], stream: streaming !== false,
-    ...(tier === "omit" ? {} : { service_tier: tier }) };
+    ...(tier === "omit" ? {} : { service_tier: tier }),
+    ...(reasoning ? reasoningForm === "effort" ? { reasoning_effort: reasoning.effort } : { reasoning } : {}) };
   if (postTool) {
     requestBody.max_output_tokens = 4096;
     requestBody.tools = [{ type: "function", name: "fixture_read", parameters: { type: "object", properties: {} } }];
@@ -229,6 +243,12 @@ async function run(model, tier, streaming) {
   assert.equal(terminal.provider_specific_fields?.grok_service_tier, want);
   assert.equal(tokenUsageFromPayload(terminal, { grokServiceTier: true })?.serviceTier, known && !repair ? actual : undefined);
   assert.equal(requested.service_tier, tier !== "omit" ? tier : undefined);
+  if (provider === "grok-oauth") {
+    assert.deepEqual(requested.reasoning, reasoning ? { effort: reasoning.effort } : undefined,
+      "selected effort survives Router, locked LiteLLM and the OAuth forwarder");
+    assert.deepEqual(requested.include, reasoning ? ["reasoning.encrypted_content"] : undefined,
+      "explicit effort requests the encrypted reasoning needed for the tool loop");
+  }
   const deadline = Date.now() + 2000;
   while (usageRecords().length === usageBefore && Date.now() < deadline) await new Promise(resolve => setTimeout(resolve, 20));
   const row = usageRecords().at(-1);
@@ -243,7 +263,43 @@ async function run(model, tier, streaming) {
   assert.equal(row.billedOutputTokens, repair ? 1000 : undefined);
   assert.equal(row.outputTokens, 1000);
   assert.equal(JSON.stringify(row).includes("synthetic fixture"), false);
-  console.log(JSON.stringify({ provider, model, requested: tier, actual: want ?? "missing", streaming, postTool, aggregateUsage, repair, contextEstimate, upstreamRequests: repair ? 2 : 1, textPieces: 1000, textPreserved: true }));
+  if (provider === "grok-oauth") {
+    let forwardTiming, routerTiming;
+    const timingDeadline = Date.now() + 2000;
+    do {
+      forwardTiming = timingRecords(forwarder).find(timing => timing.requestId === row.requestId);
+      routerTiming = timingRecords(router).find(timing => timing.requestId === row.requestId);
+      if (forwardTiming && routerTiming) break;
+      await new Promise(resolve => setTimeout(resolve, 20));
+    } while (Date.now() < timingDeadline);
+    assert.ok(forwardTiming, "owned request ID survives the locked gateway into forwarder timing");
+    assert.ok(routerTiming, "the same ID joins Router egress timing and usage");
+    assert.equal(forwardTiming.forwardedReasoningEffort, reasoning?.effort ?? null);
+    assert.equal(forwardTiming.requestedReasoningEffort, reasoning?.effort ?? null);
+    assert.equal(routerTiming.requestedReasoningEffort, reasoning?.effort ?? null);
+    assert.equal(forwardTiming.attempts.length, repair ? 2 : 1);
+    for (const attempt of forwardTiming.attempts) {
+      assert.ok(Number.isInteger(attempt.dispatchMs));
+      assert.ok(attempt.headersMs >= attempt.dispatchMs);
+      assert.ok(attempt.firstEventMs >= attempt.headersMs);
+      assert.ok(attempt.terminalMs >= attempt.firstEventMs);
+      assert.ok(attempt.endMs >= attempt.terminalMs);
+      assert.equal(attempt.terminal, "completed");
+    }
+    if (terminalDelayMs && postTool && !repair) {
+      const attempt = forwardTiming.attempts[0];
+      assert.ok(attempt.firstToolMs < attempt.terminalMs, "upstream tool arrives before the delayed terminal");
+      assert.ok(forwardTiming.firstActionMs >= attempt.terminalMs, "post-tool action is held until certified completion");
+    }
+    for (const value of [forwardTiming, routerTiming]) {
+      assert.ok(value.totalMs >= 0);
+      const serialized = JSON.stringify(value);
+      for (const secret of [key, "fake-access", "synthetic fixture", "piece-0-"]) {
+        assert.equal(serialized.includes(secret), false, "timing contains no content or credentials");
+      }
+    }
+  }
+  console.log(JSON.stringify({ provider, model, requested: tier, actual: want ?? "missing", streaming, reasoning: reasoning ?? "omitted", reasoningForm, terminalDelayMs, postTool, aggregateUsage, repair, contextEstimate, upstreamRequests: repair ? 2 : 1, textPieces: 1000, textPreserved: true }));
 }
 try {
   // Exercise the cross-process read boundary before the Router starts.
@@ -307,6 +363,39 @@ try {
     actual = "default"; await run("grok-4.7", "priority", streaming);
     actual = "priority"; await run("grok-4.7", "priority", streaming);
   }
+  // Each advertised effort, with and without summary, crosses the real locked
+  // gateway in all client transports. A missing effort is checked above too.
+  postTool = false;
+  aggregateUsage = false;
+  for (const route of MODELS.filter(model => model.provider === "grok-oauth")) {
+    for (const { effort } of route.reasoningLevels) {
+      for (const summary of [undefined, "detailed"]) {
+        for (const streaming of [true, false, "ws"]) {
+          actual = "priority";
+          await run(route.upstreamModel, "priority", streaming, { effort, ...(summary ? { summary } : {}) });
+        }
+      }
+    }
+  }
+  // Clients using the Chat-shaped effort extension send a scalar rather than
+  // a Responses object. Exercise its actual wire form through the same stack.
+  for (const streaming of [true, false, "ws"]) {
+    await run("grok-4.7", "priority", streaming, { effort: "high" }, "effort");
+  }
+  // The same object must survive both the initial post-tool decision and its
+  // bounded recovery request, where the bridge rebuilds the provider payload.
+  postTool = true;
+  aggregateUsage = true;
+  for (const recover of [false, true]) {
+    repair = recover;
+    terminalDelayMs = recover ? 0 : 80;
+    for (const streaming of [true, false, "ws"]) {
+      actual = "priority";
+      await run("grok-4.7", "priority", streaming, { effort: "high", summary: "detailed" });
+    }
+  }
+  repair = false;
+  terminalDelayMs = 0;
   provider = "grok-api";
   postTool = false;
   aggregateUsage = false;
