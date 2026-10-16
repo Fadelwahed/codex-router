@@ -15,6 +15,8 @@ import { renderLiteLlmConfig } from "../src/litellm-config.mjs";
 import { PYTHON_REQUIREMENTS, requirementParts } from "../src/install-plan.mjs";
 import { tokenUsageFromPayload } from "../src/response-usage.mjs";
 import { openPort } from "../test/port-pool.mjs";
+import { CODEX_APP_TOOLS } from "../src/codex-app-tools.mjs";
+import { grokToolSchema } from "../src/grok-tool-schema.mjs";
 
 assert.ok(process.argv[2], "pass the locked venv Python executable");
 const python = path.resolve(process.argv[2]);
@@ -28,14 +30,42 @@ const pieces = Array.from({ length: 1000 }, (_, i) => `piece-${i}-Привет\n
 const expected = pieces.join("");
 let requested;
 let actual = "priority";
+let postTool = false;
+let upstreamRequests = 0;
+const automationSchema = CODEX_APP_TOOLS.find(tool => tool.name === "codex_app")
+  .tools.find(tool => tool.name === "automation_update").inputSchema;
 const upstream = http.createServer(async (req, res) => {
+  upstreamRequests += 1;
   const body = [];
   for await (const chunk of req) body.push(chunk);
   requested = JSON.parse(Buffer.concat(body));
   res.writeHead(200, { "Content-Type": "text/event-stream" });
   const event = value => res.write(`event: ${value.type}\ndata: ${JSON.stringify(value)}\n\n`);
-  for (const delta of pieces) event({ type: "response.output_text.delta", delta });
+  let output;
+  if (postTool) {
+    assert.equal(requested.max_output_tokens, 4096, "caller budget survives Router and locked LiteLLM");
+    const final = requested.tools.find(tool => tool.name?.startsWith("__codex_router_submit_final"));
+    assert.ok(final, "first post-tool generation must offer the private final");
+    assert.equal(requested.tool_choice, "auto");
+    assert.equal(requested.temperature, 0.7);
+    assert.equal(requested.top_p, 0.95);
+    const operations = requested.tools.filter(tool => tool.name?.startsWith("fixture_operation__"));
+    const adapted = grokToolSchema(automationSchema);
+    assert.equal(operations.length, adapted.oneOf.length);
+    for (const [index, operation] of operations.entries()) {
+      assert.equal(operation.strict, true);
+      assert.deepEqual(operation.parameters, { ...adapted.oneOf[index], $defs: automationSchema.$defs, $schema: automationSchema.$schema }, "each operation survives Router and locked LiteLLM as a complete function");
+    }
+    const item = { type: "function_call", id: "fc_final", call_id: "call_final", name: final.name, arguments: JSON.stringify({ answer: expected.trimEnd() }) };
+    event({ type: "response.output_item.added", output_index: 0, item: { ...item, arguments: "" } });
+    event({ type: "response.function_call_arguments.delta", output_index: 0, item_id: item.id, delta: item.arguments });
+    event({ type: "response.output_item.done", output_index: 0, item });
+    output = [item];
+  } else {
+    for (const delta of pieces) event({ type: "response.output_text.delta", delta });
+  }
   event({ type: "response.completed", response: {
+    ...(output ? { output } : {}),
     ...(actual !== undefined ? { service_tier: actual } : {}),
     usage: { input_tokens: 10, output_tokens: 1000 },
   } });
@@ -98,9 +128,20 @@ async function ready(url, child, headers = {}) {
   }
 }
 async function run(model, tier, streaming) {
+  const requestsBefore = upstreamRequests;
   const usageBefore = usageRecords().length;
   const requestBody = { model: `grok-oauth/${model}`, input: [{ type: "message", role: "user", content: "synthetic fixture" }], stream: streaming !== false,
     ...(tier === "omit" ? {} : { service_tier: tier }) };
+  if (postTool) {
+    requestBody.max_output_tokens = 4096;
+    requestBody.tools = [{ type: "function", name: "fixture_read", parameters: { type: "object", properties: {} } }];
+    requestBody.tools.push({ type: "function", name: "fixture_operation", parameters: automationSchema });
+    for (let index = 0; index < 3; index++) {
+      requestBody.input.push({ type: "function_call", name: "fixture_read", call_id: `seed_read_${index}`, arguments: "{}" },
+        { type: "function_call_output", call_id: `seed_read_${index}`, output: "fixture complete" });
+    }
+  }
+  const expectedText = postTool ? expected.trimEnd() : expected;
   let body;
   if (streaming === "ws") {
     const url = `${callerBaseUrl(routerPort, key)}/responses`.replace("http:", "ws:");
@@ -131,11 +172,13 @@ async function run(model, tier, streaming) {
   if (streaming) {
     const delivered = body.split("\n").filter(s => s.startsWith("data: {")).map(s => JSON.parse(s.slice(6)));
     assert.equal(delivered.find(e => e.type === "error"), undefined, body);
-    assert.equal(delivered.filter(e => e.type === "response.output_text.delta").map(e => e.delta).join(""), expected);
+    assert.equal(delivered.filter(e => e.type === "response.output_text.delta").map(e => e.delta).join(""), expectedText);
     terminal = delivered.find(e => e.type === "response.completed")?.response;
   } else terminal = JSON.parse(body);
   assert.ok(terminal, "terminal response required");
-  assert.equal(terminal.output.filter(x => x.type === "message").flatMap(x => x.content).map(x => x.text || "").join(""), expected);
+  assert.equal(terminal.output.filter(x => x.type === "message").flatMap(x => x.content).map(x => x.text || "").join(""), expectedText);
+  assert.equal(upstreamRequests - requestsBefore, 1, "exactly one upstream generation per successful turn");
+  assert.equal(terminal.output.some(item => item.type === "function_call"), false, "private final never reaches client dispatch");
   const known = actual === "default" || actual === "priority";
   const want = model === "grok-4.6" ? (known ? actual : actual === undefined ? undefined : "unknown") : undefined;
   assert.equal(terminal.provider_specific_fields?.grok_service_tier, want);
@@ -151,7 +194,7 @@ async function run(model, tier, streaming) {
   assert.equal(row.inputTokens, 10);
   assert.equal(row.outputTokens, 1000);
   assert.equal(JSON.stringify(row).includes("synthetic fixture"), false);
-  console.log(JSON.stringify({ model, requested: tier, actual: want ?? "missing", streaming, textPieces: 1000, textPreserved: true }));
+  console.log(JSON.stringify({ model, requested: tier, actual: want ?? "missing", streaming, postTool, upstreamRequests: 1, textPieces: 1000, textPreserved: true }));
 }
 try {
   // Exercise the cross-process read boundary before the Router starts.
@@ -191,6 +234,10 @@ try {
     actual = undefined; await run("grok-4.6", "priority", streaming);
     actual = "future-tier"; await run("grok-4.6", "priority", streaming);
     actual = "priority"; await run("grok-4.5", "priority", streaming);
+  }
+  postTool = true;
+  for (const streaming of [true, false, "ws"]) {
+    actual = "default"; await run("grok-4.6", "default", streaming);
   }
 } finally {
   for (const child of [router, gateway]) {

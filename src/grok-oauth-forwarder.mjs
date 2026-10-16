@@ -19,13 +19,14 @@ import { PORTS } from "./paths.mjs";
 import { MODELS } from "./model-registry.mjs";
 import { ensureFreshGrokOAuthToken } from "./grok-oauth-session.mjs";
 import { grokOAuthStatus } from "./grok-oauth-status.mjs";
-import { normalizeSchemaLiterals, objectRootToolSchema } from "./tool-schema-root.mjs";
+import { grokToolSchema } from "./grok-tool-schema.mjs";
 import {
   shouldAliasViewImageForGrok,
   toolNameForCodex,
   toolNameForGrok,
 } from "./grok-oauth-tool-alias.mjs";
 import {
+  allowsAutomaticToolChoice,
   applyResponsesEvent,
   chatServiceTierFields,
   classifyAfterToolRepair,
@@ -38,11 +39,13 @@ import {
   mergeMappedUsage,
   parseSseBlockEvent,
   requestOffersClientTools,
+  privateFinalToolName,
   selectedRetryUsage,
   shouldPreferRetryTurn,
   toolCallDeltas,
   withProgressOnlyNudge,
 } from "./grok-oauth-turn.mjs";
+import { createGrokToolAlternatives } from "./grok-tool-alternatives.mjs";
 import { knownServiceTier } from "./request-diagnostics.mjs";
 import { createGrokClientVersionReader } from "./grok-client-version.mjs";
 import { installStableFetchTransport } from "./fetch-transport.mjs";
@@ -335,11 +338,33 @@ function normalizeToolOutputForGrok(content) {
   return hasImage ? parts : JSON.stringify(content ?? "");
 }
 
+function grokClientTools(chat, viewImageAlias) {
+  const tools = Array.isArray(chat.tools)
+    ? chat.tools
+        .filter((tool) => tool?.type === "function" && tool.function?.name)
+        .map((tool) => ({
+          type: "function",
+          name: toolNameForGrok(tool.function.name, { viewImageAlias }),
+          description: tool.function.description,
+          // Preserve every branch through the last provider-facing hop. The
+          // shared object merger would silently collapse Grok's alternatives.
+          parameters: grokToolSchema(tool.function.parameters ?? { type: "object", properties: {} }),
+          strict: true,
+        }))
+    : [];
+  // Apply the existing reserved-name and first-definition policy before
+  // lowering unions, so aliases cannot resurrect filtered client tools.
+  return mergeHostedSearchTools(tools, { enabled: false });
+}
+
 // Chat Completions request -> Codex Responses request.
 export function toResponsesRequest(chat, options = {}) {
   const input = [];
   let instructions;
   const viewImageAlias = shouldAliasViewImageForGrok(chat);
+  const alternatives = options.toolAlternatives ?? createGrokToolAlternatives(grokClientTools(chat, viewImageAlias), {
+    toolChoice: chat.tool_choice, maxTools: options.hostedSearchEnabled === false ? 350 : 348,
+  });
   for (const message of chat.messages || []) {
     const role = message.role;
     if (role === "system" || role === "developer") {
@@ -364,7 +389,7 @@ export function toResponsesRequest(chat, options = {}) {
         input.push({
           type: "function_call",
           call_id: call.id,
-          name: toolNameForGrok(call.function?.name, { viewImageAlias }),
+          name: alternatives.nameForCall(toolNameForGrok(call.function?.name, { viewImageAlias }), call.function?.arguments),
           arguments: call.function?.arguments || "{}",
         });
       }
@@ -374,7 +399,17 @@ export function toResponsesRequest(chat, options = {}) {
     }
   }
 
-  const request = { model: chat.model, input, stream: true, store: false };
+  // Match xAI's documented sampling profile and official CLI defaults when the
+  // caller omits them. Preserve explicit caller values, including zero.
+  const request = { model: chat.model, input, stream: true, store: false,
+    temperature: chat.temperature ?? 0.7, top_p: chat.top_p ?? 0.95 };
+  // Preserve the caller's output bound. xAI caps visible text, not reasoning or
+  // function-call tokens: this is not a wall-clock or total-compute limit.
+  // The modern field takes precedence; invalid values remain visible to
+  // upstream validation rather than being discarded.
+  if (chat.max_completion_tokens !== undefined || chat.max_tokens !== undefined) {
+    request.max_output_tokens = chat.max_completion_tokens ?? chat.max_tokens;
+  }
   if (serviceTierEnabledFor(chat.model) && knownServiceTier(chat.service_tier)) {
     request.service_tier = knownServiceTier(chat.service_tier);
   }
@@ -382,28 +417,7 @@ export function toResponsesRequest(chat, options = {}) {
   const effort = mapEffort(chat.reasoning_effort, chat.model);
   if (effort) request.reasoning = { effort };
   if (effort && options.recallReasoning) request.include = ["reasoning.encrypted_content"];
-  const clientTools = Array.isArray(chat.tools)
-    ? chat.tools
-        .filter((tool) => tool?.type === "function" && tool.function?.name)
-        .map((tool) => ({
-          type: "function",
-          name: toolNameForGrok(tool.function.name, { viewImageAlias }),
-          description: tool.function.description,
-          // xAI 400s the whole request over a union-rooted parameter schema,
-          // which Codex's own `automation_update` app tool ships. It rejects
-          // every non-object root, so this keeps objectRootToolSchema's full
-          // collapse rather than the narrower providerToolSchema the shared
-          // relay uses -- and additionally drops literals that contradict their
-          // declared type, which the relay now does for every provider.
-          parameters: objectRootToolSchema(
-            normalizeSchemaLiterals(
-              tool.function.parameters || { type: "object", properties: {} },
-            ),
-          ),
-          strict: false,
-        }))
-    : [];
-  const tools = mergeHostedSearchTools(clientTools, {
+  const tools = mergeHostedSearchTools(alternatives.tools, {
     enabled: options.hostedSearchEnabled !== false,
   });
   if (tools.length) {
@@ -579,7 +593,21 @@ async function handleChatCompletions(request, response) {
         return items;
       }
     : undefined;
-  const responsesRequest = toResponsesRequest(chat, { hostedSearchEnabled, recallReasoning });
+  const afterToolResult = lastClientMessageWasToolResult(chat);
+  const automaticChoice = allowsAutomaticToolChoice(chat);
+  const postToolDecision = PROGRESS_ONLY_RETRY && afterToolResult && automaticChoice;
+  const finalTool = privateFinalToolName(chat);
+  const maxClientTools = hostedSearchEnabled ? 348 : 350;
+  const clientTools = grokClientTools(chat, viewImageAlias);
+  const clientToolNames = new Set(clientTools.map((tool) => toolNameForCodex(tool.name, { viewImageAlias })));
+  const privateFinalOffered = postToolDecision && clientTools.length < maxClientTools;
+  const classifyPostTool = (turn) => classifyAfterToolRepair(turn, { finalTool, privateFinalOffered, clientToolNames });
+  const firstChat = postToolDecision
+    ? withProgressOnlyNudge(chat, { afterToolResult: true, finalTool, maxTools: maxClientTools, clientToolCount: clientTools.length }) : chat;
+  const toolAlternatives = createGrokToolAlternatives(grokClientTools(firstChat, viewImageAlias), {
+    toolChoice: firstChat.tool_choice, maxTools: maxClientTools,
+  });
+  const responsesRequest = toResponsesRequest(firstChat, { hostedSearchEnabled, recallReasoning, toolAlternatives });
   if (carryCounts.misses && !QUIET) {
     console.error(
       `[grok-oauth] reasoning-carry hits=${carryCounts.hits} misses=${carryCounts.misses} model=${model}`,
@@ -589,10 +617,8 @@ async function handleChatCompletions(request, response) {
     maxText: PROGRESS_ONLY_MAX_TEXT,
     minOutputTokens: PROGRESS_ONLY_MIN_OUTPUT_TOKENS,
   };
-  const afterToolResult = lastClientMessageWasToolResult(chat);
-  const mayRetry =
-    PROGRESS_ONLY_RETRY && (afterToolResult || requestOffersClientTools(chat));
-  const strictAfterToolRepair = PROGRESS_ONLY_RETRY && afterToolResult;
+  const mayRetry = PROGRESS_ONLY_RETRY && automaticChoice &&
+    (afterToolResult || requestOffersClientTools(chat));
   // Attempt 1 normally stays live. Once this exact conversation has actually
   // produced a progress-only stop, buffer only its next short visible prefix.
   // That prevents an aborted/retried turn from committing the same status
@@ -600,7 +626,7 @@ async function handleChatCompletions(request, response) {
   let bufferShortProgress =
     wantsStream &&
     mayRetry &&
-    (strictAfterToolRepair || progressOnlyConversations.has(conversationKey));
+    !postToolDecision && progressOnlyConversations.has(conversationKey);
 
   const controller = new AbortController();
   request.once("aborted", () => controller.abort());
@@ -702,10 +728,9 @@ async function handleChatCompletions(request, response) {
   const id = `chatcmpl-${randomUUID()}`;
   const created = Math.floor(Date.now() / 1_000);
   const turnState = createTurnState({
-    toolNameMapper: (name) => toolNameForCodex(name, { viewImageAlias }),
+    toolNameMapper: (name) => toolNameForCodex(toolAlternatives.originalName(name), { viewImageAlias }),
   });
   let emittedDeltaCount = 0;
-  const heldStrictContentDeltas = [];
   let streamStarted = false;
 
   const startStream = () => {
@@ -719,7 +744,7 @@ async function handleChatCompletions(request, response) {
   };
 
   // A post-tool turn can only be classified after its terminal event. Open the
-  // SSE response immediately, but hold all visible text so Codex sees liveness
+  // SSE response immediately, but hold all visible actions so Codex sees liveness
   // and reasoning without accepting an uncertified progress sentence.
   // Once the head is committed, a failed repair becomes one terminal SSE error.
   if (wantsStream) startStream();
@@ -749,32 +774,15 @@ async function handleChatCompletions(request, response) {
     return true;
   };
 
-  const emitHeldStrictContent = () => {
-    if (!wantsStream || !streamStarted || heldStrictContentDeltas.length === 0) return;
-    for (const delta of heldStrictContentDeltas) {
-      response.write(OPENAI_ROLE_CHUNK(id, created, model, delta));
-    }
-    heldStrictContentDeltas.length = 0;
-  };
-
   const emitPendingDeltas = () => {
     if (!wantsStream || !streamStarted) return;
     while (emittedDeltaCount < turnState.deltas.length) {
       const delta = turnState.deltas[emittedDeltaCount];
-      if (
-        strictAfterToolRepair &&
-        Object.hasOwn(delta, "content") &&
-        turnState.toolCalls.length === 0
-      ) {
-        heldStrictContentDeltas.push(delta);
+      if (postToolDecision && !Object.hasOwn(delta, "reasoning_content")) {
+        // A complete-looking action may still be followed by a failed terminal
+        // or a private final call. Do not expose any action until classification.
         emittedDeltaCount += 1;
         continue;
-      }
-      // A client tool call certifies attempt 1 as actionable. Release any
-      // earlier prose before its tool delta so the original event order stays
-      // intact; a no-tool attempt remains held through terminal classification.
-      if (strictAfterToolRepair && turnState.toolCalls.length > 0) {
-        emitHeldStrictContent();
       }
       if (
         bufferShortProgress &&
@@ -813,26 +821,31 @@ async function handleChatCompletions(request, response) {
   // deltas may already have reached the client; only one terminal error is
   // legal now. Withheld/backfilled deltas stay withheld on failure.
   if (rejectUnsuccessfulTurn(turn, "attempt", firstAttempt)) return;
-  // Only a completed response certifies its reasoning for the next request.
-  reasoningCarry?.remember(carryScope, turn.toolCalls.map((call) => call.id),
-    certifiedReasoningItems(upstreamOutputItems));
+  let selectedOutputItems = upstreamOutputItems;
   emitPendingDeltas();
   let retried = false;
   let repairFailure;
   let repairAttempt;
-  let strictRepairOutputEmitted = false;
+  let selectedOutputEmitted = false;
 
-  const progressOnly = isProgressOnlyStop(turn, { ...holdOptions, afterToolResult });
+  const firstDecision = postToolDecision ? classifyPostTool(turn) : undefined;
+  const progressOnly = postToolDecision
+    ? firstDecision.action === "fail" && turn.toolCalls.length === 0
+    : isProgressOnlyStop(turn, holdOptions);
+  if (postToolDecision && firstDecision.action === "final") {
+    turn = { ...turn, contentText: firstDecision.contentText, toolCalls: [],
+      deltas: [{ content: firstDecision.contentText }], finishReason: "stop" };
+  } else if (postToolDecision && firstDecision.action === "fail" && !progressOnly) {
+    repairFailure = { code: "grok_post_tool_protocol_violation",
+      message: "Grok returned an invalid or mixed final-answer tool call." };
+  }
   if (progressOnly) rememberProgressOnlyConversation(conversationKey);
-  if (progressOnly && strictAfterToolRepair && !mayRetry) {
-    repairFailure = {
-      code: "progress_only_no_client_tools",
-      message:
-        "Grok stopped after a tool result, but the repair request had no callable client tools.",
-    };
-  } else if (mayRetry && progressOnly) {
-    const retryChat = withProgressOnlyNudge(chat, { afterToolResult });
-    const retryRequest = toResponsesRequest(retryChat, { hostedSearchEnabled, recallReasoning });
+  if (mayRetry && progressOnly && !controller.signal.aborted) {
+    // Only prose-only/empty successful violations can be recovered, before any
+    // action has reached the client. Never replay malformed or mixed calls.
+    const retryChat = withProgressOnlyNudge(chat, { afterToolResult: postToolDecision, finalTool,
+      maxTools: maxClientTools, clientToolCount: clientTools.length });
+    const retryRequest = toResponsesRequest(retryChat, { hostedSearchEnabled, recallReasoning, toolAlternatives });
     let secondUpstream;
     try {
       repairAttempt = await requestUpstream(accessToken, retryRequest);
@@ -850,7 +863,7 @@ async function handleChatCompletions(request, response) {
       console.error(
         `[grok-oauth] progress-only-retry-failed=true model=${model} status=${secondUpstream.status} ${upstreamAttemptTiming("repair", repairAttempt)}`,
       );
-      if (strictAfterToolRepair) {
+      if (postToolDecision) {
         repairFailure = {
           code: "progress_only_retry_failed",
           message: "Grok stopped after a tool result and its repair request failed upstream.",
@@ -858,14 +871,18 @@ async function handleChatCompletions(request, response) {
       }
     } else if (secondUpstream?.body) {
       const secondState = createTurnState({
-        toolNameMapper: (name) => toolNameForCodex(name, { viewImageAlias }),
+        toolNameMapper: (name) => toolNameForCodex(toolAlternatives.originalName(name), { viewImageAlias }),
       });
       let emittedRepairDeltaCount = 0;
+      const secondOutputItems = [];
       try {
         await consumeResponsesStream(secondUpstream.body, (event) => {
           repairAttempt.firstEventAt ??= Date.now();
           applyResponsesEvent(secondState, event);
-          if (wantsStream && streamStarted && strictAfterToolRepair) {
+          if (event?.type === "response.output_item.done" && event.item && !secondState.terminalStatus) {
+            secondOutputItems.push(event.item);
+          }
+          if (wantsStream && streamStarted && postToolDecision) {
             while (emittedRepairDeltaCount < secondState.deltas.length) {
               const delta = secondState.deltas[emittedRepairDeltaCount];
               if (Object.hasOwn(delta, "reasoning_content")) {
@@ -885,7 +902,7 @@ async function handleChatCompletions(request, response) {
       // Keep both client tools and the private final answer withheld until
       // response.completed. An item.done followed by EOF/failure is not a
       // certified repair, even when its arguments look complete.
-      if (strictAfterToolRepair) {
+      if (postToolDecision) {
         if (rejectUnsuccessfulTurn(second, "repair", repairAttempt)) return;
       } else if (second.terminalStatus !== "completed") {
         // An optional retry is speculative: the first answer already completed
@@ -896,32 +913,31 @@ async function handleChatCompletions(request, response) {
         );
       }
       retried = true;
-      const repair = strictAfterToolRepair
-        ? classifyAfterToolRepair(second)
+      const repair = postToolDecision
+        ? classifyPostTool(second)
         : { action: shouldPreferRetryTurn(second) ? "tools" : "first" };
       console.error(
         `[grok-oauth] progress-only-retried=true retries=1 model=${model} prefer=${repair.action} ${upstreamAttemptTiming("attempt", firstAttempt)} ${upstreamAttemptTiming("repair", repairAttempt)}`,
       );
       if (repair.action === "tools") {
-        const usage = strictAfterToolRepair
+        selectedOutputItems = secondOutputItems;
+        const usage = postToolDecision
           ? selectedRetryUsage(turn.usage, second.usage)
           : mergeMappedUsage(turn.usage, second.usage);
-        if (wantsStream && streamStarted) {
-          // The repair stayed reasoning-only on the wire until certification.
-          // Its tool deltas are now safe and are emitted exactly once here.
+        if (wantsStream && streamStarted && !postToolDecision) {
+          // The optional pre-tool retry's calls are emitted only on success.
           for (const delta of toolCallDeltas(second)) {
             response.write(OPENAI_ROLE_CHUNK(id, created, model, delta));
           }
-          strictRepairOutputEmitted = strictAfterToolRepair;
         }
         turn = {
-          contentText: strictAfterToolRepair ? "" : turn.contentText,
-          reasoningText: strictAfterToolRepair ? second.reasoningText : turn.reasoningText,
+          contentText: postToolDecision ? "" : turn.contentText,
+          reasoningText: postToolDecision ? second.reasoningText : turn.reasoningText,
           toolCalls: second.toolCalls,
           usage,
           serviceTier: undefined,
           serviceTierUnknown: false,
-          deltas: strictAfterToolRepair
+          deltas: postToolDecision
             ? toolCallDeltas(second)
             : [...turn.deltas, ...toolCallDeltas(second)],
           finishReason: "tool_calls",
@@ -929,12 +945,6 @@ async function handleChatCompletions(request, response) {
         };
         if (streamStarted) emittedDeltaCount = turn.deltas.length;
       } else if (repair.action === "final") {
-        if (wantsStream && streamStarted && strictAfterToolRepair) {
-          response.write(
-            OPENAI_ROLE_CHUNK(id, created, model, { content: repair.contentText }),
-          );
-          strictRepairOutputEmitted = true;
-        }
         turn = {
           contentText: repair.contentText,
           reasoningText: second.reasoningText,
@@ -956,7 +966,7 @@ async function handleChatCompletions(request, response) {
       } else {
         turn = { ...turn, usage: mergeMappedUsage(turn.usage, second.usage), serviceTier: undefined, serviceTierUnknown: false };
       }
-    } else if (strictAfterToolRepair) {
+    } else if (postToolDecision) {
       repairFailure = {
         code: "progress_only_retry_failed",
         message: "Grok stopped after a tool result and its repair request produced no response.",
@@ -982,6 +992,21 @@ async function handleChatCompletions(request, response) {
     return;
   }
 
+  // Remember only the selected certified attempt, including a recovered tool
+  // turn. Saving the discarded first attempt loses its successor's reasoning.
+  reasoningCarry?.remember(carryScope, turn.toolCalls.map((call) => call.id),
+    certifiedReasoningItems(selectedOutputItems));
+  if (postToolDecision) {
+    if (wantsStream && streamStarted) {
+      for (const delta of turn.deltas || []) {
+        if (!Object.hasOwn(delta, "reasoning_content")) {
+          response.write(OPENAI_ROLE_CHUNK(id, created, model, delta));
+        }
+      }
+      selectedOutputEmitted = true;
+    }
+  }
+
   // A normal short answer, a failed optional repair, or the keep-first branch
   // must still deliver attempt 1. The retry-tools branch has already advanced
   // emittedDeltaCount past the suppressed prefix, so releasing is a no-op there.
@@ -993,9 +1018,8 @@ async function handleChatCompletions(request, response) {
   if (wantsStream) {
     const wasStarted = streamStarted;
     startStream();
-    if (wasStarted && !strictRepairOutputEmitted) {
+    if (wasStarted && !selectedOutputEmitted) {
       emitPendingDeltas();
-      emitHeldStrictContent();
     } else if (!wasStarted) {
       for (const delta of turn.deltas || []) {
         response.write(OPENAI_ROLE_CHUNK(id, created, model, delta));

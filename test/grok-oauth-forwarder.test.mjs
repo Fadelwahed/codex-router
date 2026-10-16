@@ -26,6 +26,19 @@ import {
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const INTERNAL_KEY = "test-grok-internal-service-key-with-sufficient-length";
 
+test("Grok preserves caller output budgets and sampling parameters", () => {
+  const chat = { model: "grok-4.7", messages: [] };
+  assert.equal(toResponsesRequest({ ...chat, max_tokens: 256 }).max_output_tokens, 256);
+  assert.equal(toResponsesRequest({ ...chat, max_tokens: 256, max_completion_tokens: 128 }).max_output_tokens, 128);
+  assert.equal(toResponsesRequest({ ...chat, max_completion_tokens: 0 }).max_output_tokens, 0);
+  assert.equal(Object.hasOwn(toResponsesRequest(chat), "max_output_tokens"), false);
+  assert.equal(toResponsesRequest(chat).temperature, 0.7);
+  assert.equal(toResponsesRequest(chat).top_p, 0.95);
+  const explicit = toResponsesRequest({ ...chat, temperature: 0, top_p: 0.6 });
+  assert.equal(explicit.temperature, 0);
+  assert.equal(explicit.top_p, 0.6);
+});
+
 function sse(events) {
   return `${events.map((e) => `event: ${e.type}\ndata: ${JSON.stringify(e)}`).join("\n\n")}\n\n`;
 }
@@ -1168,7 +1181,7 @@ test("retries a progress-only stop once and prefers a retry that calls tools", a
   }
 });
 
-test("a short stop after a tool result is nudged to continue, regardless of wording", async () => {
+test("a short native final after a tool result completes without another generation", async () => {
   let inbound = 0;
   const bodies = [];
   const backend = await mockBackend(async (req, res) => {
@@ -1232,22 +1245,15 @@ test("a short stop after a tool result is nudged to continue, regardless of word
       }),
     });
     const json = await resp.json();
-    assert.equal(inbound, 2);
-    assert.equal(json.choices[0].finish_reason, "tool_calls");
-    assert.equal(json.choices[0].message.content, null);
-    assert.equal(json.choices[0].message.tool_calls[0].function.name, "view_image");
-    assert.equal(json.usage.prompt_tokens, 12_100);
-    assert.equal(json.usage.billed_prompt_tokens, 24_100);
-    assert.match(
-      JSON.parse(bodies[1]).instructions,
-      /The previous tool call finished/,
-    );
-    assert.doesNotMatch(
-      JSON.parse(bodies[1]).instructions,
-      /already completed the task/,
-    );
-    assert.match(JSON.stringify(JSON.parse(bodies[1]).tools), /__codex_router_submit_final/);
-    assert.equal(JSON.parse(bodies[1]).tool_choice, "required");
+    assert.equal(inbound, 1);
+    assert.equal(json.choices[0].finish_reason, "stop");
+    assert.equal(json.choices[0].message.content, "The figures are ready.");
+    assert.equal(json.choices[0].message.tool_calls, undefined);
+    assert.equal(json.usage.prompt_tokens, 12_000);
+    assert.equal(json.usage.completion_tokens, 95);
+    assert.equal(json.usage.billed_prompt_tokens, undefined);
+    assert.equal(json.usage.retries, undefined);
+    assert.equal(JSON.parse(bodies[0]).tool_choice, "auto");
   } finally {
     await stop(child);
     await new Promise((r) => backend.server.close(r));
@@ -1255,7 +1261,7 @@ test("a short stop after a tool result is nudged to continue, regardless of word
   }
 });
 
-test("opens a post-tool stream before classification while holding uncertified text", async () => {
+test("streams reasoning immediately and releases native final text only after completion", async () => {
   let inbound = 0;
   const uncertifiedProgress = "I will inspect the figure next. ".repeat(8);
   assert.ok(uncertifiedProgress.length > 120);
@@ -1359,16 +1365,17 @@ test("opens a post-tool stream before classification while holding uncertified t
       if (done) break;
       body += decoder.decode(value, { stream: true });
     }
-    assert.equal(inbound, 2);
-    assert.doesNotMatch(body, /I will inspect the figure next/);
-    assert.match(body, /"reasoning_content":"Certifying the final answer\."/);
-    assert.match(body, /"content":"The chart axis is months\."/);
+    assert.equal(inbound, 1);
+    const payloads = body.split("\n").filter((line) => line.startsWith("data: {")).map((line) => JSON.parse(line.slice(6)));
+    assert.equal(payloads.flatMap((payload) => payload.choices.map((choice) => choice.delta?.content || "")).join(""), uncertifiedProgress.trim());
+    assert.doesNotMatch(body, /Certifying the final answer|The chart axis is months/);
+    const usage = payloads.find((payload) => payload.usage)?.usage;
+    assert.equal(usage.prompt_tokens, 150_000);
+    assert.equal(usage.completion_tokens, 180);
+    assert.equal(usage.retries, undefined);
+    assert.equal(usage.billed_prompt_tokens, undefined);
     assert.doesNotMatch(body, /__codex_router_submit_final/);
     assert.match(body, /data: \[DONE\]/);
-    await waitChildError(
-      child,
-      /progress-only-retried=true retries=1 model=grok-4\.6 prefer=final attempt_req=[0-9a-f-]{36} attempt_headers_ms=\d+ attempt_first_event_ms=\d+ attempt_total_ms=\d+ repair_req=[0-9a-f-]{36} repair_headers_ms=\d+ repair_first_event_ms=\d+ repair_total_ms=\d+/,
-    );
   } finally {
     releaseFirstAttempt?.();
     await stop(child);
@@ -1386,7 +1393,6 @@ test("a streamed post-tool repair exposes reasoning and only the certified tool 
       sse(
         inbound === 1
           ? [
-              { type: "response.output_text.delta", delta: "I will inspect the figure next." },
               { type: "response.completed", response: { usage: { input_tokens: 150_000, output_tokens: 180 } } },
             ]
           : [
@@ -1435,9 +1441,8 @@ test("post-tool repair releases held actions only after a successful terminal", 
     const current = scenario;
     current.inbound += 1;
     res.writeHead(200, { "Content-Type": "text/event-stream" });
-    if (current.inbound === 1) {
+    if (current.recover && current.inbound === 1) {
       res.end(sse([
-        { type: "response.output_text.delta", delta: "Uncertified progress." },
         { type: "response.completed", response: { usage: { input_tokens: 100, output_tokens: 20 } } },
       ]));
       return;
@@ -1446,10 +1451,15 @@ test("post-tool repair releases held actions only after a successful terminal", 
     const args = JSON.stringify(current.privateFinal
       ? { answer: "Certified repair answer." }
       : { cmd: "repair-command" });
-    res.write(sse([
+    const preparedOutput = current.nativeFinal ? [
+      { type: "response.output_text.delta", delta: "Certified repair answer." },
+    ] : [
       { type: "response.output_item.added", item: { type: "function_call", id: "fc_repair", call_id: "call_repair", name } },
       { type: "response.function_call_arguments.delta", item_id: "fc_repair", delta: args },
       { type: "response.output_item.done", item: { type: "function_call", id: "fc_repair", call_id: "call_repair", name, arguments: args } },
+    ];
+    res.write(sse([
+      ...preparedOutput,
       // Reading this marker proves the preceding call frames were processed
       // before the terminal gate is released; reasoning must remain live.
       { type: "response.reasoning_summary_text.delta", delta: "Repair call prepared." },
@@ -1488,11 +1498,13 @@ test("post-tool repair releases held actions only after a successful terminal", 
   };
   try {
     await waitHealth(base, child);
+    for (const recover of [false, true]) {
     for (const stream of [false, true]) {
-      for (const privateFinal of [false, true]) {
+      for (const output of ["client tool", "private final", "native final"]) {
+        const privateFinal = output !== "client tool";
         for (const terminal of ["completed", "failed", "incomplete", "eof", "truncated"]) {
-          await t.test(`${stream ? "SSE" : "JSON"} ${privateFinal ? "private final" : "client tool"}: ${terminal}`, async () => {
-            scenario = { stream, privateFinal, terminal, inbound: 0,
+          await t.test(`${recover ? "recovery" : "first"} ${stream ? "SSE" : "JSON"} ${output}: ${terminal}`, async () => {
+            scenario = { stream, privateFinal, nativeFinal: output === "native final", terminal, recover, inbound: 0,
               repairReady: Promise.withResolvers(), terminalGate: Promise.withResolvers() };
             const responsePromise = fetch(`${base}/v1/chat/completions`, {
               method: "POST", headers: auth,
@@ -1536,7 +1548,7 @@ test("post-tool repair releases held actions only after a successful terminal", 
               } else {
                 body = await resp.text();
               }
-              assert.equal(scenario.inbound, 2, "a failed repair must never replay");
+              assert.equal(scenario.inbound, recover ? 2 : 1, "a failed attempt must never replay");
               assert.doesNotMatch(body, /Uncertified progress|__codex_router_submit_final|private upstream failure detail/);
               if (terminal === "completed") {
                 assert.equal(resp.status, 200);
@@ -1571,6 +1583,7 @@ test("post-tool repair releases held actions only after a successful terminal", 
         }
       }
     }
+    }
   } finally {
     scenario?.terminalGate.resolve();
     await stop(child);
@@ -1579,7 +1592,7 @@ test("post-tool repair releases held actions only after a successful terminal", 
   }
 });
 
-test("an unsuccessful first turn emits one error without replaying its live client tool", async (t) => {
+test("an unsuccessful post-tool first turn emits one error without leaking or replaying its client tool", async (t) => {
   let terminal;
   let inbound;
   const backend = await mockBackend(async (_req, res) => {
@@ -1615,7 +1628,7 @@ test("an unsuccessful first turn emits one error without replaying its live clie
           assert.doesNotMatch(body, /"finish_reason":"(?:stop|tool_calls)"|\[DONE\]/);
           if (stream) {
             assert.equal(resp.status, 200);
-            assert.equal((body.match(/"name":"exec_command"/g) || []).length, 1);
+            assert.equal((body.match(/"name":"exec_command"/g) || []).length, 0);
             assert.equal((body.match(/event: error/g) || []).length, 1);
             assert.match(body, /local_router_stream_failed/);
           } else {
@@ -1633,7 +1646,7 @@ test("an unsuccessful first turn emits one error without replaying its live clie
   }
 });
 
-test("after-tool retry returns a certified final answer without leaking the internal tool", async () => {
+test("empty after-tool response recovers once with an optional private final", async () => {
   let inbound = 0;
   const backend = await mockBackend(async (_req, res) => {
     inbound += 1;
@@ -1642,7 +1655,6 @@ test("after-tool retry returns a certified final answer without leaking the inte
       sse(
         inbound === 1
           ? [
-              { type: "response.output_text.delta", delta: "I will inspect the figure next." },
               { type: "response.completed", response: { usage: { input_tokens: 150_000, output_tokens: 180 } } },
             ]
           : [
@@ -2638,4 +2650,277 @@ test("missing CLI version fails locally and recovers in the same forwarder", asy
     await new Promise(resolve => backend.server.close(resolve));
     rmSync(dir, { recursive: true, force: true });
   }
+});
+
+test("post-tool completion decides in one generation, preserves choices and rejects mixed actions", async (t) => {
+  let scenario;
+  const finalBase = "__codex_router_submit_final";
+  const backend = await mockBackend(async (req, res) => {
+    const chunks = [];
+    for await (const chunk of req) chunks.push(chunk);
+    const captured = JSON.parse(Buffer.concat(chunks).toString("utf8"));
+    scenario.requests.push(captured);
+    const finalName = captured.tools?.filter((tool) => tool.type === "function").at(-1)?.name;
+    const call = (name, args, index = 0) => ({ type: "response.output_item.done", output_index: index,
+      item: { type: "function_call", id: `fc_${index}`, call_id: `call_${index}`, name, arguments: args } });
+    let events;
+    if (scenario.choice !== undefined) {
+      events = [{ type: "response.output_text.delta", delta: "Caller choice preserved." }];
+    } else if (scenario.kind === "native-final") {
+      events = [{ type: "response.output_text.delta", delta: "Native final answer." }];
+    } else if (scenario.kind === "parallel") {
+      events = [call(finalBase, "{}"), call("exec_command", '{"cmd":"check"}', 1)];
+    } else if (scenario.kind === "unknown") {
+      events = [call("invented_tool", "{}")];
+    } else {
+      events = [call(finalName, scenario.kind === "malformed" ? '{"answer":"Done.","extra":true}' : '{"answer":"Done."}')];
+      if (scenario.kind === "mixed") events.push(call("exec_command", "{}", 1));
+      if (scenario.kind === "prose-final") events.unshift({ type: "response.output_text.delta", delta: "Status text." });
+    }
+    res.writeHead(200, { "Content-Type": "text/event-stream" });
+    res.end(sse([...events, { type: "response.completed", response: { usage: { input_tokens: 100, output_tokens: 20 } } }]));
+  });
+  const port = await openPort();
+  const dir = mkdtempSync(path.join(os.tmpdir(), "grok-oauth-first-decision-"));
+  const child = startForwarder(port, backend.port, writeSession(dir));
+  const base = `http://127.0.0.1:${port}`;
+  try {
+    await waitHealth(base, child);
+    for (const stream of [false, true]) {
+      for (const spec of [
+        { kind: "final", noTools: true }, { kind: "final", collision: true }, { kind: "final", repeated: true },
+        { kind: "parallel", collision: true }, { kind: "mixed" }, { kind: "malformed" },
+        { kind: "prose-final" }, { kind: "unknown" },
+        { kind: "native-final" }, { kind: "native-final", noTools: true },
+        ...["none", "required", { type: "function", function: { name: "exec_command" } }].map((choice) => ({ kind: "choice", choice })),
+      ]) {
+        await t.test(`${stream ? "SSE" : "JSON"} ${JSON.stringify(spec)}`, async () => {
+          scenario = { ...spec, requests: [] };
+          const tools = spec.noTools ? [] : [
+            ...(spec.collision ? [finalBase, `${finalBase}_1`] : []), "exec_command",
+          ].map((name) => ({ type: "function", function: { name, parameters: { type: "object" } } }));
+          const resp = await fetch(`${base}/v1/chat/completions`, { method: "POST", headers: auth,
+            body: JSON.stringify({ model: "grok-4.6", stream, tools, tool_choice: spec.choice, max_completion_tokens: 128,
+              messages: Array.from({ length: spec.repeated ? 3 : 1 }, (_, i) => [
+                { role: "assistant", tool_calls: [{ id: `old-${i}`, type: "function", function: { name: "exec_command", arguments: "{}" } }] },
+                { role: "tool", tool_call_id: `old-${i}`, content: "done" }]).flat() }) });
+          const body = await resp.text();
+          assert.equal(scenario.requests.length, 1, "a completed decision or invalid action must not regenerate");
+          const [sent] = scenario.requests;
+          assert.equal(sent.max_output_tokens, 128);
+          if (spec.repeated) {
+            assert.equal(sent.input.length, 6, "continuation must preserve every call and result");
+          }
+          if (spec.choice !== undefined) {
+            assert.equal(sent.tools.some((tool) => tool.name?.startsWith(finalBase)), false);
+            assert.deepEqual(sent.tool_choice, typeof spec.choice === "object" ? { type: "function", name: "exec_command" } : spec.choice);
+            assert.match(body, /Caller choice preserved/);
+          } else {
+            const privateName = spec.collision ? `${finalBase}_2` : finalBase;
+            assert.equal(sent.tools.filter((tool) => tool.type === "function").at(-1).name, privateName);
+            assert.equal(sent.tool_choice, "auto");
+            assert.equal(sent.input.at(-1).type, "function_call_output");
+            assert.match(sent.instructions, /Call the next task tool or tools/);
+            for (const tool of tools) assert.ok(sent.tools.some((item) => item.name === tool.function.name));
+            assert.equal(body.includes(privateName), false, "the private function must never reach the client");
+          }
+          if (["mixed", "malformed", "unknown"].includes(spec.kind)) {
+            assert.equal(resp.status, stream ? 200 : 502);
+            assert.doesNotMatch(body, /Done\.|Status text|tool_calls|\[DONE\]/);
+            assert.match(body, stream ? /event: error/ : /grok_post_tool_protocol_violation/);
+          } else {
+            assert.equal(resp.status, 200);
+            const payloads = stream ? body.split("\n").filter((line) => line.startsWith("data: {")).map((line) => JSON.parse(line.slice(6))) : [JSON.parse(body)];
+            const usage = payloads.find((item) => item.usage)?.usage;
+            assert.equal(usage.prompt_tokens, 100);
+            assert.equal(usage.completion_tokens, 20);
+            assert.equal(usage.retries, undefined);
+            assert.equal(usage.billed_prompt_tokens, undefined);
+            if (spec.kind === "parallel") {
+              const calls = stream ? payloads.flatMap((item) => item.choices.flatMap((choice) => choice.delta?.tool_calls || [])) : payloads[0].choices[0].message.tool_calls;
+              assert.deepEqual(calls.filter((item) => item.function?.name).map((item) => item.function.name), [finalBase, "exec_command"]);
+            } else if (spec.kind === "final" || spec.kind === "prose-final") {
+              assert.match(body, /Done\./);
+              assert.doesNotMatch(body, /tool_calls|Status text/);
+            } else if (spec.kind === "native-final") {
+              assert.match(body, /Native final answer\./);
+              assert.doesNotMatch(body, /tool_calls/);
+              if (stream) {
+                assert.equal((body.match(/Native final answer\./g) || []).length, 1);
+                assert.equal((body.match(/data: \[DONE\]/g) || []).length, 1);
+                assert.equal((body.match(/"finish_reason":"stop"/g) || []).length, 1);
+              } else {
+                assert.equal(payloads[0].choices[0].message.content, "Native final answer.");
+                assert.equal(payloads[0].choices[0].finish_reason, "stop");
+              }
+            }
+          }
+        });
+      }
+    }
+  } finally {
+    await stop(child);
+    await new Promise((resolve) => backend.server.close(resolve));
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("cancelling a pending post-tool decision closes upstream without action or replay", async () => {
+  let inbound = 0;
+  const closed = Promise.withResolvers();
+  const backend = await mockBackend(async (_req, res) => {
+    inbound += 1;
+    res.once("close", closed.resolve);
+    res.writeHead(200, { "Content-Type": "text/event-stream" });
+    res.write(sse([
+      { type: "response.output_item.done", item: { type: "function_call", id: "fc_cancel", call_id: "cancel", name: "__codex_router_submit_final", arguments: '{"answer":"Pending final."}' } },
+      { type: "response.reasoning_summary_text.delta", delta: "Waiting for completion." },
+    ]));
+  });
+  const port = await openPort();
+  const dir = mkdtempSync(path.join(os.tmpdir(), "grok-oauth-cancel-decision-"));
+  const child = startForwarder(port, backend.port, writeSession(dir));
+  const controller = new AbortController();
+  let timeout;
+  try {
+    const base = `http://127.0.0.1:${port}`;
+    await waitHealth(base, child);
+    const resp = await fetch(`${base}/v1/chat/completions`, { method: "POST", headers: auth, signal: controller.signal,
+      body: JSON.stringify({ model: "grok-4.6", stream: true,
+        messages: [{ role: "tool", tool_call_id: "old", content: "done" }] }) });
+    const reader = resp.body.getReader();
+    const decoder = new TextDecoder();
+    let body = "";
+    await Promise.race([(async () => {
+      while (!body.includes("Waiting for completion.")) {
+        const { value, done } = await reader.read();
+        assert.equal(done, false);
+        body += decoder.decode(value, { stream: true });
+      }
+      assert.doesNotMatch(body, /Pending final|__codex_router_submit_final|tool_calls|\[DONE\]/);
+      controller.abort();
+      await closed.promise;
+      assert.equal(inbound, 1);
+    })(), new Promise((_, reject) => { timeout = setTimeout(() => reject(new Error("cancellation did not close upstream")), 2_000); })]);
+  } finally {
+    clearTimeout(timeout);
+    controller.abort();
+    await stop(child);
+    await new Promise((resolve) => backend.server.close(resolve));
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("Grok's final provider hop keeps complete union alternatives with strict argument validation", () => {
+  const branch = (mode) => ({ type: "object", properties: { mode: { const: mode }, id: { type: "string" } }, required: ["mode", "id"], additionalProperties: false });
+  const schema = { oneOf: [branch("view"), { oneOf: [branch("update"), branch("delete")] }] };
+  const request = toResponsesRequest({ model: "grok-4.7", messages: [{ role: "user", content: "fixture" }],
+    tools: [{ type: "function", function: { name: "fixture_operation", parameters: schema } }] }, { hostedSearchEnabled: false });
+  assert.equal(request.tools.length, 3);
+  assert.ok(request.tools.every(tool => tool.strict === true));
+  assert.deepEqual(request.tools.map(tool => tool.parameters), [schema.oneOf[0], ...schema.oneOf[1].oneOf]);
+});
+
+test("reserved search unions are filtered and duplicate names settled before operation lowering", () => {
+  const branch = mode => ({ type: "object", properties: { mode: { const: mode } }, required: ["mode"] });
+  const tool = (name, modes) => ({ type: "function", function: {
+    name, parameters: { oneOf: modes.map(branch) },
+  } });
+  for (const hostedSearchEnabled of [false, true]) {
+    const request = toResponsesRequest({ model: "grok-4.7", messages: [], tools: [
+      tool("web_search", ["local", "remote"]), tool("x_search", ["local", "remote"]),
+      tool("fixture", ["view", "update"]), tool("fixture", ["delete", "create"]),
+    ] }, { hostedSearchEnabled });
+    const functions = request.tools.filter(item => item.type === "function");
+    assert.equal(functions.length, 2);
+    assert.ok(functions.every(item => item.name.startsWith("fixture__")));
+    assert.deepEqual(functions.map(item => item.parameters.properties.mode.const), ["view", "update"]);
+    assert.deepEqual(request.tools.filter(item => item.type !== "function"),
+      hostedSearchEnabled ? [{ type: "web_search" }, { type: "x_search" }] : []);
+  }
+});
+
+test("post-tool optional final respects the provider tool capacity on initial and recovery requests", async () => {
+  const captured = [];
+  const backend = await mockBackend(async (req, res) => {
+    const chunks = [];
+    for await (const chunk of req) chunks.push(chunk);
+    captured.push(JSON.parse(Buffer.concat(chunks)));
+    res.writeHead(200, { "Content-Type": "text/event-stream" });
+    res.end(sse([
+      ...(captured.length % 2 === 0 ? [{ type: "response.output_text.delta", delta: "Done." }] : []),
+      { type: "response.completed" },
+    ]));
+  });
+  const port = await openPort();
+  const dir = mkdtempSync(path.join(os.tmpdir(), "grok-final-capacity-"));
+  const child = startForwarder(port, backend.port, writeSession(dir));
+  const base = `http://127.0.0.1:${port}`;
+  try {
+    await waitHealth(base, child);
+    for (const [model, maxTools] of [["grok-4.7", 348], ["fixture-no-hosted-search", 350]]) {
+      assert.equal(hostedSearchEnabledFor(model), maxTools === 348);
+      for (const count of [maxTools - 1, maxTools]) {
+        const before = captured.length;
+        const tools = Array.from({ length: count }, (_, index) => ({ type: "function", function: {
+          name: `fixture_${index}`, parameters: { type: "object", properties: {} },
+        } }));
+        const result = await fetch(`${base}/v1/chat/completions`, {
+          method: "POST", headers: auth, body: JSON.stringify({ model, tools, messages: [
+            { role: "user", content: "Complete the synthetic task." },
+            { role: "assistant", tool_calls: [{ id: "fixture_call", type: "function", function: { name: "fixture_0", arguments: "{}" } }] },
+            { role: "tool", tool_call_id: "fixture_call", content: "done" },
+          ] }),
+        });
+        assert.equal(result.status, 200, await result.text());
+        assert.equal(captured.length - before, 2);
+        for (const request of captured.slice(before)) {
+          const finalOffered = count < maxTools;
+          assert.equal(request.tools.length, 350);
+          assert.equal(request.tools.some(tool => tool.name?.startsWith("__codex_router_submit_final")), finalOffered);
+          assert.equal(request.instructions.includes("__codex_router_submit_final"), finalOffered);
+        }
+      }
+    }
+  } finally {
+    await stop(child);
+    await new Promise(resolve => backend.server.close(resolve));
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("operation aliases round-trip through live forwarder history without leaking to the client", async () => {
+  const branch = mode => ({type:"object",properties:{mode:{const:mode},id:{type:"string"}},required:["mode","id"],additionalProperties:false});
+  const tools = [{type:"function",function:{name:"fixture_operation",parameters:{oneOf:[branch("view"),branch("update")]}}}];
+  const captured=[];
+  const backend=await mockBackend(async(req,res)=>{
+    const chunks=[];for await(const chunk of req)chunks.push(chunk);
+    const body=JSON.parse(Buffer.concat(chunks));captured.push(body);
+    const update=body.tools.find(tool=>tool.parameters?.properties?.mode?.const==="update");
+    res.writeHead(200,{"Content-Type":"text/event-stream"});
+    if(captured.length===1) res.end(sse([
+      {type:"response.output_item.done",item:{type:"reasoning",id:"rs_fixture",summary:[],encrypted_content:"opaque-fixture-reasoning"}},
+      {type:"response.output_item.done",item:{type:"function_call",id:"fc_fixture",call_id:"fixture_call",name:update.name,arguments:'{"mode":"update","id":"2"}'}},
+      {type:"response.completed"},
+    ]));
+    else res.end(sse([{type:"response.output_text.delta",delta:"Done."},{type:"response.completed"}]));
+  });
+  const port=await openPort();const dir=mkdtempSync(path.join(os.tmpdir(),"grok-alternatives-roundtrip-"));
+  const child=startForwarder(port,backend.port,writeSession(dir));const base=`http://127.0.0.1:${port}`;
+  try {
+    await waitHealth(base,child);
+    const messages=[{role:"system",content:"Synthetic alias round trip."},{role:"user",content:"Update fixture 2."}];
+    const request=()=>fetch(`${base}/v1/chat/completions`,{method:"POST",headers:auth,body:JSON.stringify({model:"grok-4.7",reasoning_effort:"medium",tools,messages})});
+    const first=await (await request()).json();const message=first.choices[0].message;
+    assert.equal(message.tool_calls[0].function.name,"fixture_operation");
+    assert.equal(message.tool_calls[0].id,"fixture_call");
+    messages.push({role:"assistant",content:null,tool_calls:message.tool_calls},{role:"tool",tool_call_id:"fixture_call",content:"updated"});
+    const second=await (await request()).json();
+    assert.equal(second.choices[0].message.content,"Done.");assert.equal(captured.length,2);
+    const update=captured[0].tools.find(tool=>tool.parameters?.properties?.mode?.const==="update");
+    const replay=captured[1].input.find(item=>item.type==="function_call");
+    assert.equal(replay.name,update.name);assert.equal(replay.call_id,"fixture_call");
+    assert.equal(captured[1].input.find(item=>item.type==="function_call_output").output,"updated");
+    assert.equal(captured[1].input.find(item=>item.type==="reasoning").encrypted_content,"opaque-fixture-reasoning");
+  } finally {await stop(child);await new Promise(resolve=>backend.server.close(resolve));rmSync(dir,{recursive:true,force:true});}
 });

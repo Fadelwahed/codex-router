@@ -971,3 +971,46 @@ test("a forced choice on a withheld connector tool restores its definition", () 
     assert.equal(names.filter((name) => name?.startsWith(CONNECTOR_PREFIX)).length, 1);
   });
 });
+
+test("Grok OAuth preserves exclusive schema alternatives through eager and discovered tool surfaces", () => {
+  const leaf = (mode) => ({ type: "object", properties: { mode: { const: mode }, id: { type: "string" } }, required: ["mode", "id"], additionalProperties: false });
+  const schema = { oneOf: [leaf("view"), { oneOf: [leaf("update"), leaf("delete")] }] };
+  for (const discovered of [false, true]) {
+    const namespace = { type: "namespace", name: "mcp__fixture", tools: [{ type: "function", name: "operation", inputSchema: schema }] };
+    const input = discovered ? [
+      { type: "tool_search_call", call_id: "search", execution: "client", arguments: { query: "fixture" } },
+      { type: "tool_search_output", call_id: "search", status: "completed", execution: "client", tools: [namespace] },
+    ] : [];
+    const tools = [clientToolSearch(), ...(!discovered ? [namespace] : [])];
+    for (const provider of ["grok-oauth", "grok-api", "deepseek"]) {
+      const surface = chatProviderToolSurface(tools, provider, { input, upstreamModel: "grok-4.7" });
+      const routed = flattenToolSearchHistory(input, surface.tools, surface.namespaces);
+      const tool = routed.tools.find((item) => item.name === "mcp__fixture__operation");
+      assert.ok(tool);
+      if (provider === "grok-oauth") {
+        assert.deepEqual(tool.parameters.oneOf, [schema.oneOf[0], ...schema.oneOf[1].oneOf]);
+        assert.equal(tool.inputSchema, schema);
+      } else {
+        assert.equal(tool.parameters.oneOf, undefined, "other providers keep existing merger behavior");
+        assert.equal(tool.parameters.properties.mode.const, "view");
+      }
+    }
+  }
+});
+
+test("Grok schema adapter survives deferred plain and namespace registrations referenced by history", () => {
+  const leaf = (mode) => ({ type: "object", properties: { mode: { const: mode } }, required: ["mode"], additionalProperties: false });
+  const schema = { oneOf: [leaf("a"), { oneOf: [leaf("b"), leaf("c")] }] };
+  for (const namespaced of [false, true]) {
+    const declaration = namespaced
+      ? { type: "namespace", name: "fixture", defer_loading: true, tools: [{ type: "function", name: "operation", inputSchema: schema }] }
+      : { type: "function", name: "operation", defer_loading: true, parameters: schema };
+    const input = [{ type: "function_call", name: "operation", ...(namespaced ? { namespace: "fixture" } : {}), call_id: "old", arguments: '{"mode":"b"}' }];
+    const surface = chatProviderToolSurface([clientToolSearch(), declaration], "grok-oauth", { input, upstreamModel: "grok-4.7" });
+    assert.equal(surface.tools.some((tool) => tool.name?.endsWith("operation")), false);
+    const restored = flattenToolSearchHistory(input, surface.tools, surface.namespaces);
+    const tool = restored.tools.find((item) => item.name?.endsWith("operation"));
+    assert.ok(tool);
+    assert.deepEqual(tool.parameters.oneOf, [schema.oneOf[0], ...schema.oneOf[1].oneOf]);
+  }
+});

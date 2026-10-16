@@ -2909,9 +2909,10 @@ function grokApplyPatchSseBody() {
   ].join("");
 }
 
-test("Grok 4.6 OAuth annotates native custom apply_patch and leaves history, collisions, and other models alone", async () => {
+test("Grok structured-patch opt-out retains native guidance, history and collisions", async () => {
   const guided = await scenario(true, {
     model: "grok-oauth/grok-4.6",
+    routerEnv: { CODEX_ROUTER_GROK_STRUCTURED_PATCH: "0" },
     requestPayload: grokApplyPatchPayload,
     sseBody: grokApplyPatchSseBody,
   });
@@ -2987,11 +2988,11 @@ function structuredPatchSse(body) {
   ].join("");
 }
 
-test("Grok structured patch opt-in crosses the real Router with collision, choice and historical identity intact", async () => {
+test("Grok structured patch default crosses the real Router with collision, choice and historical identity intact", async () => {
   for (const stream of [true, false]) {
     const result = await scenario(stream, {
       model: "grok-oauth/grok-4.6",
-      routerEnv: { CODEX_ROUTER_GROK_STRUCTURED_PATCH: "1" },
+      routerEnv: { CODEX_ROUTER_GROK_STRUCTURED_PATCH: "" },
       requestPayload: (stream, model) => ({ ...grokApplyPatchPayload(stream, model), tool_choice: { type: "custom", name: "apply_patch" } }),
       sseBody: structuredPatchSse,
       jsonBody: (body) => ({ id: "response_structured", output: [structuredPatchCall(body)] }),
