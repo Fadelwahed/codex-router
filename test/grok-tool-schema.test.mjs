@@ -5,6 +5,40 @@ import { CODEX_APP_TOOLS } from "../src/codex-app-tools.mjs";
 
 const branch = (mode, extra = {}) => ({ type: "object", properties: { mode: { const: mode }, id: { type: "string" }, ...extra }, required: ["mode", "id"], additionalProperties: false });
 
+test("literal normalization precedes every root-union preservation or expansion decision", () => {
+  const malformed = branch("update", { id: { type: "string", enum: [true], const: false } });
+  const normalized = branch("update", { id: { type: "string" } });
+  const cases = [
+    [malformed, normalized],
+    [{ oneOf: [malformed] }, { oneOf: [normalized] }],
+    [{ anyOf: [malformed], $anchor: "keep" }, { anyOf: [normalized], $anchor: "keep" }],
+    [{ allOf: [malformed] }, { allOf: [normalized] }],
+    [{ $schema: "https://example.test/dialect", oneOf: [malformed] },
+      { $schema: "https://example.test/dialect", oneOf: [normalized] }],
+    [{ $ref: "#/$defs/update", oneOf: [malformed], $defs: { update: malformed } },
+      { $ref: "#/$defs/update", oneOf: [normalized], $defs: { update: normalized } }],
+    [{ oneOf: [branch("view"), { oneOf: [{ $ref: "#/$defs/update" }] }], $defs: { update: malformed } },
+      { oneOf: [branch("view"), normalized], $defs: { update: normalized } }],
+  ];
+  for (const [schema, expected] of cases) {
+    const before = structuredClone(schema);
+    const adapted = grokToolSchema(schema);
+    assert.deepEqual(adapted, expected);
+    assert.deepEqual(schema, before, "normalization never mutates client input");
+    assert.equal(grokToolSchema(adapted), adapted, "normalized output is stable");
+  }
+});
+
+test("invalid discriminator literals cannot prove exclusivity before normalization", () => {
+  const invalid = branch(true);
+  invalid.properties.mode.type = "string";
+  const schema = { oneOf: [branch("view"), { oneOf: [invalid, branch("update")] }] };
+  const adapted = grokToolSchema(schema);
+  assert.equal(adapted.oneOf.length, 2, "removed discriminator leaves exclusivity unproven");
+  assert.deepEqual(adapted.oneOf[1].oneOf[0].properties.mode, { type: "string" });
+  assert.equal(schema.oneOf[1].oneOf[0].properties.mode.const, true);
+});
+
 test("Grok keeps every automation operation and its original required fields", () => {
   const schema = CODEX_APP_TOOLS.find((tool) => tool.name === "codex_app").tools.find((tool) => tool.name === "automation_update").inputSchema;
   const original = JSON.stringify(schema);

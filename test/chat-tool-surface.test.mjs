@@ -1014,3 +1014,24 @@ test("Grok schema adapter survives deferred plain and namespace registrations re
     assert.deepEqual(tool.parameters.oneOf, [schema.oneOf[0], ...schema.oneOf[1].oneOf]);
   }
 });
+
+test("Grok normalizes malformed literals in eager, discovered and deferred union tools", () => {
+  const schema = { $anchor: "preserve", oneOf: [{ type: "object", properties: {
+    id: { type: "string", enum: [true] },
+  }, required: ["id"] }] };
+  for (const mode of ["eager", "discovered", "deferred"]) {
+    const declaration = { type: "function", name: "fixture", parameters: schema,
+      ...(mode === "deferred" ? { defer_loading: true } : {}) };
+    const input = mode === "discovered" ? [
+      { type: "tool_search_call", call_id: "search", execution: "client", arguments: { query: "fixture" } },
+      { type: "tool_search_output", call_id: "search", status: "completed", execution: "client", tools: [declaration] },
+    ] : mode === "deferred" ? [{ type: "function_call", name: "fixture", call_id: "old", arguments: '{"id":"x"}' }] : [];
+    const surface = chatProviderToolSurface([clientToolSearch(), ...(mode === "discovered" ? [] : [declaration])],
+      "grok-oauth", { input, upstreamModel: "grok-4.7" });
+    const routed = flattenToolSearchHistory(input, surface.tools, surface.namespaces);
+    const tool = routed.tools.find(item => item.name === "fixture");
+    assert.equal(tool.parameters.$anchor, "preserve");
+    assert.deepEqual(tool.parameters.oneOf[0].properties.id, { type: "string" }, mode);
+  }
+  assert.deepEqual(schema.oneOf[0].properties.id.enum, [true]);
+});

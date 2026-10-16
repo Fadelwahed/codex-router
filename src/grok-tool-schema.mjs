@@ -1,4 +1,4 @@
-import { providerToolSchema } from "./tool-schema-root.mjs";
+import { normalizeSchemaLiterals, providerToolSchema } from "./tool-schema-root.mjs";
 
 const MAPS = ["$defs", "definitions", "properties", "patternProperties", "dependentSchemas", "dependencies"];
 const ARRAYS = ["anyOf", "oneOf", "allOf", "prefixItems"];
@@ -92,6 +92,9 @@ export { safeToExpand as canExpandGrokToolSchema, literalDomain as grokLiteralDo
 export function grokToolSchema(schema) {
   if (!object(schema)) return schema ?? { type: "object", properties: {} };
   if (!union(schema)) return providerToolSchema(schema);
+  // Preserve the provider boundary's literal repair even when the union must
+  // stay intact. Disjointness must be proved against these normalized domains.
+  schema = normalizeSchemaLiterals(schema);
   // const was introduced in Draft-06. Unknown dialects may assign different
   // meaning to the keywords used in the disjointness proof; do not guess.
   if (schema.$schema !== undefined && !/^https?:\/\/json-schema\.org\/(?:draft-0[67]\/schema|draft\/(?:2019-09|2020-12)\/schema)#?$/.test(schema.$schema)) return schema;

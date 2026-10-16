@@ -187,3 +187,32 @@ Source digests are represented as `{path, sha256}` entries because GitGuardian
 misidentified two OAuth-named digest-map entries as credentials. All prior digest
 values and measurements were preserved and compared after normalization. No
 security scan or detector was disabled.
+
+## Codex review follow-up
+
+The review of `151d3257` identified three issues addressed after the live
+acceptance campaign:
+
+- Root unions now receive the existing recursive malformed-literal normalization
+  before preservation, flattening or operation lowering. A removed invalid
+  discriminator cannot supply a false proof of exclusivity. Regression tests
+  cover preserved/ref-based unions and eager, discovered and deferred tools,
+  as well as the final strict provider boundary.
+- Initial/resumed campaign snapshots and the separate final-validation snapshot
+  now include `src/grok-tool-alternatives.mjs`. Historical snapshots were not
+  backfilled: the original campaign preceded that module; the later six-task
+  acceptance already recorded its digest through the follow-up harness.
+- Resume excludes unfinished runs from quality results and reserves their
+  unrecorded per-run allowance before new requests. Repeated resume cannot
+  charge that allowance twice. Ambiguous legacy reserve attribution is refused
+  before resumption rather than guessed.
+
+These fixes use offline regression and local protocol checks; no additional
+provider generations were used. The six-task live result remains evidence for
+the source recorded in its original artifact, not a new live measurement of the
+review fixes. The automation schema used by those tasks is unchanged by literal
+normalization.
+
+Review-fix verification: `npm run check` passed; full local suite **5,415 passed,
+0 failed, 39 skipped** (5,454 total); targeted schema/provider tests **210/210**,
+resume bookkeeping **10/10**, and local Router/LiteLLM protocol proof **24/24**.

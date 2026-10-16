@@ -2821,6 +2821,25 @@ test("Grok's final provider hop keeps complete union alternatives with strict ar
   assert.deepEqual(request.tools.map(tool => tool.parameters), [schema.oneOf[0], ...schema.oneOf[1].oneOf]);
 });
 
+test("strict provider tools normalize malformed literals in preserved and lowered alternatives", () => {
+  const branch = mode => ({ type: "object", properties: {
+    mode: { type: "string", const: mode }, id: { type: "string", enum: [true] },
+  }, required: ["mode", "id"], additionalProperties: false });
+  for (const preserved of [false, true]) {
+    const schema = { oneOf: [branch("view"), branch("update")], ...(preserved ? { $anchor: "keep" } : {}) };
+    const before = structuredClone(schema);
+    const request = toResponsesRequest({ model: "grok-4.7", messages: [], tools: [
+      { type: "function", function: { name: "fixture", parameters: schema } },
+    ] }, { hostedSearchEnabled: false });
+    assert.equal(request.tools.length, preserved ? 1 : 2);
+    assert.ok(request.tools.every(tool => tool.strict === true));
+    const alternatives = preserved ? request.tools[0].parameters.oneOf : request.tools.map(tool => tool.parameters);
+    assert.deepEqual(alternatives.map(item => item.properties.id), [{ type: "string" }, { type: "string" }]);
+    assert.deepEqual(alternatives.map(item => item.properties.mode.const), ["view", "update"]);
+    assert.deepEqual(schema, before);
+  }
+});
+
 test("reserved search unions are filtered and duplicate names settled before operation lowering", () => {
   const branch = mode => ({ type: "object", properties: { mode: { const: mode } }, required: ["mode"] });
   const tool = (name, modes) => ({ type: "function", function: {

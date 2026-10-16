@@ -22,6 +22,9 @@ import path from 'node:path';
 import { pathToFileURL, fileURLToPath } from 'node:url';
 import { Readable, Writable } from 'node:stream';
 import { pipeline } from 'node:stream/promises';
+import {
+  GROK_QUALITY_SOURCE_FILES, GROK_FINAL_VALIDATION_SOURCE_FILES, reconcileInterruptedQualityRuns,
+} from './grok-quality-resume.mjs';
 
 const BASELINE = '8c5c128867d3b9f1bd359b9e9491d94cd65b90e1';
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
@@ -101,13 +104,16 @@ async function main() {
   const previous = process.argv.includes('--resume') ? JSON.parse(readFileSync(outputPath,'utf8')) : undefined;
   const report = previous || { validationDependency: { name:'ajv', version:validatorVersion, dialect:'2020-12', optional:true }, nodeVersion:process.version, candidateSourceDiffSha256:hash(shellRun('git',['diff','--','src'],{cwd:ROOT}).stdout), baseline: BASELINE, candidateBase: shellRun('git',['rev-parse','HEAD'],{cwd:ROOT}).stdout.trim(), candidateSourceHashes: [], scope: 'Actual per-revision namespace bridge/edit facade and Grok OAuth forwarder, direct Chat adapter, stock client patch executor. LiteLLM and router HTTP listener are outside this experiment.', model: 'grok-4.7', effort: 'medium', serviceTier: 'default (omitted)', limits: LIMITS, startedAt: null, finishedAt: null, plannedRuns: LIMITS.taskRuns, runs: [], providerRequests: [], exclusions: [], limitations: ['Synthetic fixtures; not a general coding ranking.', 'Cached tokens are null when provider telemetry omits them.', 'Seeded invalid call is input setup and counted separately from generated invalid calls.', 'No personal prompts, credentials or raw reasoning are stored.','A client tool_search sentinel prevents bundled app expansion; fixture tools are eager and the search declaration is omitted upstream.'] };
   const snapshot=[];
-  for (const file of ['src/namespace-relay.mjs','src/grok-tool-facade.mjs','src/grok-structured-patch.mjs','src/grok-oauth-forwarder.mjs','src/grok-oauth-turn.mjs','src/tool-schema-root.mjs','src/chat-tool-surface.mjs','src/codex-app-tools.mjs','src/grok-tool-schema.mjs']) snapshot.push({path:file,sha256:hash(readFileSync(path.join(ROOT,file)))});
+  for (const file of GROK_QUALITY_SOURCE_FILES) snapshot.push({path:file,sha256:hash(readFileSync(path.join(ROOT,file)))});
   if(previous) { report.resumedAt=new Date().toISOString(); report.resumedCandidateSourceHashes=snapshot; } else report.candidateSourceHashes=snapshot;
-  let activeRun; let campaignStart; let providerCount = report.providerRequests.length+(report.unaccountedProviderRequestsUpperBound||0);
+  const reconciled = reconcileInterruptedQualityRuns(report, LIMITS);
+  const save = () => writeFileSync(outputPath, JSON.stringify(report,null,2)+'\n');
+  // Checkpoint interrupted-run exclusions and reserves before any new call.
+  if (previous && !process.argv.includes('--prepare')) save();
+  let activeRun; let campaignStart; let providerCount = reconciled.providerBudgetUsedUpperBound;
   const campaignAbort=new AbortController();
   for(const signal of ['SIGTERM','SIGINT']) process.once(signal,()=>campaignAbort.abort());
   const children = []; const arms = {}; const internalKey = randomUUID();
-  const save = () => writeFileSync(outputPath, JSON.stringify(report,null,2)+'\n');
   const proxy = http.createServer(async (request,response) => {
     if (!activeRun || providerCount >= LIMITS.providerGenerations || activeRun.providerRequests >= LIMITS.generationsPerRun || Date.now()-campaignStart >= LIMITS.campaignMs) { response.writeHead(429); response.end('{"error":"experiment_generation_limit"}'); return; }
     const run = activeRun; providerCount++; run.providerRequests++;
@@ -253,7 +259,7 @@ async function validateFinal() {
   if(!process.argv.includes('--live')||!process.argv.includes('--yes')) throw new Error('--validate-final requires --live --yes and separate approval for up to 6 provider generations.');
   const outputPath=path.join(ROOT,'docs/grok-final-validation.json');
   const report={scope:'Three isolated candidate post-tool final responses; no client tool execution, production listeners, or configuration changes.',model:'grok-4.7',effort:'medium',limits:{taskRuns:3,providerGenerations:6,requestMs:90000,campaignMs:300000},startedAt:new Date().toISOString(),sourceHashes:[],runs:[],providerRequests:[]};
-  for(const file of ['src/grok-oauth-forwarder.mjs','src/grok-oauth-turn.mjs','src/grok-tool-schema.mjs'])report.sourceHashes.push({path:file,sha256:hash(readFileSync(path.join(ROOT,file)))});
+  for(const file of GROK_FINAL_VALIDATION_SOURCE_FILES)report.sourceHashes.push({path:file,sha256:hash(readFileSync(path.join(ROOT,file)))});
   const save=()=>writeFileSync(outputPath,JSON.stringify(report,null,2)+'\n');
   const started=Date.now();const key=randomUUID();let activeRun;let child;const abortAll=new AbortController();
   for(const signal of ['SIGINT','SIGTERM'])process.once(signal,()=>abortAll.abort());
