@@ -38,6 +38,7 @@ let terminalDelayMs = 0;
 let emptyReplies = 0;
 let provider = "grok-oauth";
 let upstreamRequests = 0;
+let compaction = false;
 const automationSchema = CODEX_APP_TOOLS.find(tool => tool.name === "codex_app")
   .tools.find(tool => tool.name === "automation_update").inputSchema;
 const upstream = http.createServer(async (req, res) => {
@@ -91,6 +92,8 @@ const upstream = http.createServer(async (req, res) => {
     event({ type: "response.function_call_arguments.delta", output_index: 0, item_id: item.id, delta: item.arguments });
     event({ type: "response.output_item.done", output_index: 0, item });
     output = [item];
+  } else if (compaction) {
+    event({ type: "response.output_text.delta", delta: "Synthetic compaction summary." });
   } else {
     for (const delta of pieces) event({ type: "response.output_text.delta", delta });
   }
@@ -114,8 +117,9 @@ const forwarder = spawn(process.execPath, [path.join(root, "src/grok-oauth-forwa
     GROK_AUTH_PATH: authPath, GROK_CLI: writeGrokVersionCli(temp), CODEX_ROUTER_GROK_REASONING_CARRY: "1", MODEL_ROUTER_QUIET: "1" },
   stdio: ["ignore", "ignore", "pipe"],
 });
+const maxLogBytes = 64 * 1024;
 let errors = "";
-forwarder.stderr.on("data", chunk => { errors = (errors + chunk).slice(-8000); });
+forwarder.stderr.on("data", chunk => { errors = (errors + chunk).slice(-maxLogBytes); });
 
 const gatewayPort = await openPort();
 const apiPort = await openPort();
@@ -146,7 +150,7 @@ const processErrors = new Map();
 function start(executable, args, env) {
   const child = spawn(executable, args, { cwd: temp, env: { ...process.env, ...env }, stdio: ["ignore", "ignore", "pipe"] });
   processErrors.set(child, "");
-  child.stderr.on("data", c => processErrors.set(child, (processErrors.get(child) + c).slice(-8000)));
+  child.stderr.on("data", c => processErrors.set(child, (processErrors.get(child) + c).slice(-maxLogBytes)));
   return child;
 }
 let gateway, router, apiForwarder;
@@ -301,6 +305,64 @@ async function run(model, tier, streaming, reasoning, reasoningForm = "responses
   }
   console.log(JSON.stringify({ provider, model, requested: tier, actual: want ?? "missing", streaming, reasoning: reasoning ?? "omitted", reasoningForm, terminalDelayMs, postTool, aggregateUsage, repair, contextEstimate, upstreamRequests: repair ? 2 : 1, textPieces: 1000, textPreserved: true }));
 }
+
+async function runCompaction(v2, stream, effortFields) {
+  const requestsBefore = upstreamRequests;
+  const usageBefore = usageRecords().length;
+  const requestBody = { model: "grok-oauth/grok-4.7", stream, service_tier: "priority", ...effortFields,
+    tools: [{ type: "function", name: "write_stdin", parameters: { type: "object", properties: { session_id: { type: "integer" } } } }],
+    input: [{ type: "message", role: "user", content: "synthetic compact fixture" },
+      ...(v2 ? [{ type: "compaction_trigger" }] : [])],
+  };
+  const reply = await fetch(`${callerBaseUrl(routerPort, key)}/responses${v2 ? "" : "/compact"}`, {
+    method: "POST", headers: { "Content-Type": "application/json" }, signal: AbortSignal.timeout(60000),
+    body: JSON.stringify(requestBody),
+  });
+  const body = await reply.text();
+  assert.equal(reply.status, 200, body);
+  if (stream) {
+    const events = body.split("\n").filter(s => s.startsWith("data: {")).map(s => JSON.parse(s.slice(6)));
+    const terminal = events.find(event => event.type === "response.completed")?.response;
+    assert.equal(terminal?.output[0]?.type, "compaction", body);
+  } else assert.ok(JSON.parse(body).output.length > 0, "client receives a usable checkpoint");
+  assert.equal(upstreamRequests - requestsBefore, 1, "compaction uses one summary generation");
+  const effort = effortFields.reasoning?.effort ?? effortFields.reasoning_effort;
+  assert.deepEqual(requested.reasoning, effort ? { effort } : undefined, "compaction effort crosses the locked bridge");
+  assert.deepEqual(requested.include, effort ? ["reasoning.encrypted_content"] : undefined);
+  assert.equal(requested.tools, undefined, "compaction cannot execute client or hosted tools");
+  assert.equal(requested.tool_choice, undefined, "xAI does not accept none with an empty tool list");
+  const deadline = Date.now() + 2000;
+  let row, routerTiming, forwardTiming;
+  do {
+    if (usageRecords().length > usageBefore) row = usageRecords().at(-1);
+    routerTiming = row && timingRecords(router).find(timing => timing.requestId === row.requestId);
+    forwardTiming = row && timingRecords(forwarder).find(timing => timing.requestId === row.requestId);
+    if (routerTiming && forwardTiming) break;
+    await new Promise(resolve => setTimeout(resolve, 20));
+  } while (Date.now() < deadline);
+  assert.ok(routerTiming && forwardTiming, "compaction has one correlation ID across all three processes");
+  assert.equal(row.requestKind, "compaction");
+  assert.equal(row.generationOutcome, "completed");
+  assert.equal(row.httpStatus, 200);
+  assert.equal(row.providerToolCount, 0);
+  assert.equal(routerTiming.requestKind, "compaction");
+  assert.equal(routerTiming.requestedReasoningEffort, effort ?? null);
+  assert.equal(forwardTiming.forwardedReasoningEffort, effort ?? null);
+  assert.ok(routerTiming.preparedMs >= routerTiming.parsedMs);
+  assert.ok(routerTiming.firstGatewayDispatchMs >= routerTiming.preparedMs);
+  assert.ok(routerTiming.firstGatewayHeadersMs >= routerTiming.firstGatewayDispatchMs);
+  assert.ok(routerTiming.terminalMs >= routerTiming.firstGatewayHeadersMs);
+  assert.equal(routerTiming.terminal, "completed");
+  assert.equal(routerTiming.toolSurfaces.client.known.write_stdin.count, 1);
+  assert.equal(routerTiming.toolSurfaces.gateway.count, 0);
+  assert.equal(forwardTiming.toolSurfaces.gateway.count, 0);
+  assert.equal(forwardTiming.toolSurfaces.upstream.count, 0);
+  assert.equal(forwardTiming.attempts.length, 1);
+  assert.equal(forwardTiming.attempts[0].terminal, "completed");
+  assert.doesNotMatch(JSON.stringify({ row, routerTiming, forwardTiming }), /synthetic compact fixture|Synthetic compaction summary/);
+  console.log(JSON.stringify({ compaction: v2 ? "v2" : "v1", stream, effort: effort ?? "omitted",
+    correlated: true, measuredStages: true, upstreamRequests: 1 }));
+}
 try {
   // Exercise the cross-process read boundary before the Router starts.
   const ledgerFixture = path.join(temp, "usage-events.jsonl");
@@ -396,6 +458,15 @@ try {
   }
   repair = false;
   terminalDelayMs = 0;
+  postTool = false;
+  aggregateUsage = false;
+  compaction = true;
+  for (const effortFields of [{ reasoning: { effort: "medium", summary: "detailed" } }, { reasoning_effort: "high" }, {}]) {
+    await runCompaction(false, false, effortFields);
+    await runCompaction(true, false, effortFields);
+    await runCompaction(true, true, effortFields);
+  }
+  compaction = false;
   provider = "grok-api";
   postTool = false;
   aggregateUsage = false;

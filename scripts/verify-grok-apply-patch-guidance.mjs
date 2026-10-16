@@ -33,6 +33,10 @@ if (cancellationBoundaryControl && !nativeHook) {
 }
 const codexBinary = process.argv.find((arg) => arg.startsWith("--codex="))?.slice("--codex=".length);
 if (codexBinary && !structured) throw new Error("--codex requires --structured or --native-hook");
+const nativeExec = process.argv.includes("--native-exec");
+if (nativeExec && (!codexBinary || !structured || nativeHook || process.argv.some((arg) => arg.startsWith("--native-fault=")))) {
+  throw new Error("--native-exec requires --structured --codex and no native hook/fault mode");
+}
 const nativeFault = process.argv.find((arg) => arg.startsWith("--native-fault="))?.slice("--native-fault=".length);
 if (nativeFault && (!codexBinary || !["disconnect", "duplicate-close", "invalid-arguments"].includes(nativeFault))) {
   throw new Error("--native-fault=disconnect|duplicate-close|invalid-arguments requires --codex");
@@ -303,6 +307,58 @@ function mockFunctionCall(callId, argumentsText, name = APPLY_PATCH_TOOL_NAME, i
   ]);
 }
 
+function mockNativeExec(body, response) {
+  const probe = nativeRecoveryProbe;
+  probe.requests += 1;
+  assert.ok(probe.requests <= 3, "native exec/poll must finish in three model requests without retries");
+  for (const [name, properties, required] of [
+    ["exec_command", ["cmd", "workdir", "shell", "login", "tty", "yield_time_ms", "max_output_tokens", "sandbox_permissions", "justification", "prefix_rule"], "cmd"],
+    ["write_stdin", ["session_id", "chars", "yield_time_ms", "max_output_tokens"], "session_id"],
+  ]) {
+    const tool = body.tools?.find((item) => item.type === "function" && item.name === name);
+    assert.ok(tool, `native ${name} must reach xAI on every request`);
+    assert.equal(tool.parameters?.type, "object");
+    for (const property of properties) assert.ok(tool.parameters.properties?.[property], `${name}.${property} schema must survive the full bridge`);
+    assert.ok(tool.parameters.required?.includes(required), `${name} must retain its required ${required}`);
+  }
+  if (probe.requests === 1) {
+    const args = { cmd: "node -e \"setTimeout(() => { console.log('OFFLINE_SESSION_COMPLETE'); process.exit(7); }, 3000)\"", tty: true, yield_time_ms: 1, max_output_tokens: 1000 };
+    probe.execArguments = JSON.stringify(args);
+    response.writeHead(200, { "Content-Type": "text/event-stream" });
+    response.end(mockFunctionCall("call_exec_session", probe.execArguments, "exec_command"));
+    return;
+  }
+  const callId = probe.requests === 2 ? "call_exec_session" : "call_poll_session";
+  const history = body.input?.find((item) => item.type === "function_call" && item.call_id === callId);
+  const feedback = body.input?.find((item) => item.type === "function_call_output" && item.call_id === callId);
+  assert.ok(feedback, `native feedback must retain ${callId}`);
+  assert.equal(history?.name, probe.requests === 2 ? "exec_command" : "write_stdin");
+  assert.deepEqual(JSON.parse(history.arguments), JSON.parse(probe.requests === 2 ? probe.execArguments : probe.pollArguments), "executed arguments must survive native history replay");
+  if (probe.requests === 2) {
+    const session = String(feedback.output).match(/Process running with session ID (\d+)/);
+    assert.ok(session, "native exec must yield an actual running process session");
+    probe.sessionId = Number(session[1]);
+    assert.ok(Number.isSafeInteger(probe.sessionId));
+    probe.pollArguments = JSON.stringify({ session_id: probe.sessionId, chars: "", yield_time_ms: 10_000, max_output_tokens: 1000 });
+    response.writeHead(200, { "Content-Type": "text/event-stream" });
+    response.end(mockFunctionCall("call_poll_session", probe.pollArguments, "write_stdin"));
+    return;
+  }
+  assert.match(String(feedback.output), /Process exited with code 7|Exit code: 7/, "native poll must preserve the real nonzero exit code");
+  assert.match(String(feedback.output), /OFFLINE_SESSION_COMPLETE/, "native poll must preserve process output");
+  probe.completed = true;
+  const text = "offline process session verified";
+  const item = { type: "message", id: "msg_exec_final", role: "assistant", status: "completed", content: [{ type: "output_text", text, annotations: [] }] };
+  response.writeHead(200, { "Content-Type": "text/event-stream" });
+  response.end(sse([
+    { type: "response.created", response: { id: "resp_exec_final", status: "in_progress", output: [] } },
+    { type: "response.output_item.added", output_index: 0, item },
+    { type: "response.output_text.delta", item_id: item.id, output_index: 0, content_index: 0, delta: text },
+    { type: "response.output_item.done", output_index: 0, item },
+    { type: "response.completed", response: { id: "resp_exec_final", status: "completed", output: [item], usage: { input_tokens: 12, output_tokens: 9 } } },
+  ]));
+}
+
 // Discovery and exact-command trust use the official app-server API. Only the
 // disposable CODEX_HOME is changed; the caller's real trust/config is untouched.
 async function prepareTrustedNativeHook(codexHome, fixtureDir) {
@@ -402,6 +458,10 @@ async function handleMockRequest(request, response) {
     authorizationPresent: Boolean(request.headers.authorization),
     body,
   });
+  if (nativeExec && nativeRecoveryProbe) {
+    mockNativeExec(body, response);
+    return;
+  }
   const structuredTool = body.tools?.find((tool) => tool.parameters?.properties?.operations);
   const toolName = structured ? structuredTool?.name : APPLY_PATCH_TOOL_NAME;
   if (nativeRecoveryProbe) {
@@ -909,7 +969,9 @@ cancellation_boundary_callback = CustomLogger()
     const template = nativeModels.find((model) => model.apply_patch_tool_type === "freeform");
     assert.ok(template, "bundled metadata must provide the native freeform patch tool");
     const catalogPath = path.join(workspace, "probe-catalog.json");
-    writeFileSync(catalogPath, JSON.stringify({ models: [routedModel(template, MODEL_BY_SLUG.get("grok-oauth/grok-4.6"))] }));
+    const probeModel = routedModel(template, MODEL_BY_SLUG.get("grok-oauth/grok-4.6"));
+    assert.equal(Object.hasOwn(probeModel, "tool_mode"), false, "native probe must use routed catalog capabilities");
+    writeFileSync(catalogPath, JSON.stringify({ models: [probeModel] }));
     nativeRecoveryProbe = { requests: 0, contextFailure: false, successFeedback: false, invalidArgumentFeedback: false,
       ...(nativeHook ? { expectedHistory: new Map(), fixturePath: path.join(fixtureDir, "fixture.txt"),
         ...(outsideCanaryDirectory ? { targetPath: path.join(outsideCanaryDirectory, "fixture.txt") } : {}),
@@ -930,7 +992,9 @@ cancellation_boundary_callback = CustomLogger()
     ]) args.push("-c", setting);
     if (nativeHook && !hookEndpoint) args.push("-c", `model_providers.local-protocol.http_headers={${JSON.stringify(GROK_PATCH_HOOK_HEADER)}=${JSON.stringify(GROK_PATCH_HOOK_CAPABILITY)}}`);
     if (hookEndpoint) args.push("-c", 'model_provider="openai"', "-c", `openai_base_url=${JSON.stringify(clientBaseUrl(routerPort))}`);
-    args.push("Offline tool protocol test. Only fixture.txt in this temporary workspace may be edited. Process the supplied tool calls and finish.");
+    args.push(nativeExec
+      ? "Offline native exec/poll protocol test. Run the supplied temporary process, poll its returned session, preserve its output and exit status, then finish."
+      : "Offline tool protocol test. Only fixture.txt in this temporary workspace may be edited. Process the supplied tool calls and finish.");
     const client = spawnChild(codexBinary, args, nativeProbeEnvironment(codexHome), { cwd: fixtureDir, inheritEnvironment: false });
     let timedOut = false;
     const timer = setTimeout(() => {
@@ -950,7 +1014,13 @@ cancellation_boundary_callback = CustomLogger()
       process.stderr.write(`offline probe state: ${JSON.stringify(nativeRecoveryProbe)}\n`);
       process.stderr.write(`Router: ${routerChild.testOutput()}\nForwarder: ${grokChild.testOutput()}\nLiteLLM: ${litellmChild.testOutput()}\n`);
     }
-    if (singleNativeControl) {
+    if (nativeExec) {
+      assert.equal(exit, 0, client.testOutput());
+      assert.equal(nativeRecoveryProbe.requests, 3);
+      assert.equal(nativeRecoveryProbe.completed, true);
+      assert.equal(readFileSync(path.join(fixtureDir, "fixture.txt"), "utf8"), "old\n");
+      process.stdout.write("ok real Codex native exec_command yielded a session; write_stdin preserved output and exit code 7 through Router, locked LiteLLM, Grok forwarder, and mock xAI in three model requests (no live provider requests)\n");
+    } else if (singleNativeControl) {
       assert.equal(exit, 0, client.testOutput());
       assert.equal(nativeRecoveryProbe.requests, 2);
       assert.equal(nativeRecoveryProbe.controlFeedback, true);

@@ -687,7 +687,7 @@ test("toResponsesRequest leaves view_image unchanged for other Grok models", () 
   );
 });
 
-test("toResponsesRequest always includes hosted search tools when enabled", () => {
+test("toResponsesRequest includes hosted search tools when enabled and not forbidden", () => {
   const request = toResponsesRequest({
     model: "grok-4.5",
     messages: [{ role: "user", content: "latest from X?" }],
@@ -698,6 +698,18 @@ test("toResponsesRequest always includes hosted search tools when enabled", () =
   assert.equal(request.tools.some((tool) => tool.type === "x_search"), true);
   assert.equal(request.tools.some((tool) => tool.type === "web_search"), true);
   assert.equal(request.tools.some((tool) => tool.name === "bash"), true);
+});
+
+test("explicit none forbids client and hosted tools without sending an empty-tool choice to xAI", () => {
+  for (const tool_choice of ["none", { type: "none" }]) {
+    for (const tools of [[], [{ type: "function", function: { name: "write_stdin", parameters: { type: "object" } } }]]) {
+      const request = toResponsesRequest({ model: "grok-4.7", messages: [{ role: "user", content: "summarize" }], tool_choice, tools });
+      assert.equal(request.tools, undefined);
+      assert.equal(request.tool_choice, undefined);
+    }
+  }
+  const ordinary = toResponsesRequest({ model: "grok-4.7", messages: [], tools: [] });
+  assert.deepEqual(ordinary.tools, [{ type: "web_search" }, { type: "x_search" }], "omitted choice keeps ordinary ambient search");
 });
 
 test("toResponsesRequest omits hosted search tools when disabled", () => {
@@ -1684,7 +1696,7 @@ test("an unsuccessful post-tool first turn emits one error without leaking or re
                 { role: "assistant", tool_calls: [{ id: "c1", type: "function", function: { name: "exec_command", arguments: "{}" } }] },
                 { role: "tool", tool_call_id: "c1", content: "rendered page" },
               ],
-              tools: [{ type: "function", function: { name: "exec_command", parameters: { type: "object" } } }],
+              tools: [{ type: "function", function: { name: "exec_command", description: "private-tool-description", parameters: { type: "object" } } }],
               stream,
             }),
           });
@@ -1697,7 +1709,8 @@ test("an unsuccessful post-tool first turn emits one error without leaking or re
           assert.equal(timing.attempts.length, 1);
           assert.equal(timing.attempts[0].terminal, terminal === "missing" ? undefined : terminal);
           assert.equal(timing.firstActionMs, undefined, "uncertified tool remains withheld");
-          assert.doesNotMatch(JSON.stringify(timing), /rendered page|exec_command/);
+          assert.equal(timing.toolSurfaces.upstream.known.exec_command.count, 1);
+          assert.doesNotMatch(JSON.stringify(timing), /rendered page|private-tool-description/);
           assert.doesNotMatch(body, /"finish_reason":"(?:stop|tool_calls)"|\[DONE\]/);
           if (stream) {
             assert.equal(resp.status, 200);
@@ -2785,8 +2798,13 @@ test("post-tool completion decides in one generation, preserves choices and reje
             assert.equal(sent.input.length, 6, "continuation must preserve every call and result");
           }
           if (spec.choice !== undefined) {
-            assert.equal(sent.tools.some((tool) => tool.name?.startsWith(finalBase)), false);
-            assert.deepEqual(sent.tool_choice, typeof spec.choice === "object" ? { type: "function", name: "exec_command" } : spec.choice);
+            if (spec.choice === "none") {
+              assert.equal(sent.tools, undefined, "none also removes ambient hosted search");
+              assert.equal(sent.tool_choice, undefined, "xAI empty-tool requests omit the choice");
+            } else {
+              assert.equal(sent.tools.some((tool) => tool.name?.startsWith(finalBase)), false);
+              assert.deepEqual(sent.tool_choice, typeof spec.choice === "object" ? { type: "function", name: "exec_command" } : spec.choice);
+            }
             assert.match(body, /Caller choice preserved/);
           } else {
             const privateName = spec.collision ? `${finalBase}_2` : finalBase;

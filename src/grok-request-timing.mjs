@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { grokToolDiagnostics } from "./grok-tool-diagnostics.mjs";
 
 export const GROK_TIMING_HEADER = "x-codex-router-request-id";
 const requestIds = new WeakMap();
@@ -69,6 +70,14 @@ export function createGrokRequestTiming({ layer, requestId, now = () => performa
   const mark = marker(row);
   return {
     mark,
+    kind(value) {
+      if (!finished && ["generation", "compaction"].includes(value)) row.requestKind = value;
+    },
+    tools(stage, tools) {
+      if (!finished && ["client", "gateway", "upstream"].includes(stage)) {
+        (row.toolSurfaces ??= {})[stage] = grokToolDiagnostics(tools);
+      }
+    },
     identify(model, requested, forwarded) {
       if (finished) return;
       // Only catalogue-shaped Grok model names, never arbitrary caller text.

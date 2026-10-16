@@ -59,9 +59,18 @@ test("router observes first egress events once and ignores events after terminal
 test("diagnostics admit only bounded schema fields and owned correlation headers", () => {
   const { timing: t, rows } = fixture();
   t.identify("private path/token", { effort: "secret" }, "private"); t.mark("private");
+  t.kind("private"); t.tools("private", [{ type: "function", name: "private" }]);
+  t.kind("compaction");
+  t.tools("gateway", [{ type: "function", name: "write_stdin", description: "private", parameters: {
+    type: "object", properties: { session_id: { type: "integer" }, secret: { const: "private" } },
+  } }]);
   for (let i = 0; i < 20; i++) t.attempt("private value").headers(999);
   t.finish("private outcome", 999);
+  t.kind("generation"); t.tools("upstream", []);
   assert.equal(rows[0].attempts.length, 8);
+  assert.equal(rows[0].requestKind, "compaction");
+  assert.deepEqual(Object.keys(rows[0].toolSurfaces), ["gateway"]);
+  assert.deepEqual(rows[0].toolSurfaces.gateway.known.write_stdin.declarations[0].parameters, ["session_id"]);
   assert.equal(rows[0].model, undefined);
   assert.equal(rows[0].requestedReasoningEffort, null);
   assert.doesNotMatch(JSON.stringify(rows), /private|secret/);

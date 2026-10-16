@@ -11,6 +11,16 @@ omitted effort stays omitted; Router does not invent a default here. Existing
 model-specific aliases and xhigh support remain unchanged. API-key Grok and
 other providers retain their existing reasoning paths.
 
+Ordinary turns and both remote compaction forms now use the same final bridge
+adaptation. Previously the compaction branch bypassed it: explicit reasoning
+could disappear and the forwarder generated a different correlation ID.
+An omitted compaction effort still stays omitted. The summarizer also sends
+the standard `tool_choice: none` prohibition. The forwarder consumes it by
+removing client and hosted tools, then omits the choice on the tool-free xAI
+request. An empty client tool list alone did not prevent the forwarder from
+adding `web_search` and `x_search`. Ordinary requests without an explicit
+prohibition retain their existing hosted search capability.
+
 ## Reading stage timings
 
 `[grok-timing]` JSON records in the service log join the Router and OAuth
@@ -25,7 +35,7 @@ correlation. Missing marks mean the stage was not observed, not zero latency.
 
 | Boundary | Marks and interpretation |
 | --- | --- |
-| Router preparation | `preparedMs`: routing and request adaptation completed |
+| Router preparation | `parsedMs`, `preparedMs`: body parsing, then routing and request adaptation completed |
 | Gateway | `firstGatewayDispatchMs` to `firstGatewayHeadersMs`: first gateway request to response headers |
 | Forwarder preparation | `parsedMs`, `preparedMs`: JSON parsing and upstream request adaptation |
 | Local concurrency queue | Per attempt: `dispatchMs - queuedMs` |
@@ -41,8 +51,15 @@ does not prove a successful model turn. Preparation-to-queue time can include
 authentication and CLI-version work; it is not reported as queue time. The
 Router records only the first gateway dispatch/headers; gateway retries can
 produce multiple forwarder records with the same correlation ID. These
-records are for ordinary Grok OAuth requests, not a complete compaction or
-cross-provider failover trace.
+records cover ordinary Grok OAuth requests and compaction. Router timing and
+usage records label these as `requestKind: generation` or `compaction`.
+Compaction records preparation, dispatch, gateway headers and the client-facing
+terminal; forwarder records locate the work within the summary generation.
+A locally skipped compaction has a completed checkpoint but no dispatch or
+provider-header marks. Cancellation does not fabricate a semantic terminal.
+Usage records preserve `httpStatus` separately from `generationOutcome`, so
+a streamed error carried by HTTP 200 is still a failed compaction. These
+records are not a complete cross-provider failover trace.
 
 Diagnostics are bounded and contain no prompts, tool arguments/results,
 reasoning text, credentials, URLs, or arbitrary error messages. They remain
@@ -50,6 +67,34 @@ available in quiet mode. Requested and forwarded effort are recorded
 separately; aliases may legitimately differ. Unknown/absent effort is `null`.
 These timings locate delay at observable boundaries; they do not measure
 provider-internal compute time or establish a speed improvement by themselves.
+
+## Checking tool delivery
+
+The same records contain bounded `toolSurfaces` inventories: Router `client`
+and `gateway`, then forwarder `gateway` and `upstream`. `count` counts all
+leaf declarations, including hosted tools. `known` only admits a fixed set of
+execution and editing names: `exec_command`, `write_stdin`, `shell_command`,
+`apply_patch`, `replace_lines`, `search_replace`, `write`, and
+`run_terminal_command`. For these, it records declaration count, function/custom
+type, explicit function/namespace deferral, schema SHA-256 and a fixed allowlist of parameter
+names. It never logs arbitrary tool names, descriptions, schemas or arguments.
+At most four declarations per known name are retained, even for duplicates.
+The forwarder snapshot describes the initial prepared request, not a separate
+inventory for every repair attempt.
+
+Join records by request ID to locate where a known tool disappeared or its
+schema changed. Namespace flattening, custom-patch conversion and provider
+schema adaptation can legitimately change a hash; a changed hash alone is not
+evidence of corruption. During compaction, client tools may be present at
+ingress while both provider-facing inventories are intentionally empty.
+
+The real Codex executable was also driven through the locked bridge with a
+local synthetic provider. Native `exec_command` produced an actual running
+session, `write_stdin` read its output and nonzero exit status, and the editing
+probe recovered from a missing patch context and changed the fixture. This
+proves the core tool protocol, not that a live model will select the right tool
+or that a desktop chat has the same additional MCP registrations. Runtime
+inventories make the latter observable without recording private schemas.
 
 ## Verification
 
@@ -59,5 +104,22 @@ the real forwarder, and a synthetic loopback provider. It covers all advertised
 OAuth efforts with and without summaries, scalar effort, HTTP streaming,
 HTTP JSON, WebSocket, post-tool completion and repair. Delayed-terminal cases
 verify that upstream tool readiness and action release are measured separately.
-Focused tests additionally cover child overrides, failed/incomplete/missing
-terminals, cancellation, timing bounds and log privacy. No live quota is used.
+It also covers nine compaction cases: V1 JSON and V2 JSON/SSE, each with object,
+scalar or omitted reasoning, no tool dispatch, and correlated stage/usage
+records. There are 135 scenarios in total. Focused HTTP tests cover failed,
+canceled and locally skipped compaction; unit tests cover child overrides,
+failed/incomplete/missing terminals, timing bounds and log privacy.
+
+Repeat the real-client execution and editing checks with an installed Codex
+binary (the client's own workspace sandbox remains enabled):
+
+```sh
+node scripts/verify-grok-apply-patch-guidance.mjs .venv/bin/python --structured --native-exec --codex=/absolute/path/to/codex
+node scripts/verify-grok-apply-patch-guidance.mjs .venv/bin/python --structured --codex=/absolute/path/to/codex
+```
+
+These checks use a disposable client home, isolated Router/gateway and fake
+provider credentials. No live quota is used. A sandbox wrapping the whole
+test must permit the nested client's workspace writes; a denial by that outer
+sandbox is not a provider editing failure. No latency or live model-quality
+improvement is inferred from these deterministic checks.

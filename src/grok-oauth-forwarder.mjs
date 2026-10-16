@@ -336,7 +336,12 @@ function normalizeToolOutputForGrok(content) {
   return hasImage ? parts : JSON.stringify(content ?? "");
 }
 
+function toolsForbidden(chat) {
+  return chat.tool_choice === "none" || chat.tool_choice?.type === "none";
+}
+
 function grokClientTools(chat, viewImageAlias) {
+  if (toolsForbidden(chat)) return [];
   const tools = Array.isArray(chat.tools)
     ? chat.tools
         .filter((tool) => tool?.type === "function" && tool.function?.name)
@@ -415,7 +420,7 @@ export function toResponsesRequest(chat, options = {}) {
   const effort = mapEffort(chat.reasoning_effort, chat.model);
   if (effort) request.reasoning = { effort };
   if (effort && options.recallReasoning) request.include = ["reasoning.encrypted_content"];
-  const tools = mergeHostedSearchTools(alternatives.tools, {
+  const tools = toolsForbidden(chat) ? [] : mergeHostedSearchTools(alternatives.tools, {
     enabled: options.hostedSearchEnabled !== false,
   });
   if (tools.length) {
@@ -623,6 +628,8 @@ async function handleChatCompletions(request, response) {
   });
   const responsesRequest = toResponsesRequest(firstChat, { hostedSearchEnabled, recallReasoning, toolAlternatives });
   timing.identify(model, chat.reasoning_effort, responsesRequest.reasoning?.effort);
+  timing.tools("gateway", chat.tools);
+  timing.tools("upstream", responsesRequest.tools);
   timing.mark("preparedMs");
   let contextRequest = responsesRequest;
   if (carryCounts.misses && !QUIET) {

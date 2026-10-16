@@ -192,6 +192,7 @@ export function recordUsageEvent({
   // Router-generated correlation id. Matches /activity's `requestId`. Optional so
   // historical rows keep their exact shape.
   requestId,
+  requestKind,
   // Grok OAuth 4.6 ingress UTF-8 JSON byte split. Optional, bounded, and never
   // a token estimate. Missing payload fields measure as zero.
   contextBytes,
@@ -203,6 +204,7 @@ export function recordUsageEvent({
 }) {
   const diagnostics = usageDiagnosticMetadata({
     requestId,
+    requestKind,
     contextBytes,
     grokStructuredPatch,
     reasoningEffort,
@@ -544,6 +546,7 @@ export function recentUsageEvents({
         const searchResults = safeTokenCount(event.searchResults);
         const diagnostics = usageDiagnosticMetadata({
           requestId: event.requestId,
+          requestKind: event.requestKind,
           contextBytes: event.contextBytes,
           grokStructuredPatch: event.grokStructuredPatch,
           reasoningEffort: event.reasoningEffort,
