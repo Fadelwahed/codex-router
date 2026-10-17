@@ -814,7 +814,7 @@ test("a fresh routed turn keeps every app connector eager by default", () => {
     JSON.stringify(routed.tools).length,
     JSON.stringify(optedOut.tools).length,
   );
-  assert.equal(routed.tools.length, 576);
+  assert.equal(routed.tools.length, 558);
   assert.deepEqual(
     eagerConnectorNamespaces(routed.tools),
     REAL_TURN_NAMESPACES.map(([name]) => name).filter((name) =>
@@ -832,14 +832,11 @@ test("the connector allow-list value none withholds every connector", () => {
   );
   const eagerBytes = JSON.stringify(eager.tools).length;
   const routedBytes = JSON.stringify(routed.tools).length;
-  // This deterministic fixture expands to 576 tools and over 900 KiB.
-  assert.equal(eager.tools.length, 576);
+  // This deterministic fixture expands to 558 tools and over 900 KiB.
+  assert.equal(eager.tools.length, 558);
   assert.ok(eagerBytes > 900 * 1024, `${eagerBytes} bytes eager`);
-  // What is left is the client's non-connector namespaces plus the app
-  // snapshot the router injects itself (~53 KB of the total, half of it the
-  // `inputSchema` copy `flattenNamespaceChild` keeps beside `parameters`).
-  // Both are required eager, so the floor sits above the 100 KB the connector
-  // removal alone would suggest.
+  // The remaining surface is exactly the client's non-connector tools;
+  // modern MCP app registration must not acquire a second legacy snapshot.
   assert.ok(routedBytes < 128 * 1024, `${routedBytes} bytes routed`);
   assert.ok(routedBytes * 8 < eagerBytes, `${routedBytes} of ${eagerBytes} bytes`);
   const names = routed.tools.map((tool) => tool.name);
@@ -854,7 +851,7 @@ test("the connector allow-list value none withholds every connector", () => {
   assert.ok(names.includes("mcp__node_repl__node_repl_op_0"));
   assert.ok(names.includes("image_gen__image_gen_op_0"));
   assert.ok(names.includes("mcp__openai_artifact_template_picker__openai_artifact_template_picker_op_0"));
-  assert.ok(names.includes("codex_app__automation_update"));
+  assert.ok(!names.some(name => name?.startsWith("codex_app__")));
   assert.ok(names.includes("core_op_0"));
   assert.ok(routed.tools.some((tool) => tool?.type === "custom"));
   assert.ok(routed.tools.some((tool) => tool?.type === "web_search"));
@@ -881,9 +878,8 @@ test("the connector allow-list value all restores the whole eager surface", () =
     chatProviderToolSurface(realTurnSurface(), "opencode-go"),
   );
   const declared = REAL_TURN_NAMESPACES.reduce((total, [, children]) => total + children, 0);
-  // 11 functions + custom + web_search + every namespace child + the injected
-  // codex_app (17) and plugin_management (1) app definitions.
-  assert.equal(eager.tools.length, declared + 13 + 18);
+  // 11 functions + custom + web_search + every caller-owned namespace child.
+  assert.equal(eager.tools.length, declared + 13);
   for (const [namespace, children] of REAL_TURN_NAMESPACES) {
     assert.equal(
       eager.tools.filter((tool) => tool.name?.startsWith(`${namespace}__`)).length,
@@ -1034,4 +1030,25 @@ test("Grok normalizes malformed literals in eager, discovered and deferred union
     assert.deepEqual(tool.parameters.oneOf[0].properties.id, { type: "string" }, mode);
   }
   assert.deepEqual(schema.oneOf[0].properties.id.enum, [true]);
+});
+
+
+test("current MCP app tools stay caller-owned without a native search control", () => {
+  const tools = [{ type: "namespace", name: "mcp__codex_app", defer_loading: true, tools: [
+    { type: "function", name: "list_projects", parameters: { type: "object", properties: {} } },
+    { type: "function", name: "create_thread", parameters: {
+      type: "object", properties: { prompt: { type: "string" } }, required: ["prompt"],
+    } },
+  ] }];
+  for (const provider of ["grok-oauth", "groq", "deepseek"]) {
+    const surface = chatProviderToolSurface(tools, provider);
+    assert.deepEqual(surface.tools.map(tool => tool.name),
+      ["mcp__codex_app__list_projects", "mcp__codex_app__create_thread"]);
+    assert.deepEqual(surface.tools[1].parameters.required, ["prompt"]);
+    const restored = rewriteNamespaceResponsePayload({ output: [{ type: "function_call",
+      call_id: "call_app", name: "mcp__codex_app__create_thread", arguments: '{"prompt":"fixture"}',
+    }] }, buildNamespaceLookups(surface.namespaces));
+    assert.equal(restored.output[0].name, "create_thread");
+    assert.equal(restored.output[0].namespace, "mcp__codex_app");
+  }
 });

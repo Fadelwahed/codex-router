@@ -60,6 +60,10 @@ test("diagnostics admit only bounded schema fields and owned correlation headers
   const { timing: t, rows } = fixture();
   t.identify("private path/token", { effort: "secret" }, "private"); t.mark("private");
   t.kind("private"); t.tools("private", [{ type: "function", name: "private" }]);
+  t.parallelTools("private", false);
+  t.parallelTools("client", "secret");
+  t.parallelTools("gateway", false);
+  t.parallelTools("upstream", true);
   t.kind("compaction");
   t.tools("gateway", [{ type: "function", name: "write_stdin", description: "private", parameters: {
     type: "object", properties: { session_id: { type: "integer" }, secret: { const: "private" } },
@@ -67,6 +71,8 @@ test("diagnostics admit only bounded schema fields and owned correlation headers
   for (let i = 0; i < 20; i++) t.attempt("private value").headers(999);
   t.finish("private outcome", 999);
   t.kind("generation"); t.tools("upstream", []);
+  t.parallelTools("gateway", true);
+  assert.deepEqual(rows[0].parallelToolCalls, { client: null, gateway: false, upstream: true });
   assert.equal(rows[0].attempts.length, 8);
   assert.equal(rows[0].requestKind, "compaction");
   assert.deepEqual(Object.keys(rows[0].toolSurfaces), ["gateway"]);
@@ -82,4 +88,16 @@ test("diagnostics admit only bounded schema fields and owned correlation headers
   const rejected = {};
   setGrokTimingRequestId(rejected, "secret");
   assert.equal(grokTimingHeaders(rejected, undefined), undefined);
+});
+
+
+test("native client search records tool readiness after namespace restoration", () => {
+  const { timing: t, rows, at } = fixture("router");
+  at(3); t.event({ type: "response.output_item.added", item: { type: "tool_search_call" } });
+  at(5); t.event({ type: "response.output_item.done", item: { type: "tool_search_call" } });
+  at(6); t.event({ type: "response.completed", response: { status: "completed" } });
+  t.finish("response_finished", 200);
+  assert.equal(rows[0].firstToolMs, 3);
+  assert.equal(rows[0].firstToolReadyMs, 5);
+  assert.equal(rows[0].terminal, "completed");
 });

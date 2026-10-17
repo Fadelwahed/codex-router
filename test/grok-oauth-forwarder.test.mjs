@@ -26,6 +26,14 @@ import {
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const INTERNAL_KEY = "test-grok-internal-service-key-with-sufficient-length";
 
+test("Grok preserves explicit parallel tool-call policy and upstream defaults", () => {
+  const chat = { model: "grok-4.7", messages: [] };
+  for (const parallel_tool_calls of [false, true]) {
+    assert.equal(toResponsesRequest({ ...chat, parallel_tool_calls }).parallel_tool_calls, parallel_tool_calls);
+  }
+  assert.equal(Object.hasOwn(toResponsesRequest(chat), "parallel_tool_calls"), false);
+});
+
 test("Grok preserves caller output budgets and sampling parameters", () => {
   const chat = { model: "grok-4.7", messages: [] };
   assert.equal(toResponsesRequest({ ...chat, max_tokens: 256 }).max_output_tokens, 256);
@@ -2979,13 +2987,13 @@ test("post-tool optional final respects the provider tool capacity on initial an
     await waitHealth(base, child);
     for (const [model, maxTools] of [["grok-4.7", 348], ["fixture-no-hosted-search", 350]]) {
       assert.equal(hostedSearchEnabledFor(model), maxTools === 348);
-      for (const count of [maxTools - 1, maxTools]) {
+      for (const [count, parallelPolicy] of [[maxTools - 1, false], [maxTools, true], [maxTools, undefined]]) {
         const before = captured.length;
         const tools = Array.from({ length: count }, (_, index) => ({ type: "function", function: {
           name: `fixture_${index}`, parameters: { type: "object", properties: {} },
         } }));
         const result = await fetch(`${base}/v1/chat/completions`, {
-          method: "POST", headers: auth, body: JSON.stringify({ model, tools, messages: [
+          method: "POST", headers: auth, body: JSON.stringify({ model, tools, ...(parallelPolicy === undefined ? {} : { parallel_tool_calls: parallelPolicy }), messages: [
             { role: "user", content: "Complete the synthetic task." },
             { role: "assistant", tool_calls: [{ id: "fixture_call", type: "function", function: { name: "fixture_0", arguments: "{}" } }] },
             { role: "tool", tool_call_id: "fixture_call", content: "done" },
@@ -2994,6 +3002,8 @@ test("post-tool optional final respects the provider tool capacity on initial an
         assert.equal(result.status, 200, await result.text());
         assert.equal(captured.length - before, 2);
         for (const request of captured.slice(before)) {
+          assert.equal(request.parallel_tool_calls, parallelPolicy);
+          assert.equal(Object.hasOwn(request, "parallel_tool_calls"), parallelPolicy !== undefined);
           const finalOffered = count < maxTools;
           assert.equal(request.tools.length, 350);
           assert.equal(request.tools.some(tool => tool.name?.startsWith("__codex_router_submit_final")), finalOffered);

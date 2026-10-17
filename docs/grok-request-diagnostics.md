@@ -75,9 +75,14 @@ and `gateway`, then forwarder `gateway` and `upstream`. `count` counts all
 leaf declarations, including hosted tools. `known` only admits a fixed set of
 execution and editing names: `exec_command`, `write_stdin`, `shell_command`,
 `apply_patch`, `replace_lines`, `search_replace`, `write`, and
-`run_terminal_command`. For these, it records declaration count, function/custom
-type, explicit function/namespace deferral, schema SHA-256 and a fixed allowlist of parameter
-names. It never logs arbitrary tool names, descriptions, schemas or arguments.
+`run_terminal_command`, `exec`, and `tool_search`. It also recognizes only
+`list_projects`, `create_thread`, and `automation_update` in the exact
+`codex_app` and `mcp__codex_app` namespaces, retaining their distinct identities.
+For these, it records declaration count, declaration type, explicit
+function/namespace deferral, schema SHA-256 and a fixed allowlist of parameter
+names. Native search records its `client`/`server` execution kind; its Chat relay
+is a function declaration. An app definition may correctly be absent before
+search, then appear after a `tool_search_output` supplies it. It never logs arbitrary tool names, descriptions, schemas or arguments.
 At most four declarations per known name are retained, even for duplicates.
 The forwarder snapshot describes the initial prepared request, not a separate
 inventory for every repair attempt.
@@ -123,3 +128,49 @@ provider credentials. No live quota is used. A sandbox wrapping the whole
 test must permit the nested client's workspace writes; a denial by that outer
 sandbox is not a provider editing failure. No latency or live model-quality
 improvement is inferred from these deterministic checks.
+
+
+## Parallel calls and current app registrations
+
+`parallelToolCalls` records the incoming Router `client` value and the
+forwarder's `gateway`/`upstream` values as boolean or `null` (absent/invalid).
+The forwarder preserves explicit `parallel_tool_calls: false` and `true`;
+omission stays omitted. Previously this field was dropped when converting Chat
+back to xAI Responses, so a caller's explicit serialization request was lost.
+No calls are suppressed, reordered, or executed by the Router.
+
+The installed Codex 0.162.0-alpha.17.2 sent `true` even when the routed catalog
+contained `supports_parallel_tool_calls: false`. This is an observed client
+policy, not a reason to silently override an explicit caller request. The
+public Codex `build_prompt` also sets `parallel_tool_calls: true`
+([source](https://github.com/openai/codex/blob/main/codex-rs/core/src/session/turn.rs));
+that source alone does not prove the installed binary's implementation.
+The offline `--native-tool-policy` probe captures the actual ingress, asserts
+it survives every hop, and executes three dependent native patch edits on a
+temporary file. The synthetic provider selects one edit per turn: this proves
+feedback and final file integrity, **not** that Grok will choose sequential
+edits. Parallel whole-file shell read/modify/write operations can still race;
+the Router cannot determine their dependencies from arbitrary command text.
+
+A client declaring modern `mcp__codex_app` tools owns that app surface. The
+legacy `codex_app` snapshot is no longer appended alongside it when native
+search is absent. Older native app clients retain their compatibility path.
+This fixes a reproduced duplicate-registration defect. A separate full-chain
+regression found that a search-only response was restored to native
+`tool_search_call` before the empty-completion guard, which recognized only
+ordinary/custom tool calls and text. The guard withheld the search and retried
+the same generation without letting Codex return discovery results. It now
+recognizes the native search action, preserving the terminal and avoiding that
+retry. Search results by themselves and reasoning-only responses remain empty.
+Native search also records tool-ready timing after restoration.
+
+The local full-chain verifier exercises actual discovery, MCP dispatch and
+result replay with a fixture server. The feedback feature flag
+`tool_search=false` does not imply that the wire search control is absent.
+This reproduces and repairs a Router loop mechanism; the historical Air shell
+loop cannot be uniquely attributed to it without the original wire capture.
+
+```sh
+node scripts/verify-grok-apply-patch-guidance.mjs .venv/bin/python --structured --native-tool-policy --codex=/absolute/path/to/codex
+node scripts/verify-grok-app-tools.mjs .venv/bin/python --codex=/absolute/path/to/codex
+```

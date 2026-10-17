@@ -33,6 +33,10 @@ if (cancellationBoundaryControl && !nativeHook) {
 }
 const codexBinary = process.argv.find((arg) => arg.startsWith("--codex="))?.slice("--codex=".length);
 if (codexBinary && !structured) throw new Error("--codex requires --structured or --native-hook");
+const nativeToolPolicy = process.argv.includes("--native-tool-policy");
+if (nativeToolPolicy && (!codexBinary || !structured || nativeHook)) {
+  throw new Error("--native-tool-policy requires --structured --codex and no native hook");
+}
 const nativeExec = process.argv.includes("--native-exec");
 if (nativeExec && (!codexBinary || !structured || nativeHook || process.argv.some((arg) => arg.startsWith("--native-fault=")))) {
   throw new Error("--native-exec requires --structured --codex and no native hook/fault mode");
@@ -58,6 +62,7 @@ if (paddingOption !== undefined && (!nativeHook || !codexBinary || singleNativeC
 }
 const structuredOperations = { operations: [{ op: "add", path: 'café "quotes".txt', lines: ["hello “unicode”"] }] };
 let nativeRecoveryProbe;
+let nativeIngressServer;
 let hookRawWireArguments;
 const nativeInvalidArguments = ' { "operations" : [] } \n' + " ".repeat(errorPadding);
 const hookHeaders = nativeHook && !hookEndpoint ? { [GROK_PATCH_HOOK_HEADER]: GROK_PATCH_HOOK_CAPABILITY } : {};
@@ -307,6 +312,43 @@ function mockFunctionCall(callId, argumentsText, name = APPLY_PATCH_TOOL_NAME, i
   ]);
 }
 
+function mockNativeSerialEdits(body, response) {
+  const probe = nativeRecoveryProbe;
+  probe.requests += 1;
+  assert.ok(probe.requests <= 4, "dependent edits must complete in four model requests");
+  // Observe the installed client's actual wire policy rather than assuming
+  // its catalog capability field controls this request parameter.
+  assert.equal(typeof probe.ingressParallelPolicy, "boolean");
+  assert.equal(body.parallel_tool_calls, probe.ingressParallelPolicy, "native caller policy must survive every translation");
+  const expected = ["old\n", "one\n", "two\n", "three\n"];
+  assert.equal(readFileSync(probe.fixturePath, "utf8"), expected[probe.requests - 1]);
+  if (probe.requests > 1) {
+    const feedback = body.input?.find((item) => item.type === "function_call_output" && item.call_id === `call_serial_${probe.requests - 1}`);
+    assert.match(String(feedback?.output), /Success/, "each native edit must finish before the next request");
+  }
+  response.writeHead(200, { "Content-Type": "text/event-stream" });
+  if (probe.requests <= 3) {
+    const tool = body.tools?.find((item) => item.parameters?.properties?.operations);
+    assert.ok(tool, "native editing tool must reach xAI");
+    const argumentsText = JSON.stringify({ operations: [{ op: "update", path: "fixture.txt", hunks: [{ lines: [
+      { kind: "remove", text: expected[probe.requests - 1].trim() },
+      { kind: "add", text: expected[probe.requests].trim() },
+    ] }] }] });
+    response.end(mockFunctionCall(`call_serial_${probe.requests}`, argumentsText, tool.name));
+  } else {
+    probe.completed = true;
+    const text = "offline serial edits verified";
+    const item = { type: "message", id: "msg_serial_final", role: "assistant", status: "completed", content: [{ type: "output_text", text, annotations: [] }] };
+    response.end(sse([
+      { type: "response.created", response: { id: "resp_serial_done", status: "in_progress", output: [] } },
+      { type: "response.output_item.added", output_index: 0, item },
+      { type: "response.output_text.delta", item_id: item.id, output_index: 0, content_index: 0, delta: text },
+      { type: "response.output_item.done", output_index: 0, item },
+      { type: "response.completed", response: { id: "resp_serial_done", status: "completed", output: [item], usage: { input_tokens: 12, output_tokens: 9 } } },
+    ]));
+  }
+}
+
 function mockNativeExec(body, response) {
   const probe = nativeRecoveryProbe;
   probe.requests += 1;
@@ -445,7 +487,7 @@ async function prepareTrustedNativeHook(codexHome, fixtureDir) {
 let mockFailure;
 const mockXai = http.createServer((request, response) => {
   handleMockRequest(request, response).catch((error) => {
-    mockFailure = error;
+    mockFailure ||= error;
     if (!response.headersSent) response.writeHead(500);
     response.end("Offline fixture assertion failed");
   });
@@ -458,6 +500,10 @@ async function handleMockRequest(request, response) {
     authorizationPresent: Boolean(request.headers.authorization),
     body,
   });
+  if (nativeToolPolicy && nativeRecoveryProbe) {
+    mockNativeSerialEdits(body, response);
+    return;
+  }
   if (nativeExec && nativeRecoveryProbe) {
     mockNativeExec(body, response);
     return;
@@ -766,10 +812,11 @@ cancellation_boundary_callback = CustomLogger()
   }
 
   const unicodeBody = await postTurn(
-    applyPatchRequest({ historyInput: HISTORY_PATCH, historyId: "ctc_history" }),
+    { ...applyPatchRequest({ historyInput: HISTORY_PATCH, historyId: "ctc_history" }), parallel_tool_calls: false },
   );
   assert.equal(capturedGrok.length, 1);
   const grokRequest = capturedGrok[0].body;
+  assert.equal(grokRequest.parallel_tool_calls, false, "explicit no-parallel policy must survive Router and locked LiteLLM");
   const grokTools = grokRequest.tools || [];
   const grokApply = grokTools.filter((tool) => structured
     ? tool.parameters?.properties?.operations
@@ -970,20 +1017,40 @@ cancellation_boundary_callback = CustomLogger()
     assert.ok(template, "bundled metadata must provide the native freeform patch tool");
     const catalogPath = path.join(workspace, "probe-catalog.json");
     const probeModel = routedModel(template, MODEL_BY_SLUG.get("grok-oauth/grok-4.6"));
+    assert.equal(probeModel.supports_parallel_tool_calls, false);
     assert.equal(Object.hasOwn(probeModel, "tool_mode"), false, "native probe must use routed catalog capabilities");
     writeFileSync(catalogPath, JSON.stringify({ models: [probeModel] }));
     nativeRecoveryProbe = { requests: 0, contextFailure: false, successFeedback: false, invalidArgumentFeedback: false,
-      ...(nativeHook ? { expectedHistory: new Map(), fixturePath: path.join(fixtureDir, "fixture.txt"),
+      ...(nativeHook || nativeToolPolicy ? { expectedHistory: new Map(), fixturePath: path.join(fixtureDir, "fixture.txt"),
         ...(outsideCanaryDirectory ? { targetPath: path.join(outsideCanaryDirectory, "fixture.txt") } : {}),
       } : {}),
     };
+    let nativeClientBaseUrl = clientBaseUrl(routerPort);
+    if (nativeToolPolicy) {
+      nativeIngressServer = http.createServer(async (request, response) => {
+        const chunks = [];
+        for await (const chunk of request) chunks.push(chunk);
+        const raw = Buffer.concat(chunks);
+        const body = JSON.parse(raw.toString("utf8"));
+        nativeRecoveryProbe.ingressParallelPolicy = body.parallel_tool_calls;
+        const upstream = http.request({ hostname: "127.0.0.1", port: routerPort, path: request.url, method: request.method,
+          headers: { ...request.headers, host: `127.0.0.1:${routerPort}` } }, (incoming) => {
+          response.writeHead(incoming.statusCode, incoming.headers);
+          incoming.pipe(response);
+        });
+        upstream.on("error", (error) => response.destroy(error));
+        upstream.end(raw);
+      });
+      await new Promise((resolve) => nativeIngressServer.listen(0, "127.0.0.1", resolve));
+      nativeClientBaseUrl = clientBaseUrl(nativeIngressServer.address().port);
+    }
     if (nativeHook) await prepareTrustedNativeHook(codexHome, fixtureDir);
     const args = ["exec", "--ephemeral", ...(!nativeHook ? ["--ignore-user-config"] : []), "--skip-git-repo-check", "--sandbox", "workspace-write", "--color", "never", "--json", "--model", "grok-oauth/grok-4.6", "--cd", fixtureDir, "--disable", "plugins", "--disable", "remote_plugin"];
     for (const setting of [
       'model_provider="local-protocol"',
       `model_catalog_json=${JSON.stringify(catalogPath)}`,
       'model_providers.local-protocol.name="Offline structured patch proof"',
-      `model_providers.local-protocol.base_url=${JSON.stringify(clientBaseUrl(routerPort))}`,
+      `model_providers.local-protocol.base_url=${JSON.stringify(nativeClientBaseUrl)}`,
       'model_providers.local-protocol.wire_api="responses"',
       'model_providers.local-protocol.requires_openai_auth=false',
       'model_providers.local-protocol.supports_websockets=false',
@@ -991,7 +1058,7 @@ cancellation_boundary_callback = CustomLogger()
       'model_reasoning_effort="high"',
     ]) args.push("-c", setting);
     if (nativeHook && !hookEndpoint) args.push("-c", `model_providers.local-protocol.http_headers={${JSON.stringify(GROK_PATCH_HOOK_HEADER)}=${JSON.stringify(GROK_PATCH_HOOK_CAPABILITY)}}`);
-    if (hookEndpoint) args.push("-c", 'model_provider="openai"', "-c", `openai_base_url=${JSON.stringify(clientBaseUrl(routerPort))}`);
+    if (hookEndpoint) args.push("-c", 'model_provider="openai"', "-c", `openai_base_url=${JSON.stringify(nativeClientBaseUrl)}`);
     args.push(nativeExec
       ? "Offline native exec/poll protocol test. Run the supplied temporary process, poll its returned session, preserve its output and exit status, then finish."
       : "Offline tool protocol test. Only fixture.txt in this temporary workspace may be edited. Process the supplied tool calls and finish.");
@@ -1014,7 +1081,13 @@ cancellation_boundary_callback = CustomLogger()
       process.stderr.write(`offline probe state: ${JSON.stringify(nativeRecoveryProbe)}\n`);
       process.stderr.write(`Router: ${routerChild.testOutput()}\nForwarder: ${grokChild.testOutput()}\nLiteLLM: ${litellmChild.testOutput()}\n`);
     }
-    if (nativeExec) {
+    if (nativeToolPolicy) {
+      assert.equal(exit, 0, client.testOutput());
+      assert.equal(nativeRecoveryProbe.requests, 4);
+      assert.equal(nativeRecoveryProbe.completed, true);
+      assert.equal(readFileSync(path.join(fixtureDir, "fixture.txt"), "utf8"), "three\n");
+      process.stdout.write(`ok real Codex parallel_tool_calls=${nativeRecoveryProbe.ingressParallelPolicy} survived Router, locked LiteLLM and Grok forwarder; fixture-selected three dependent native edits completed across four model requests with final contents intact (no live requests; does not prove the model chooses serial edits)\n`);
+    } else if (nativeExec) {
       assert.equal(exit, 0, client.testOutput());
       assert.equal(nativeRecoveryProbe.requests, 3);
       assert.equal(nativeRecoveryProbe.completed, true);
@@ -1058,6 +1131,8 @@ cancellation_boundary_callback = CustomLogger()
   }
 } finally {
   await Promise.all(children.map((child) => stopChild(child)));
+  nativeIngressServer?.closeAllConnections();
+  if (nativeIngressServer?.listening) await new Promise((resolve) => nativeIngressServer.close(resolve));
   mockXai.closeAllConnections();
   if (mockXai.listening) await new Promise((resolve) => mockXai.close(resolve));
   rmSync(workspace, { recursive: true, force: true });

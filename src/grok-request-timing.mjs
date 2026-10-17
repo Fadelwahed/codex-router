@@ -41,7 +41,7 @@ function observeEvent(target, mark, event) {
     if (event.type === "response.output_text.delta") mark("firstTextMs");
     if (["response.function_call_arguments.delta", "response.custom_tool_call_input.delta"].includes(event.type)) mark("firstToolMs");
   }
-  if (["function_call", "custom_tool_call"].includes(event?.item?.type)) {
+  if (["function_call", "custom_tool_call", "tool_search_call"].includes(event?.item?.type)) {
     if (["response.output_item.added", "response.output_item.done"].includes(event.type)) mark("firstToolMs");
     if (event.type === "response.output_item.done") mark("firstToolReadyMs");
   }
@@ -76,6 +76,11 @@ export function createGrokRequestTiming({ layer, requestId, now = () => performa
     tools(stage, tools) {
       if (!finished && ["client", "gateway", "upstream"].includes(stage)) {
         (row.toolSurfaces ??= {})[stage] = grokToolDiagnostics(tools);
+      }
+    },
+    parallelTools(stage, value) {
+      if (!finished && ["client", "gateway", "upstream"].includes(stage)) {
+        (row.parallelToolCalls ??= {})[stage] = typeof value === "boolean" ? value : null;
       }
     },
     identify(model, requested, forwarded) {

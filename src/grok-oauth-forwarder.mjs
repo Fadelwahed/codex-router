@@ -406,6 +406,9 @@ export function toResponsesRequest(chat, options = {}) {
   // caller omits them. Preserve explicit caller values, including zero.
   const request = { model: chat.model, input, stream: true, store: false,
     temperature: chat.temperature ?? 0.7, top_p: chat.top_p ?? 0.95 };
+  // This is a caller capability contract: omission keeps xAI's default,
+  // whereas false limits the next response to a single tool call.
+  if (typeof chat.parallel_tool_calls === "boolean") request.parallel_tool_calls = chat.parallel_tool_calls;
   // Preserve the caller's output bound. xAI caps visible text, not reasoning or
   // function-call tokens: this is not a wall-clock or total-compute limit.
   // The modern field takes precedence; invalid values remain visible to
@@ -628,6 +631,8 @@ async function handleChatCompletions(request, response) {
   });
   const responsesRequest = toResponsesRequest(firstChat, { hostedSearchEnabled, recallReasoning, toolAlternatives });
   timing.identify(model, chat.reasoning_effort, responsesRequest.reasoning?.effort);
+  timing.parallelTools("gateway", chat.parallel_tool_calls);
+  timing.parallelTools("upstream", responsesRequest.parallel_tool_calls);
   timing.tools("gateway", chat.tools);
   timing.tools("upstream", responsesRequest.tools);
   timing.mark("preparedMs");

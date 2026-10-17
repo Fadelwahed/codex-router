@@ -4690,6 +4690,7 @@ async function handleResponses(request, response, requestUrl) {
       diagnostics.requestKind = compactV1 || compactV2 ? "compaction" : "generation";
       timing.kind(diagnostics.requestKind);
       timing.tools("client", payload.tools);
+      timing.parallelTools("client", payload.parallel_tool_calls);
     }
     const setRoutingDiagnostics = (built) => {
       timing.mark("preparedMs");

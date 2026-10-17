@@ -22,6 +22,12 @@ name: Grok apply_patch protocol
       - "scripts/grok-patch-hook.mjs"
       - "test/grok-patch-hook*.test.mjs"
       - "src/namespace-relay.mjs"
+      - "src/chat-tool-surface.mjs"
+      - "src/codex-app-tools.mjs"
+      - "src/grok-tool-diagnostics.mjs"
+      - "scripts/verify-grok-app-tools.mjs"
+      - "test/grok-app-tools-ci.test.mjs"
+      - "test/empty-completion-guard.test.mjs"
       - "src/grok-oauth-forwarder.mjs"
       - "src/grok-client-version.mjs"
       - "test/grok-version-fixture.mjs"
@@ -69,6 +75,12 @@ name: Grok apply_patch protocol
       - "scripts/grok-patch-hook.mjs"
       - "test/grok-patch-hook*.test.mjs"
       - "src/namespace-relay.mjs"
+      - "src/chat-tool-surface.mjs"
+      - "src/codex-app-tools.mjs"
+      - "src/grok-tool-diagnostics.mjs"
+      - "scripts/verify-grok-app-tools.mjs"
+      - "test/grok-app-tools-ci.test.mjs"
+      - "test/empty-completion-guard.test.mjs"
       - "src/grok-oauth-forwarder.mjs"
       - "src/grok-client-version.mjs"
       - "test/grok-version-fixture.mjs"
@@ -190,4 +202,5 @@ jobs:
           MODEL_ROUTER_TEST_LITELLM_PYTHON="$venv_python" node --test test/litellm-stream-cleanup.test.mjs
           node scripts/verify-grok-apply-patch-guidance.mjs "$venv_python" --native-hook --native-hook-endpoint --cancel-before-next-provider-read
           node scripts/verify-grok-service-tier.mjs "$venv_python"
+          node scripts/verify-grok-app-tools.mjs "$venv_python"
           MODEL_ROUTER_TEST_LITELLM_PYTHON="$venv_python" node --test --test-name-pattern="emits one terminal SSE error when the upstream stream fails mid-turn" test/grok-oauth-forwarder.test.mjs

@@ -58,3 +58,43 @@ test("diagnostics never reflect unknown names, namespaces, properties or schema 
   assert.doesNotMatch(JSON.stringify(result), new RegExp(secret));
   assert.deepEqual(result.known.write_stdin.declarations[0].parameters, ["session_id"]);
 });
+
+
+test("discovery and app diagnostics distinguish native, relay, current and legacy registrations", () => {
+  const app = { type: "function", name: "list_projects", parameters: { type: "object", properties: {} } };
+  const tools = [
+    { type: "tool_search", execution: "client", parameters: {
+      type: "object", properties: { query: { type: "string" }, limit: { type: "number" } },
+    } },
+    { type: "namespace", name: "mcp__codex_app", defer_loading: true, tools: [app] },
+    { type: "namespace", name: "codex_app", tools: [app] },
+  ];
+  const before = grokToolDiagnostics(tools);
+  assert.equal(before.known.tool_search.declarations[0].execution, "client");
+  assert.equal(before.known.mcp__codex_app__list_projects.declarations[0].deferred, true);
+  assert.equal(before.known.codex_app__list_projects.declarations[0].deferred, false);
+  const after = grokToolDiagnostics(chatProviderToolSurface(tools, "grok-oauth").tools);
+  assert.equal(after.known.tool_search.declarations[0].type, "function");
+  assert.equal(after.known.mcp__codex_app__list_projects, undefined);
+  assert.deepEqual(after.known.codex_app__list_projects, before.known.codex_app__list_projects);
+  const chat = grokToolDiagnostics([{ type: "function", function: {
+    ...app, name: "mcp__codex_app__list_projects",
+  } }]);
+  assert.equal(chat.known.mcp__codex_app__list_projects.declarations[0].schemaSha256,
+    before.known.mcp__codex_app__list_projects.declarations[0].schemaSha256);
+});
+
+test("app diagnostics do not log lookalikes or arbitrary search metadata", () => {
+  const secret = "DO_NOT_LOG_DISCOVERY_SECRET";
+  const tools = [
+    { type: "function", name: "create_thread" },
+    { type: "function", name: "mcp__codex_app__" + secret },
+    { type: "namespace", name: "mcp__codex_apps__private", tools: [{ type: "function", name: "create_thread" }] },
+    { type: "function", name: "mcp__codex_app__list_projects", namespace: secret },
+    { type: "namespace", name: "mcp__codex_app", tools: [{ type: "function", name: "create_thread", namespace: secret }] },
+    { type: "tool_search", execution: secret, description: secret },
+  ];
+  const result = grokToolDiagnostics(tools);
+  assert.deepEqual(Object.keys(result.known), ["tool_search"]);
+  assert.doesNotMatch(JSON.stringify(result), new RegExp(secret));
+});
