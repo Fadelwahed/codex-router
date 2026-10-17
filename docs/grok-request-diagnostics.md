@@ -139,18 +139,20 @@ omission stays omitted. Previously this field was dropped when converting Chat
 back to xAI Responses, so a caller's explicit serialization request was lost.
 No calls are suppressed, reordered, or executed by the Router.
 
-The installed Codex 0.162.0-alpha.17.2 sent `true` even when the routed catalog
-contained `supports_parallel_tool_calls: false`. This is an observed client
-policy, not a reason to silently override an explicit caller request. The
-public Codex `build_prompt` also sets `parallel_tool_calls: true`
-([source](https://github.com/openai/codex/blob/main/codex-rs/core/src/session/turn.rs));
-that source alone does not prove the installed binary's implementation.
-The offline `--native-tool-policy` probe captures the actual ingress, asserts
-it survives every hop, and executes three dependent native patch edits on a
-temporary file. The synthetic provider selects one edit per turn: this proves
-feedback and final file integrity, **not** that Grok will choose sequential
-edits. Parallel whole-file shell read/modify/write operations can still race;
-the Router cannot determine their dependencies from arbitrary command text.
+Current Codex deliberately removed the model-catalog parallel flag in
+[86b1123](https://github.com/openai/codex/commit/86b1123ff6b5d089a146be4e603a324cf454223a).
+The installed Codex 0.162.0-alpha.17.2 sends `true` even with the legacy catalog
+field set to `false`. Actual scheduling is a separate per-tool client policy.
+The offline `--native-tool-policy` probe captures ingress and checks that it
+survives every hop, then executes three fixture-selected dependent native
+patches. This proves feedback and final integrity, not Grok's choice of tools.
+
+The additional `--native-scheduler=read|race|patch` diagnostics exercise two
+simultaneous tool calls in the real client. They establish parallel reads,
+deterministically reproduce a lost update from shell read/modify/write, and
+show that conflicting native patches produce one success and one context
+conflict. See [the evidence and client-side correction boundary](codex-edit-concurrency.md).
+These diagnostics do not claim that Router fixes arbitrary shell races.
 
 A client declaring modern `mcp__codex_app` tools owns that app surface. The
 legacy `codex_app` snapshot is no longer appended alongside it when native

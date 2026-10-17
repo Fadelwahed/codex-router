@@ -37,6 +37,11 @@ const nativeToolPolicy = process.argv.includes("--native-tool-policy");
 if (nativeToolPolicy && (!codexBinary || !structured || nativeHook)) {
   throw new Error("--native-tool-policy requires --structured --codex and no native hook");
 }
+const nativeScheduler = process.argv.find((arg) => arg.startsWith("--native-scheduler="))?.slice("--native-scheduler=".length);
+if (nativeScheduler !== undefined && (!nativeToolPolicy || !["read", "race", "patch"].includes(nativeScheduler)
+  || process.argv.includes("--native-exec") || process.argv.some((arg) => arg.startsWith("--native-fault=")))) {
+  throw new Error("--native-scheduler=read|race|patch requires --native-tool-policy and no native exec/fault mode");
+}
 const nativeExec = process.argv.includes("--native-exec");
 if (nativeExec && (!codexBinary || !structured || nativeHook || process.argv.some((arg) => arg.startsWith("--native-fault=")))) {
   throw new Error("--native-exec requires --structured --codex and no native hook/fault mode");
@@ -312,6 +317,71 @@ function mockFunctionCall(callId, argumentsText, name = APPLY_PATCH_TOOL_NAME, i
   ]);
 }
 
+// Diagnostic for the installed client's scheduler, not a model-quality test.
+// The race case intentionally asserts the current failure. A future client fix
+// should make this diagnostic fail instead of silently preserving a stale claim.
+function mockNativeScheduler(body, response) {
+  const probe = nativeRecoveryProbe;
+  probe.requests += 1;
+  assert.ok(probe.requests <= 2, "two supplied actions must return without a hidden model retry");
+  assert.equal(probe.ingressParallelPolicy, true, "this diagnostic exercises the current native parallel policy");
+  assert.equal(body.parallel_tool_calls, probe.ingressParallelPolicy);
+  response.writeHead(200, { "Content-Type": "text/event-stream" });
+  if (probe.requests === 1) {
+    const tool = body.tools?.find((item) => nativeScheduler === "patch"
+      ? item.parameters?.properties?.operations : item.name === "exec_command");
+    assert.ok(tool, "the native tool must survive the complete Router path");
+    const events = [];
+    for (const [output_index, name] of ["A", "B"].entries()) {
+      const args = nativeScheduler === "patch"
+        ? { operations: [{ op: "update", path: "fixture.txt", hunks: [{ lines: [
+          { kind: "remove", text: "old" }, { kind: "add", text: name },
+        ] }] }] }
+        : { cmd: `node scheduler-fixture.cjs ${name} ${nativeScheduler}`, yield_time_ms: 10000, max_output_tokens: 1000 };
+      const callId = `call_scheduler_${name}`;
+      const item = { type: "function_call", id: `fc_${callId}`, call_id: callId, name: tool.name };
+      const argumentsText = JSON.stringify(args);
+      events.push(
+        { type: "response.output_item.added", output_index, item },
+        { type: "response.function_call_arguments.delta", output_index, item_id: item.id, delta: argumentsText },
+        { type: "response.output_item.done", output_index, item: { ...item, arguments: argumentsText } },
+      );
+    }
+    events.push({ type: "response.completed", response: { status: "completed", usage: { input_tokens: 12, output_tokens: 9 } } });
+    response.end(sse(events));
+    return;
+  }
+  const outputs = body.input?.filter((item) => item.type === "function_call_output" && ["call_scheduler_A", "call_scheduler_B"].includes(item.call_id));
+  assert.equal(outputs?.length, 2);
+  assert.equal(new Set(outputs.map((item) => item.call_id)).size, 2);
+  const fixture = readFileSync(probe.fixturePath, "utf8");
+  if (nativeScheduler === "patch") {
+    assert.ok(["A\n", "B\n"].includes(fixture), "either patch may win; dispatch is not guaranteed FIFO");
+    assert.equal(outputs.filter((item) => /Success/.test(String(item.output))).length, 1);
+    assert.equal(outputs.filter((item) => /Failed to find expected lines/.test(String(item.output))).length, 1);
+  } else {
+    for (const item of outputs) {
+      assert.match(String(item.output), /Process exited with code 0/);
+      assert.match(String(item.output), /BARRIER_PASSED/);
+    }
+    for (const name of ["A", "B"]) {
+      assert.equal(readFileSync(path.join(path.dirname(probe.fixturePath), `ready.${name}`), "utf8"), "old\n");
+    }
+    assert.equal(fixture, nativeScheduler === "race" ? "old\nB\n" : "old\n");
+  }
+  probe.completed = true;
+  process.stdout.write(`ok native scheduler ${nativeScheduler}: ${JSON.stringify({ parallelToolCalls: body.parallel_tool_calls, fixture, outputs })}\n`);
+  const text = "offline scheduler diagnostic complete";
+  const item = { type: "message", id: "msg_scheduler_final", role: "assistant", status: "completed", content: [{ type: "output_text", text, annotations: [] }] };
+  response.end(sse([
+    { type: "response.created", response: { id: "resp_scheduler_done", status: "in_progress", output: [] } },
+    { type: "response.output_item.added", output_index: 0, item },
+    { type: "response.output_text.delta", item_id: item.id, output_index: 0, content_index: 0, delta: text },
+    { type: "response.output_item.done", output_index: 0, item },
+    { type: "response.completed", response: { id: "resp_scheduler_done", status: "completed", output: [item], usage: { input_tokens: 12, output_tokens: 9 } } },
+  ]));
+}
+
 function mockNativeSerialEdits(body, response) {
   const probe = nativeRecoveryProbe;
   probe.requests += 1;
@@ -501,7 +571,8 @@ async function handleMockRequest(request, response) {
     body,
   });
   if (nativeToolPolicy && nativeRecoveryProbe) {
-    mockNativeSerialEdits(body, response);
+    if (nativeScheduler) mockNativeScheduler(body, response);
+    else mockNativeSerialEdits(body, response);
     return;
   }
   if (nativeExec && nativeRecoveryProbe) {
@@ -1005,6 +1076,31 @@ cancellation_boundary_callback = CustomLogger()
       outsideCanaryDirectory = mkdtempSync(path.join(nativeOutsideDir, "grok-hook-permission-"));
       writeFileSync(path.join(outsideCanaryDirectory, "fixture.txt"), "old\n", { mode: 0o600 });
     }
+    if (nativeScheduler && nativeScheduler !== "patch") {
+      // Each process reads before the barrier. B must overwrite after A in the
+      // race case, making lost-update evidence deterministic rather than timed.
+      // Markers are synchronization writes; the read case never edits fixture.txt.
+      writeFileSync(path.join(fixtureDir, "scheduler-fixture.cjs"), String.raw`
+const fs = require("node:fs");
+const [name, mode] = process.argv.slice(2);
+const deadline = Date.now() + 8000;
+const wait = (file) => {
+  while (!fs.existsSync(file)) {
+    if (Date.now() > deadline) { console.error("BARRIER_TIMEOUT:" + file); process.exit(11); }
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 20);
+  }
+};
+const original = fs.readFileSync("fixture.txt", "utf8");
+fs.writeFileSync("ready." + name, original);
+wait("ready." + (name === "A" ? "B" : "A"));
+if (mode === "race") {
+  if (name === "B") wait("done.A");
+  fs.writeFileSync("fixture.txt", original + name + "\n");
+}
+fs.writeFileSync("done." + name, original);
+console.log("BARRIER_PASSED:" + name);
+`);
+    }
     // Match the Router's catalog conversion. Unknown-model fallback metadata
     // does not advertise native apply_patch and cannot exercise this bridge.
     const bundled = spawnSync(codexBinary, ["debug", "models", "--bundled"], {
@@ -1083,10 +1179,11 @@ cancellation_boundary_callback = CustomLogger()
     }
     if (nativeToolPolicy) {
       assert.equal(exit, 0, client.testOutput());
-      assert.equal(nativeRecoveryProbe.requests, 4);
+      assert.equal(nativeRecoveryProbe.requests, nativeScheduler ? 2 : 4);
       assert.equal(nativeRecoveryProbe.completed, true);
-      assert.equal(readFileSync(path.join(fixtureDir, "fixture.txt"), "utf8"), "three\n");
-      process.stdout.write(`ok real Codex parallel_tool_calls=${nativeRecoveryProbe.ingressParallelPolicy} survived Router, locked LiteLLM and Grok forwarder; fixture-selected three dependent native edits completed across four model requests with final contents intact (no live requests; does not prove the model chooses serial edits)\n`);
+      if (!nativeScheduler) assert.equal(readFileSync(path.join(fixtureDir, "fixture.txt"), "utf8"), "three\n");
+      if (nativeScheduler) process.stdout.write(`ok native scheduler ${nativeScheduler} diagnostic completed in two requests with fake provider credentials\n`);
+      else process.stdout.write(`ok real Codex parallel_tool_calls=${nativeRecoveryProbe.ingressParallelPolicy} survived Router, locked LiteLLM and Grok forwarder; fixture-selected three dependent native edits completed across four model requests with final contents intact (no live requests; does not prove the model chooses serial edits)\n`);
     } else if (nativeExec) {
       assert.equal(exit, 0, client.testOutput());
       assert.equal(nativeRecoveryProbe.requests, 3);

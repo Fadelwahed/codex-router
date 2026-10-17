@@ -659,10 +659,10 @@ function normalizeNativeModel(model) {
       : NATIVE_PARALLEL_TOOL_CALL_COMPAT.get(String(model.slug)) ?? false;
   return {
     ...model,
-    // Recent Codex clients require this field on every catalog entry. An
-    // absent native declaration is not evidence that parallel calls work, so
-    // make the conservative answer explicit instead of leaving the catalog
-    // unparsable.
+    // Older Codex clients require this field on every catalog entry. Retain
+    // their conservative fallback for compatibility. Current clients removed
+    // this model field and choose execution concurrency per tool; this value
+    // cannot serialize shell writes (see docs/grok-request-diagnostics.md).
     supports_parallel_tool_calls: supportsParallelToolCalls,
     supports_reasoning_summaries:
       typeof model.supports_reasoning_summaries === "boolean"
@@ -751,9 +751,9 @@ export function routedModel(template, model, behaviorTemplate = template) {
     // absent declaration remains the conservative default.
     supports_search_tool: routedModelSearchAvailable(model),
     supports_image_detail_original: model.supportsImageDetailOriginal === true,
-    // A routed model must never inherit a native template's capability. Codex
-    // now requires the key, and `false` is both schema-valid and conservative
-    // until this exact provider/model route declares support.
+    // A routed model must never inherit a native template's capability.
+    // Older clients require this key; current clients ignore this legacy
+    // model field. It is not an execution lock or a file-safety guarantee.
     supports_parallel_tool_calls: model.supportsParallelToolCalls === true,
     use_responses_lite: false,
     // Codex only knows one ApplyPatchToolType variant. The native template
