@@ -120,6 +120,21 @@ async function waitFor(url, child, headers = {}) {
   throw new Error(`Timed out waiting for ${url}: ${child.testErrors()}`);
 }
 
+// HTTP completion and stderr delivery are independent cross-process events.
+// Wait for the full diagnostic record before teardown, especially on Windows
+// where SIGTERM can terminate the child before its asynchronous pipe is drained.
+async function waitForLog(child, pattern) {
+  const deadline = Date.now() + 5_000;
+  while (Date.now() < deadline) {
+    if (pattern.test(child.testErrors())) return;
+    if (child.exitCode !== null || child.signalCode !== null) {
+      throw new Error(`Child exited before log record: ${child.testErrors()}`);
+    }
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
+  throw new Error(`Timed out waiting for log record: ${child.testErrors()}`);
+}
+
 async function stopChild(child) {
   if (child.exitCode !== null || child.signalCode !== null) return;
   child.kill("SIGTERM");
@@ -902,6 +917,7 @@ async function scenario(
     prepareRouterEnv,
     visionJsonBody,
     expectedStatus = 200,
+    routerLogPattern,
   } = {},
 ) {
   const gatewayBodies = [];
@@ -960,6 +976,7 @@ async function scenario(
     });
     assert.equal(response.status, expectedStatus, `router status ${response.status}`);
     const clientBody = await response.text();
+    if (routerLogPattern) await waitForLog(router, routerLogPattern);
     return { gatewayBodies, gatewayHeaders, visionBodies, clientBody, router, status: response.status };
   } finally {
     await stopChild(router);
@@ -3439,6 +3456,7 @@ test("Console Go Muse Contributor routes carry Codex handoffs as user messages",
 test("Grok timing records a rejected streamed patch as failed despite committed HTTP 200", async () => {
   const result = await scenario(true, {
     model: "grok-oauth/grok-4.7",
+    routerLogPattern: /^\[grok-timing\] [^\r\n]+\r?\n/m,
     routerEnv: { CODEX_ROUTER_GROK_STRUCTURED_PATCH: "1", CODEX_ROUTER_GROK_PATCH_HOOK: "0" },
     requestPayload: (stream, model) => ({ model, stream, input: "Synthetic patch rejection.", tools: [{ type: "custom", name: "apply_patch" }] }),
     sseBody: (body) => {
@@ -3470,6 +3488,7 @@ test("Grok timing records a rejected streamed patch as failed despite committed 
 test("Grok timing waits for a successful handler outcome after the response finishes", async () => {
   const result = await scenario(false, {
     model: "grok-oauth/grok-4.7",
+    routerLogPattern: /^\[grok-timing\] [^\r\n]+\r?\n/m,
     requestPayload: (stream, model) => ({ model, stream, input: "Synthetic completed response.",
       client_metadata: { "x-codex-turn-metadata": JSON.stringify({ thread_source: "composer_predictions", prediction_source_thread_id: "private" }) },
     }),
