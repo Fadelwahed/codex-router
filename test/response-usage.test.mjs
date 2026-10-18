@@ -342,13 +342,14 @@ test("billed counts are added up like every other measurement", () => {
       billedOutputTokens: 270,
     },
   );
-  // Reported by one attempt and not the other, exactly like the cache count.
+  // A billed component overrides its own attempt; the other attempt still
+  // contributes its reported usage instead of becoming free.
   assert.deepEqual(
     mergeTokenUsage(
       { inputTokens: 10, outputTokens: 1, totalTokens: 11 },
       { inputTokens: 10, outputTokens: 1, totalTokens: 11, billedInputTokens: 25 },
     ),
-    { inputTokens: 20, outputTokens: 2, totalTokens: 22, billedInputTokens: 25 },
+    { inputTokens: 20, outputTokens: 2, totalTokens: 22, billedInputTokens: 35 },
   );
   // Reported by neither, the key stays absent rather than becoming a zero:
   // `billedInputTokens ?? inputTokens` has to fall through to the reported one.
@@ -358,11 +359,18 @@ test("billed counts are added up like every other measurement", () => {
   );
   assert.equal("billedInputTokens" in plain, false);
   assert.equal("billedOutputTokens" in plain, false);
-  // A measured zero survives.
+  // A measured zero overrides only its own attempt.
   assert.equal(
     mergeTokenUsage(
       { inputTokens: 1, outputTokens: 1, totalTokens: 2, billedOutputTokens: 0 },
       { inputTokens: 1, outputTokens: 1, totalTokens: 2 },
+    ).billedOutputTokens,
+    1,
+  );
+  assert.equal(
+    mergeTokenUsage(
+      { inputTokens: 1, outputTokens: 1, totalTokens: 2, billedOutputTokens: 0 },
+      { inputTokens: 1, outputTokens: 1, totalTokens: 2, billedOutputTokens: 0 },
     ).billedOutputTokens,
     0,
   );
@@ -747,6 +755,41 @@ test("observes a terminal SSE error without rewriting the stream", async () => {
   assert.equal(await passThrough(transform, body), body.join(""));
   assert.equal(transform.terminalErrorObserved(), true);
   assert.equal(transform.completedResponseObserved(), false);
+});
+
+test("generation outcome follows terminal semantics independently of HTTP", async () => {
+  for (const [event, expected] of [
+    [{ type: "response.failed", response: { status: "failed", usage: { input_tokens: 50, output_tokens: 2 } } }, "failed"],
+    [{ type: "response.incomplete", response: { status: "incomplete" } }, "incomplete"],
+    [{ type: "response.completed", response: { status: "failed" } }, "failed"],
+    [{ type: "response.completed", response: { status: "incomplete" } }, "incomplete"],
+    [{ type: "response.completed", response: { status: "cancelled" } }, "canceled"],
+    [{ type: "response.completed", response: { status: "completed" } }, "completed"],
+  ]) {
+    const body = `data: ${JSON.stringify(event)}\n\n`;
+    const transform = new ResponseUsageTransform("text/event-stream");
+    assert.equal(await passThrough(transform, [body]), body);
+    assert.equal(transform.generationOutcome(), expected);
+    assert.equal(transform.completedResponseObserved(), expected === "completed");
+    if (event.response?.usage) assert.equal(transform.tokenUsage().inputTokens, 50);
+  }
+});
+
+test("an EOF with output but no terminal is indeterminate; a later completion cannot erase failure", async () => {
+  const missingTerminal = new ResponseUsageTransform("text/event-stream");
+  await passThrough(missingTerminal, ['data: {"type":"response.output_text.delta","delta":"partial"}\n\n']);
+  assert.equal(missingTerminal.generationOutcome(), "indeterminate");
+  const failed = new ResponseUsageTransform("");
+  await passThrough(failed, ['data: {"type":"response.failed"}\n\n', 'data: {"type":"response.completed","response":{"status":"completed"}}\n\n']);
+  assert.equal(failed.generationOutcome(), "failed");
+  assert.equal(failed.completedResponseObserved(), false);
+});
+
+test("nonstreaming Responses terminal semantics are observed without rewriting", async () => {
+  const body = JSON.stringify({ object: "response", status: "incomplete", output: [], usage: { input_tokens: 4, output_tokens: 0 } });
+  const transform = new ResponseUsageTransform("application/json");
+  assert.equal(await passThrough(transform, [body]), body);
+  assert.equal(transform.generationOutcome(), "incomplete");
 });
 
 test("bytes the router is not rewriting survive rewrite mode exactly", async () => {

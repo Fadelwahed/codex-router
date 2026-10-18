@@ -1,6 +1,25 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
+test("semantic outcomes determine success while failed generation usage remains metered", () => {
+  const now = Date.now();
+  const events = ["completed", "failed", "incomplete", "canceled", "indeterminate"].map((generationOutcome) => ({
+    at: new Date(now).toISOString(), model: "custom/contract", provider: "custom",
+    meteringVersion: 1, status: 200, httpStatus: 200, generationOutcome,
+    inputTokens: 50, outputTokens: 2, totalTokens: 52,
+  }));
+  const result = aggregateProviderUsage(events, { now });
+  const custom = result.providers.find((provider) => provider.id === "custom");
+  assert.equal(custom.requests, 5);
+  assert.equal(custom.successfulRequests, 1);
+  assert.equal(custom.inputTokens, 250);
+  assert.equal(custom.outputTokens, 10);
+  assert.equal(custom.models[0].successfulRequests, 1);
+  assert.deepEqual(custom.outcomeCounts, { completed: 1, failed: 1, incomplete: 1, canceled: 1, indeterminate: 1 });
+  assert.equal(custom.legacyOutcomeRequests, 0);
+  assert.deepEqual(custom.models[0].outcomeCounts, custom.outcomeCounts);
+});
+
 import { aggregateProviderUsage, tokensGeneratedAfterFirstToken } from "../src/provider-usage.mjs";
 import { mergeTokenUsage } from "../src/response-usage.mjs";
 
@@ -330,6 +349,41 @@ test("a retried turn's billed spend survives the merge into one row", () => {
   assert.equal(grok.inputTokens, 301_000);
   assert.equal(grok.outputTokens, 270);
   assert.equal(grok.totalTokens, 301_270);
+});
+
+test("merging mixed billed and raw attempts preserves their separately aggregated spend", () => {
+  const now = Date.parse("2026-10-14T12:00:00Z");
+  const base = {
+    meteringVersion: 1,
+    at: "2026-10-14T11:00:00Z",
+    provider: "grok-oauth",
+    model: "grok-oauth/grok-4.6",
+    status: 200,
+  };
+  const raw = { inputTokens: 100, outputTokens: 20, totalTokens: 120 };
+  const cases = [
+    [{ ...raw, billedInputTokens: 250 }, raw],
+    [raw, { ...raw, billedOutputTokens: 45 }],
+    [{ ...raw, billedInputTokens: 0, billedOutputTokens: 0 }, raw],
+    [{ ...raw, billedInputTokens: 250 }, { ...raw, billedOutputTokens: 45 }],
+    [{ ...raw, billedInputTokens: 250, billedOutputTokens: 45 }, { ...raw, billedInputTokens: 250, billedOutputTokens: 45 }],
+    [raw, raw],
+    [raw, { ...raw, billedInputTokens: 250, billedOutputTokens: 45 }, raw],
+  ];
+  const totals = (usage) => ({ inputTokens: usage.inputTokens, outputTokens: usage.outputTokens, totalTokens: usage.totalTokens });
+  const aggregate = (attempts) => aggregateProviderUsage(attempts.map((usage) => ({ ...base, ...usage })), { now })
+    .providers.find((provider) => provider.id === base.provider);
+  for (const [index, attempts] of cases.entries()) {
+    const separately = aggregate(attempts);
+    for (const ordered of [attempts, [...attempts].reverse()]) {
+      const merged = aggregate([ordered.reduce((usage, attempt) => mergeTokenUsage(usage, attempt))]);
+      assert.deepEqual(totals(merged), totals(separately), `provider totals for case ${index}`);
+      assert.deepEqual(totals(merged.models[0]), totals(separately.models[0]), `model totals for case ${index}`);
+      assert.deepEqual(merged.dailyUsageBuckets.map(({ requests: _requests, ...bucket }) => bucket),
+        separately.dailyUsageBuckets.map(({ requests: _requests, ...bucket }) => bucket), `daily totals for case ${index}`);
+      assert.equal(merged.last24hTokens, separately.last24hTokens, `rolling total for case ${index}`);
+    }
+  }
 });
 
 test("breaks provider usage down by model, heaviest first", () => {

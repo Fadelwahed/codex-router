@@ -4,6 +4,7 @@ import { StringDecoder } from "node:string_decoder";
 import { HeaderlessSseDetector } from "./sse-prefix.mjs";
 import { promptImageUsage } from "./prompt-image-usage.mjs";
 import { knownServiceTier } from "./request-diagnostics.mjs";
+import { ResponseOutcomeObserver } from "./response-outcome.mjs";
 
 const MAX_JSON_CAPTURE_BYTES = 8 * 1024 * 1024;
 
@@ -222,15 +223,19 @@ export function mergeTokenUsage(first, second) {
   // reports -- Grok OAuth sends `billed_prompt_tokens` beside `prompt_tokens`
   // -- is exactly the one whose retried turns were being charged twice and
   // metered once, because provider-usage.mjs reads `billedInputTokens ??
-  // inputTokens` and the billed half went missing on the way here.
+  // inputTokens` and the billed half went missing on the way here. Apply that
+  // fallback per attempt: a missing billed component does not mean the
+  // attempt was free. An explicit billed zero still overrides its raw count.
   const billedInputTokens =
     first.billedInputTokens === undefined && second.billedInputTokens === undefined
       ? undefined
-      : (first.billedInputTokens || 0) + (second.billedInputTokens || 0);
+      : (first.billedInputTokens ?? first.inputTokens ?? 0) +
+        (second.billedInputTokens ?? second.inputTokens ?? 0);
   const billedOutputTokens =
     first.billedOutputTokens === undefined && second.billedOutputTokens === undefined
       ? undefined
-      : (first.billedOutputTokens || 0) + (second.billedOutputTokens || 0);
+      : (first.billedOutputTokens ?? first.outputTokens ?? 0) +
+        (second.billedOutputTokens ?? second.outputTokens ?? 0);
   return {
     inputTokens: (first.inputTokens || 0) + (second.inputTokens || 0),
     outputTokens: (first.outputTokens || 0) + (second.outputTokens || 0),
@@ -381,8 +386,7 @@ export class ResponseUsageTransform extends Transform {
   #reasoningStreamed = false;
   #onEvent;
   #grokServiceTier;
-  #completedResponseObserved = false;
-  #terminalErrorObserved = false;
+  #outcome = new ResponseOutcomeObserver();
 
   // `estimatedInputTokens` arrives only on routed requests large enough that a
   // reported zero cannot be true. Without it this transform observes and
@@ -575,7 +579,6 @@ export class ResponseUsageTransform extends Transform {
     if (!data || data === "[DONE]") return undefined;
     try {
       const payload = JSON.parse(data);
-      if (payload?.type === "error") this.#terminalErrorObserved = true;
       this.#observe(payload);
       return payload;
     } catch {
@@ -588,7 +591,7 @@ export class ResponseUsageTransform extends Transform {
     // Diagnostics must not change parsing, metering, or the relayed bytes.
     try { this.#onEvent?.(payload); } catch { /* Observer failure is non-fatal. */ }
     this.#noteFirstToken(payload);
-    if (payload?.type === "response.completed") this.#completedResponseObserved = true;
+    this.#outcome.observe(payload);
     const usage = tokenUsageFromPayload(payload, { grokServiceTier: this.#grokServiceTier });
     if (usage) {
       // A tier-only terminal event must not erase earlier measured counters.
@@ -639,10 +642,14 @@ export class ResponseUsageTransform extends Transform {
   }
 
   completedResponseObserved() {
-    return this.#completedResponseObserved;
+    return this.#outcome.outcome() === "completed";
   }
 
   terminalErrorObserved() {
-    return this.#terminalErrorObserved;
+    return ["failed", "incomplete"].includes(this.#outcome.outcome());
+  }
+
+  generationOutcome() {
+    return this.#outcome.outcome() ?? (this.#eventStream ? "indeterminate" : undefined);
   }
 }
