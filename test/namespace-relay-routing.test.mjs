@@ -3470,7 +3470,9 @@ test("Grok timing records a rejected streamed patch as failed despite committed 
 test("Grok timing waits for a successful handler outcome after the response finishes", async () => {
   const result = await scenario(false, {
     model: "grok-oauth/grok-4.7",
-    requestPayload: (stream, model) => ({ model, stream, input: "Synthetic completed response." }),
+    requestPayload: (stream, model) => ({ model, stream, input: "Synthetic completed response.",
+      client_metadata: { "x-codex-turn-metadata": JSON.stringify({ thread_source: "composer_predictions", prediction_source_thread_id: "private" }) },
+    }),
     jsonBody: (body) => ({ id: "resp_timing_ok", object: "response", status: "completed", model: body.model,
       output: [{ type: "message", role: "assistant", status: "completed", content: [{ type: "output_text", text: "done" }] }],
       usage: { input_tokens: 10, output_tokens: 1, total_tokens: 11 },
@@ -3482,4 +3484,6 @@ test("Grok timing waits for a successful handler outcome after the response fini
   assert.equal(rows[0].httpStatus, 200);
   assert.equal(rows[0].requestStatus, 200);
   assert.equal(rows[0].generationOutcome, "completed");
+  assert.equal(rows[0].clientSource, "composer_predictions");
+  assert.doesNotMatch(JSON.stringify(rows), /private/);
 });

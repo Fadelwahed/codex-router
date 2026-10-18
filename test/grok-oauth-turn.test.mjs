@@ -10,12 +10,9 @@ import {
   finalizeTurn,
   isProgressOnlyStop,
   lastClientMessageWasToolResult,
-  mergeMappedUsage,
   parseSseBlockEvent,
-  requestOffersClientTools,
   REPAIR_FINAL_TOOL,
   selectedRetryUsage,
-  shouldPreferRetryTurn,
   sseDataFromBlock,
   toolCallDeltas,
   withProgressOnlyNudge,
@@ -196,23 +193,13 @@ test("parseSseBlockEvent skips malformed JSON and leaves handlers to throw", () 
   });
 });
 
-test("isProgressOnlyStop requires short text, no tools, and enough output tokens", () => {
-  const progress = {
-    terminalStatus: "completed",
-    contentText: "Still thinking about it.",
-    toolCalls: [],
-    usage: { completion_tokens: 1660 },
-  };
-  assert.equal(isProgressOnlyStop(progress), true);
-  assert.equal(isProgressOnlyStop({ ...progress, toolCalls: [{ id: "c1" }] }), false);
-  assert.equal(
-    isProgressOnlyStop({ ...progress, contentText: "x".repeat(121) }),
-    false,
-  );
-  assert.equal(
-    isProgressOnlyStop({ ...progress, usage: { completion_tokens: 12 } }),
-    false,
-  );
+test("pre-tool completion never triggers recovery regardless of text or token count", () => {
+  for (const contentText of ["", " ", "Done.", "Still thinking about it.", "x".repeat(200)]) {
+    for (const completion_tokens of [0, 400, 1660, 100000]) {
+      assert.equal(isProgressOnlyStop({ terminalStatus: "completed", contentText,
+        toolCalls: [], usage: { completion_tokens } }), false);
+    }
+  }
 });
 
 test("isProgressOnlyStop repairs only an empty completed response after a tool result", () => {
@@ -263,41 +250,9 @@ test("lastClientMessageWasToolResult ignores system and user tails", () => {
   );
 });
 
-test("requestOffersClientTools ignores hosted-only or empty tool lists", () => {
-  assert.equal(requestOffersClientTools({}), false);
-  assert.equal(requestOffersClientTools({ tools: [] }), false);
-  assert.equal(
-    requestOffersClientTools({ tools: [{ type: "web_search" }] }),
-    false,
-  );
-  assert.equal(
-    requestOffersClientTools({
-      tools: [{ type: "function", function: { name: "exec_command" } }],
-    }),
-    true,
-  );
-});
-
-test("shouldPreferRetryTurn keeps the first answer when the retry also has no tools", () => {
-  assert.equal(shouldPreferRetryTurn({ terminalStatus: "completed", toolCalls: [] }), false);
-  assert.equal(shouldPreferRetryTurn({ terminalStatus: "completed", toolCalls: [{ id: "c1" }] }), true);
-});
-
-test("withProgressOnlyNudge appends a user message so the instructions prefix stays put", () => {
-  const nudged = withProgressOnlyNudge({
-    model: "grok-4.6",
-    messages: [
-      { role: "system", content: "You are Codex." },
-      { role: "user", content: "update the deck" },
-    ],
-  });
-  assert.equal(nudged.messages[0].role, "system");
-  assert.equal(nudged.messages.at(-1).role, "user");
-  // The no-tool branch comes first so a finished turn can decline rather than
-  // invent a call the client would run.
-  assert.match(nudged.messages.at(-1).content, /^If your previous message already completed/);
-  assert.match(nudged.messages.at(-1).content, /call no tool/);
-  assert.match(nudged.messages.at(-1).content, /Otherwise continue the same task now/);
+test("recovery instructions are not added before a tool result", () => {
+  const chat = { messages: [{ role: "user", content: "Done?" }] };
+  assert.equal(withProgressOnlyNudge(chat), chat);
 });
 
 test("withProgressOnlyNudge leads with continue after a tool result", () => {
@@ -406,7 +361,6 @@ test("only response.completed certifies a tool call or private final answer", ()
       assert.deepEqual(classifyAfterToolRepair(turn), terminalStatus === "completed"
         ? name === REPAIR_FINAL_TOOL ? { action: "final", contentText: "Done." } : { action: "tools" }
         : { action: "fail" });
-      assert.equal(shouldPreferRetryTurn(turn), terminalStatus === "completed");
     }
   }
 });
@@ -498,53 +452,6 @@ test("selectedRetryUsage keeps selected tokens without labeling billed usage as 
   );
   assert.equal("service_tier" in usage, false);
   assert.equal("billed_service_tier" in usage, false);
-});
-
-test("mergeMappedUsage omits actual service_tier from aggregated retry billing", () => {
-  const merged = mergeMappedUsage(
-    { prompt_tokens: 10, completion_tokens: 2, total_tokens: 12, service_tier: "default" },
-    { prompt_tokens: 11, completion_tokens: 3, total_tokens: 14, service_tier: "priority" },
-  );
-  assert.equal("service_tier" in merged, false);
-  assert.equal(merged.retries, 1);
-});
-
-
-test("mergeMappedUsage adds both attempts and marks retries", () => {
-  const merged = mergeMappedUsage(
-    {
-      prompt_tokens: 100,
-      completion_tokens: 1660,
-      total_tokens: 1760,
-      prompt_tokens_details: { cached_tokens: 80 },
-      completion_tokens_details: { reasoning_tokens: 1600 },
-    },
-    {
-      prompt_tokens: 110,
-      completion_tokens: 40,
-      total_tokens: 150,
-      prompt_tokens_details: { cached_tokens: 80 },
-      completion_tokens_details: { reasoning_tokens: 10 },
-    },
-  );
-  assert.equal(merged.prompt_tokens, 210);
-  assert.equal(merged.completion_tokens, 1700);
-  assert.equal(merged.total_tokens, 1910);
-  assert.equal(merged.prompt_tokens_details.cached_tokens, 160);
-  assert.equal(merged.completion_tokens_details.reasoning_tokens, 1610);
-  assert.equal(merged.retries, 1);
-  assert.equal(merged.progress_only_retried, true);
-});
-
-test("mergeMappedUsage still marks retries when one attempt reported no usage", () => {
-  const onlySecond = mergeMappedUsage(undefined, {
-    prompt_tokens: 10,
-    completion_tokens: 4,
-    total_tokens: 14,
-  });
-  assert.equal(onlySecond.prompt_tokens, 10);
-  assert.equal(onlySecond.retries, 1);
-  assert.equal(onlySecond.progress_only_retried, true);
 });
 
 test("a completed terminal seals the attempt against late tool, text, and reasoning frames", () => {

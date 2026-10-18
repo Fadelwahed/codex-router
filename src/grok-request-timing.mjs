@@ -26,6 +26,23 @@ export function grokTimingHeaders(request, headers) {
   return { ...Object.fromEntries(entries), [GROK_TIMING_HEADER]: id };
 }
 
+// Codex prediction forks identify themselves in transport metadata. This is
+// diagnostic attribution only: never infer purpose from effort, prompt text or
+// arrival time, and never suppress a request based on this caller-owned label.
+export function grokClientRequestSource(payload, headers) {
+  const key = "x-codex-turn-metadata";
+  const canonical = payload?.client_metadata;
+  const raw = canonical && typeof canonical === "object" && Object.hasOwn(canonical, key)
+    ? canonical[key] : headers?.[key];
+  if (typeof raw !== "string") return "unknown";
+  try {
+    const metadata = JSON.parse(raw);
+    return metadata?.thread_source === "composer_predictions" ? "composer_predictions" : "unknown";
+  } catch {
+    return "unknown";
+  }
+}
+
 function effort(value) {
   const candidate = value && typeof value === "object" ? value.effort : value;
   return EFFORTS.has(candidate) ? candidate : null;
@@ -73,6 +90,9 @@ export function createGrokRequestTiming({ layer, requestId, now = () => performa
     mark,
     kind(value) {
       if (!finished && ["generation", "compaction"].includes(value)) row.requestKind = value;
+    },
+    clientRequest(payload, headers) {
+      if (!finished && layer === "router") row.clientSource = grokClientRequestSource(payload, headers);
     },
     tools(stage, tools) {
       if (!finished && ["client", "gateway", "upstream"].includes(stage)) {

@@ -4695,6 +4695,7 @@ async function handleResponses(request, response, requestUrl) {
     if (route?.provider === "grok-oauth") {
       diagnostics.requestKind = compactV1 || compactV2 ? "compaction" : "generation";
       timing.kind(diagnostics.requestKind);
+      timing.clientRequest(payload, request.headers);
       timing.tools("client", payload.tools);
       timing.parallelTools("client", payload.parallel_tool_calls);
     }

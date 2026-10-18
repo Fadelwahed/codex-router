@@ -1077,93 +1077,6 @@ const TOOL_EVENTS = [
   },
 ];
 
-test("buffers a proven progress-only prefix without losing a healthy short answer", async () => {
-  let inbound = 0;
-  const backend = await mockBackend(async (_req, res) => {
-    inbound += 1;
-    res.writeHead(200, { "Content-Type": "text/event-stream" });
-    if (inbound <= 2) {
-      res.end(sse(PROGRESS_EVENTS));
-      return;
-    }
-    if (inbound === 3) {
-      res.end(
-        sse([
-          { type: "response.output_text.delta", delta: "Done." },
-          { type: "response.completed", response: { usage: { input_tokens: 20, output_tokens: 5 } } },
-        ]),
-      );
-      return;
-    }
-    res.write(sse([{ type: "response.output_text.delta", delta: "Next I will update the deck." }]));
-    setImmediate(() => res.destroy());
-  });
-  const port = await openPort();
-  const dir = mkdtempSync(path.join(os.tmpdir(), "grok-oauth-repeat-abort-"));
-  const child = startForwarder(port, backend.port, writeSession(dir));
-  const base = `http://127.0.0.1:${port}`;
-  const opening = [
-    { role: "system", content: "You are Codex." },
-    { role: "user", content: "update the deck" },
-  ];
-  const tools = [
-    { type: "function", function: { name: "exec_command", parameters: { type: "object" } } },
-  ];
-  try {
-    await waitHealth(base, child);
-    const first = await fetch(`${base}/v1/chat/completions`, {
-      method: "POST",
-      headers: auth,
-      body: JSON.stringify({ model: "grok-4.6", messages: opening, tools, stream: false }),
-    });
-    assert.equal(first.status, 200);
-    assert.equal(inbound, 2);
-
-    const followUpMessages = [
-      ...opening,
-      { role: "assistant", content: "Next I will update the deck." },
-      { role: "user", content: "continue" },
-    ];
-    const healthy = await fetch(`${base}/v1/chat/completions`, {
-      method: "POST",
-      headers: auth,
-      body: JSON.stringify({
-        model: "grok-4.6",
-        messages: followUpMessages,
-        tools,
-        stream: true,
-      }),
-    });
-    const healthyBody = await readAll(healthy);
-    assert.equal(healthy.status, 200);
-    assert.equal(inbound, 3);
-    assert.match(healthyBody, /"content":"Done\."/);
-    assert.match(healthyBody, /data: \[DONE\]/);
-
-    const repeated = await fetch(`${base}/v1/chat/completions`, {
-      method: "POST",
-      headers: auth,
-      body: JSON.stringify({
-        model: "grok-4.6",
-        messages: followUpMessages,
-        tools,
-        stream: true,
-      }),
-    });
-    const body = await readAll(repeated);
-    assert.equal(repeated.status, 200);
-    assert.equal(inbound, 4);
-    assert.doesNotMatch(body, /Next I will update the deck/);
-    assert.equal((body.match(/event: error/g) || []).length, 1);
-    assert.match(body, /local_router_stream_failed/);
-    assert.doesNotMatch(body, /data: \[DONE\]/);
-  } finally {
-    await stop(child);
-    await new Promise((r) => backend.server.close(r));
-    rmSync(dir, { recursive: true, force: true });
-  }
-});
-
 test("does not retry a short reasoning-heavy answer when the client offered no tools", async () => {
   let inbound = 0;
   const backend = await mockBackend(async (_req, res) => {
@@ -1190,70 +1103,6 @@ test("does not retry a short reasoning-heavy answer when the client offered no t
     assert.equal(json.choices[0].message.content, "Next I will update the deck.");
     assert.equal(json.choices[0].finish_reason, "stop");
     assert.equal(inbound, 1);
-  } finally {
-    await stop(child);
-    await new Promise((r) => backend.server.close(r));
-    rmSync(dir, { recursive: true, force: true });
-  }
-});
-
-test("retries a progress-only stop once and prefers a retry that calls tools", async () => {
-  let inbound = 0;
-  const bodies = [];
-  const backend = await mockBackend(async (req, res) => {
-    inbound += 1;
-    const chunks = [];
-    for await (const chunk of req) chunks.push(chunk);
-    bodies.push(Buffer.concat(chunks).toString("utf8"));
-    res.writeHead(200, { "Content-Type": "text/event-stream" });
-    const events = (inbound === 1 ? PROGRESS_EVENTS : TOOL_EVENTS).map(event =>
-      event.response ? { ...event, response: { ...event.response, service_tier: inbound === 1 ? "default" : "priority" } } : event);
-    res.end(sse(events));
-  });
-  const port = await openPort();
-  const dir = mkdtempSync(path.join(os.tmpdir(), "grok-oauth-retry-tools-"));
-  const child = startForwarder(port, backend.port, writeSession(dir));
-  const base = `http://127.0.0.1:${port}`;
-  try {
-    await waitHealth(base, child);
-    const resp = await fetch(`${base}/v1/chat/completions`, {
-      method: "POST",
-      headers: auth,
-      body: JSON.stringify({
-        model: "grok-4.6",
-        service_tier: "priority",
-        messages: [
-          { role: "system", content: "You are Codex." },
-          { role: "user", content: "update the deck" },
-        ],
-        tools: [{ type: "function", function: { name: "exec_command", parameters: { type: "object" } } }],
-        stream: false,
-      }),
-    });
-    const json = await resp.json();
-    assert.equal(inbound, 2);
-    assert.equal(json.choices[0].finish_reason, "tool_calls");
-    assert.equal(json.choices[0].message.content, "Next I will update the deck.");
-    assert.equal(json.choices[0].message.tool_calls[0].function.name, "exec_command");
-    assert.equal(json.usage.prompt_tokens, 105_882 + 106_000);
-    assert.equal(json.usage.completion_tokens, 1_660 + 40);
-    assert.equal(json.usage.retries, 1);
-    assert.equal(json.usage.progress_only_retried, true);
-    assert.equal(json.service_tier, undefined);
-    assert.equal(json.provider_specific_fields?.grok_service_tier, undefined);
-    assert.equal(resp.headers.get("x-codex-router-grok-service-tier"), null);
-    assert.equal(JSON.parse(bodies[0]).service_tier, "priority");
-    const retryBody = JSON.parse(bodies[1]);
-    assert.equal(retryBody.service_tier, "priority");
-    assert.equal(retryBody.instructions, "You are Codex.");
-    // No prior tool result, so the decline-first nudge stays. See
-    // "a finished task ... declines" and the after-tool case below.
-    assert.match(
-      JSON.stringify(retryBody.input),
-      /already completed the task, restate the final answer and call no tool/,
-    );
-    assert.match(JSON.stringify(retryBody.input), /Otherwise continue the same task now/);
-    await waitChildError(child, /progress-only-retried=true/);
   } finally {
     await stop(child);
     await new Promise((r) => backend.server.close(r));
@@ -1853,145 +1702,12 @@ test("double-empty after a tool result is an explicit terminal error, never a cl
   }
 });
 
-test("keeps the first progress-only answer when the retry also has no tools", async () => {
+test("empty post-tool recovery kill switch leaves the first attempt alone", async () => {
   let inbound = 0;
   const backend = await mockBackend(async (_req, res) => {
     inbound += 1;
     res.writeHead(200, { "Content-Type": "text/event-stream" });
-    res.end(
-      sse(
-        inbound === 1
-          ? PROGRESS_EVENTS
-          : [
-              { type: "response.output_text.delta", delta: "Still thinking about it." },
-              {
-                type: "response.completed",
-                response: {
-                  usage: {
-                    input_tokens: 106_000,
-                    output_tokens: 500,
-                    output_tokens_details: { reasoning_tokens: 480 },
-                  },
-                },
-              },
-            ],
-      ),
-    );
-  });
-  const port = await openPort();
-  const dir = mkdtempSync(path.join(os.tmpdir(), "grok-oauth-keep-first-"));
-  const child = startForwarder(port, backend.port, writeSession(dir));
-  const base = `http://127.0.0.1:${port}`;
-  try {
-    await waitHealth(base, child);
-    const resp = await fetch(`${base}/v1/chat/completions`, {
-      method: "POST",
-      headers: auth,
-      body: JSON.stringify({
-        model: "grok-4.6",
-        messages: [{ role: "user", content: "update the deck" }],
-        tools: [{ type: "function", function: { name: "exec_command", parameters: { type: "object" } } }],
-        stream: false,
-      }),
-    });
-    const json = await resp.json();
-    assert.equal(inbound, 2);
-    assert.equal(json.choices[0].message.content, "Next I will update the deck.");
-    assert.equal(json.choices[0].finish_reason, "stop");
-    assert.equal(json.usage.completion_tokens, 1_660 + 500);
-    assert.equal(json.usage.retries, 1);
-  } finally {
-    await stop(child);
-    await new Promise((r) => backend.server.close(r));
-    rmSync(dir, { recursive: true, force: true });
-  }
-});
-
-// A finished task answered in one line is byte-for-byte the shape the trigger
-// looks for, so the retry fires on it and always will. What must not happen is
-// the retry manufacturing a tool call the model never meant to make and the
-// forwarder grafting it onto the answer -- the client would then run it. The
-// nudge's no-tool branch is what routes this into keep-first.
-test("a finished task answered in one line declines the retry instead of calling a tool", async () => {
-  let inbound = 0;
-  const bodies = [];
-  const backend = await mockBackend(async (req, res) => {
-    inbound += 1;
-    const chunks = [];
-    for await (const chunk of req) chunks.push(chunk);
-    bodies.push(Buffer.concat(chunks).toString("utf8"));
-    res.writeHead(200, { "Content-Type": "text/event-stream" });
-    res.end(
-      sse(
-        inbound === 1
-          ? [
-              { type: "response.output_text.delta", delta: "Yes, that is correct." },
-              {
-                type: "response.completed",
-                response: {
-                  usage: {
-                    input_tokens: 5_000,
-                    output_tokens: 1_500,
-                    output_tokens_details: { reasoning_tokens: 1_490 },
-                  },
-                },
-              },
-            ]
-          : // The model takes the no-tool branch the nudge offers.
-            [
-              { type: "response.output_text.delta", delta: "Yes. Nothing further to do." },
-              {
-                type: "response.completed",
-                response: { usage: { input_tokens: 5_010, output_tokens: 60 } },
-              },
-            ],
-      ),
-    );
-  });
-  const port = await openPort();
-  const dir = mkdtempSync(path.join(os.tmpdir(), "grok-oauth-finished-"));
-  const child = startForwarder(port, backend.port, writeSession(dir));
-  const base = `http://127.0.0.1:${port}`;
-  try {
-    await waitHealth(base, child);
-    const resp = await fetch(`${base}/v1/chat/completions`, {
-      method: "POST",
-      headers: auth,
-      body: JSON.stringify({
-        model: "grok-4.6",
-        messages: [{ role: "user", content: "Is the config right?" }],
-        tools: [
-          { type: "function", function: { name: "exec_command", parameters: { type: "object" } } },
-        ],
-        stream: false,
-      }),
-    });
-    const json = await resp.json();
-    assert.equal(inbound, 2);
-    assert.equal(json.choices[0].finish_reason, "stop");
-    assert.equal(json.choices[0].message.content, "Yes, that is correct.");
-    assert.equal(json.choices[0].message.tool_calls, undefined);
-    // Both attempts were billed, and the marker says so.
-    assert.equal(json.usage.prompt_tokens, 5_000 + 5_010);
-    assert.equal(json.usage.progress_only_retried, true);
-    const retryBody = JSON.parse(bodies[1]);
-    assert.match(
-      JSON.stringify(retryBody.input),
-      /already completed the task, restate the final answer and call no tool/,
-    );
-  } finally {
-    await stop(child);
-    await new Promise((r) => backend.server.close(r));
-    rmSync(dir, { recursive: true, force: true });
-  }
-});
-
-test("progress-only kill switch leaves the first attempt alone", async () => {
-  let inbound = 0;
-  const backend = await mockBackend(async (_req, res) => {
-    inbound += 1;
-    res.writeHead(200, { "Content-Type": "text/event-stream" });
-    res.end(sse(PROGRESS_EVENTS));
+    res.end(sse([{ type: "response.completed", response: { usage: { input_tokens: 10, output_tokens: 1000 } } }]));
   });
   const port = await openPort();
   const dir = mkdtempSync(path.join(os.tmpdir(), "grok-oauth-kill-switch-"));
@@ -2006,7 +1722,11 @@ test("progress-only kill switch leaves the first attempt alone", async () => {
       headers: auth,
       body: JSON.stringify({
         model: "grok-4.6",
-        messages: [{ role: "user", content: "update the deck" }],
+        messages: [
+          { role: "user", content: "update the deck" },
+          { role: "assistant", tool_calls: [{ id: "prior", type: "function", function: { name: "exec_command", arguments: "{}" } }] },
+          { role: "tool", tool_call_id: "prior", content: "done" },
+        ],
         tools: [{ type: "function", function: { name: "exec_command", parameters: { type: "object" } } }],
         stream: false,
       }),
@@ -2015,49 +1735,6 @@ test("progress-only kill switch leaves the first attempt alone", async () => {
     assert.equal(inbound, 1);
     assert.equal(json.choices[0].finish_reason, "stop");
     assert.equal(json.usage.retries, undefined);
-  } finally {
-    await stop(child);
-    await new Promise((r) => backend.server.close(r));
-    rmSync(dir, { recursive: true, force: true });
-  }
-});
-
-test("drains a failed progress-only retry and keeps the first answer", async () => {
-  let inbound = 0;
-  let secondBodyRead = false;
-  const backend = await mockBackend(async (_req, res) => {
-    inbound += 1;
-    if (inbound === 1) {
-      res.writeHead(200, { "Content-Type": "text/event-stream" });
-      res.end(sse(PROGRESS_EVENTS));
-      return;
-    }
-    res.writeHead(502, { "Content-Type": "text/plain" });
-    res.write("upstream retry exploded");
-    res.end();
-    secondBodyRead = true;
-  });
-  const port = await openPort();
-  const dir = mkdtempSync(path.join(os.tmpdir(), "grok-oauth-retry-fail-"));
-  const child = startForwarder(port, backend.port, writeSession(dir));
-  const base = `http://127.0.0.1:${port}`;
-  try {
-    await waitHealth(base, child);
-    const resp = await fetch(`${base}/v1/chat/completions`, {
-      method: "POST",
-      headers: auth,
-      body: JSON.stringify({
-        model: "grok-4.6",
-        messages: [{ role: "user", content: "update the deck" }],
-        tools: [{ type: "function", function: { name: "exec_command", parameters: { type: "object" } } }],
-        stream: false,
-      }),
-    });
-    const json = await resp.json();
-    assert.equal(inbound, 2);
-    assert.equal(secondBodyRead, true);
-    assert.equal(json.choices[0].message.content, "Next I will update the deck.");
-    await waitChildError(child, /progress-only-retry-failed=true/);
   } finally {
     await stop(child);
     await new Promise((r) => backend.server.close(r));
@@ -2101,97 +1778,6 @@ test("stops reading an upstream that keeps its socket open after the terminal ev
     await stop(child);
     await new Promise((r) => backend.server.close(r));
     rmSync(dir, { recursive: true, force: true });
-  }
-});
-
-test("a streamed optional progress-only retry that fails keeps the first answer", async () => {
-  let inbound = 0;
-  const backend = await mockBackend(async (req, res) => {
-    for await (const _chunk of req) {
-      // Drain the request before answering.
-    }
-    inbound += 1;
-    res.writeHead(200, { "Content-Type": "text/event-stream" });
-    res.end(sse(inbound === 1
-      ? PROGRESS_EVENTS
-      : [{ type: "response.failed", response: { status: "failed" } }]));
-  });
-  const port = await openPort();
-  const dir = mkdtempSync(path.join(os.tmpdir(), "grok-oauth-optional-retry-stream-"));
-  const child = startForwarder(port, backend.port, writeSession(dir));
-  const base = `http://127.0.0.1:${port}`;
-  try {
-    await waitHealth(base, child);
-    const resp = await fetch(`${base}/v1/chat/completions`, {
-      method: "POST",
-      headers: auth,
-      body: JSON.stringify({
-        model: "grok-4.6",
-        messages: [{ role: "user", content: "update the deck" }],
-        tools: [{ type: "function", function: { name: "exec_command", parameters: { type: "object" } } }],
-        stream: true,
-      }),
-    });
-    const text = await resp.text();
-    assert.equal(resp.status, 200, text);
-    assert.equal(inbound, 2);
-    assert.match(text, /Next I will update the deck\./);
-    assert.match(text, /"finish_reason":"stop"/);
-    assert.doesNotMatch(text, /"error"/);
-    await waitChildError(child, /progress-only-retry-failed=true .*terminal=failed/);
-  } finally {
-    await stop(child);
-    await new Promise((r) => backend.server.close(r));
-    rmSync(dir, { recursive: true, force: true });
-  }
-});
-
-test("an optional progress-only retry that does not complete keeps the first answer", async () => {
-  for (const [label, retryEvents] of [
-    ["failed", [{ type: "response.failed", response: { status: "failed", usage: { input_tokens: 90, output_tokens: 3 } } }]],
-    ["incomplete", [{ type: "response.incomplete", response: { status: "incomplete" } }]],
-    ["missing", [{ type: "response.output_text.delta", delta: "partial retry text" }]],
-  ]) {
-    let inbound = 0;
-    const backend = await mockBackend(async (req, res) => {
-      for await (const _chunk of req) {
-        // Drain the request before answering.
-      }
-      inbound += 1;
-      res.writeHead(200, { "Content-Type": "text/event-stream" });
-      res.end(sse(inbound === 1 ? PROGRESS_EVENTS : retryEvents));
-    });
-    const port = await openPort();
-    const dir = mkdtempSync(path.join(os.tmpdir(), `grok-oauth-optional-retry-${label}-`));
-    const child = startForwarder(port, backend.port, writeSession(dir));
-    const base = `http://127.0.0.1:${port}`;
-    try {
-      await waitHealth(base, child);
-      const resp = await fetch(`${base}/v1/chat/completions`, {
-        method: "POST",
-        headers: auth,
-        body: JSON.stringify({
-          model: "grok-4.6",
-          messages: [{ role: "user", content: "update the deck" }],
-          tools: [{ type: "function", function: { name: "exec_command", parameters: { type: "object" } } }],
-          stream: false,
-        }),
-      });
-      const json = await resp.json();
-      assert.equal(resp.status, 200, `${label}: ${JSON.stringify(json)}`);
-      assert.equal(inbound, 2, label);
-      assert.equal(json.choices[0].message.content, "Next I will update the deck.", label);
-      assert.equal(json.choices[0].finish_reason, "stop", label);
-      assert.doesNotMatch(json.choices[0].message.content, /partial retry text/, label);
-      await waitChildError(
-        child,
-        new RegExp(`progress-only-retry-failed=true .*terminal=${label}`),
-      ).catch((error) => { throw new Error(`${label}: ${error.message}`); });
-    } finally {
-      await stop(child);
-      await new Promise((r) => backend.server.close(r));
-      rmSync(dir, { recursive: true, force: true });
-    }
   }
 });
 
@@ -2335,95 +1921,6 @@ test("streams a short tool-offered answer before the upstream turn completes", a
     }
   } finally {
     releaseCompletion?.();
-    await stop(child);
-    await new Promise((r) => backend.server.close(r));
-    rmSync(dir, { recursive: true, force: true });
-  }
-});
-
-test("appends retry tool-call deltas onto a live progress-only stream", async () => {
-  let inbound = 0;
-  const backend = await mockBackend(async (_req, res) => {
-    inbound += 1;
-    res.writeHead(200, { "Content-Type": "text/event-stream" });
-    res.end(sse(inbound === 1 ? PROGRESS_EVENTS : TOOL_EVENTS));
-  });
-  const port = await openPort();
-  const dir = mkdtempSync(path.join(os.tmpdir(), "grok-oauth-stream-retry-"));
-  const child = startForwarder(port, backend.port, writeSession(dir));
-  const base = `http://127.0.0.1:${port}`;
-  try {
-    await waitHealth(base, child);
-    const resp = await fetch(`${base}/v1/chat/completions`, {
-      method: "POST",
-      headers: auth,
-      body: JSON.stringify({
-        model: "grok-4.6",
-        messages: [{ role: "user", content: "update the deck" }],
-        tools: [{ type: "function", function: { name: "exec_command", parameters: { type: "object" } } }],
-        stream: true,
-      }),
-    });
-    const body = await readAll(resp);
-    assert.equal(inbound, 2);
-    assert.match(body, /Next I will update the deck/);
-    assert.match(body, /exec_command/);
-    assert.match(body, /"finish_reason":"tool_calls"/);
-    assert.match(body, /"progress_only_retried":true/);
-  } finally {
-    await stop(child);
-    await new Promise((r) => backend.server.close(r));
-    rmSync(dir, { recursive: true, force: true });
-  }
-});
-
-test("keeps the first streamed answer when the retry also has no tools", async () => {
-  let inbound = 0;
-  const backend = await mockBackend(async (_req, res) => {
-    inbound += 1;
-    res.writeHead(200, { "Content-Type": "text/event-stream" });
-    res.end(
-      sse(
-        inbound === 1
-          ? PROGRESS_EVENTS
-          : [
-              { type: "response.output_text.delta", delta: "Still thinking about it." },
-              {
-                type: "response.completed",
-                response: {
-                  usage: {
-                    input_tokens: 106_000,
-                    output_tokens: 500,
-                    output_tokens_details: { reasoning_tokens: 480 },
-                  },
-                },
-              },
-            ],
-      ),
-    );
-  });
-  const port = await openPort();
-  const dir = mkdtempSync(path.join(os.tmpdir(), "grok-oauth-stream-keep-"));
-  const child = startForwarder(port, backend.port, writeSession(dir));
-  const base = `http://127.0.0.1:${port}`;
-  try {
-    await waitHealth(base, child);
-    const resp = await fetch(`${base}/v1/chat/completions`, {
-      method: "POST",
-      headers: auth,
-      body: JSON.stringify({
-        model: "grok-4.6",
-        messages: [{ role: "user", content: "update the deck" }],
-        tools: [{ type: "function", function: { name: "exec_command", parameters: { type: "object" } } }],
-        stream: true,
-      }),
-    });
-    const body = await readAll(resp);
-    assert.equal(inbound, 2);
-    assert.match(body, /Next I will update the deck/);
-    assert.doesNotMatch(body, /Still thinking about it/);
-    assert.match(body, /"finish_reason":"stop"/);
-  } finally {
     await stop(child);
     await new Promise((r) => backend.server.close(r));
     rmSync(dir, { recursive: true, force: true });
@@ -3052,4 +2549,106 @@ test("operation aliases round-trip through live forwarder history without leakin
     assert.equal(captured[1].input.find(item=>item.type==="function_call_output").output,"updated");
     assert.equal(captured[1].input.find(item=>item.type==="reasoning").encrypted_content,"opaque-fixture-reasoning");
   } finally {await stop(child);await new Promise(resolve=>backend.server.close(resolve));rmSync(dir,{recursive:true,force:true});}
+});
+
+// A second upstream call would manufacture work from an already certified final.
+test("pre-tool short or empty completed answers dispatch once with tools and high reasoning usage", async (t) => {
+  for (const stream of [false, true]) {
+    for (const contentText of ["Yes, that is correct.", "", " "]) {
+      await t.test(`${stream ? "stream" : "json"} ${JSON.stringify(contentText)}`, async () => {
+        let inbound = 0;
+        const backend = await mockBackend(async (_req, res) => {
+          inbound += 1;
+          res.writeHead(200, { "Content-Type": "text/event-stream" });
+          res.end(sse([
+            { type: "response.reasoning_text.delta", delta: "Checking." },
+            { type: "response.output_text.delta", delta: contentText },
+            { type: "response.completed", response: { service_tier: "priority", usage: {
+              input_tokens: 5000, output_tokens: 1500,
+              output_tokens_details: { reasoning_tokens: 1490 },
+            } } },
+          ]));
+        });
+        const port = await openPort();
+        const dir = mkdtempSync(path.join(os.tmpdir(), "grok-oauth-final-one-dispatch-"));
+        const child = startForwarder(port, backend.port, writeSession(dir));
+        const base = `http://127.0.0.1:${port}`;
+        try {
+          await waitHealth(base, child);
+          // Repeat in the same conversation: no process-local history may change delivery.
+          for (let request = 1; request <= 2; request += 1) {
+            const resp = await fetch(`${base}/v1/chat/completions`, {
+              method: "POST", headers: auth, body: JSON.stringify({ model: "grok-4.6", stream,
+                messages: [{ role: "user", content: "Is the config right?" }],
+                tools: [{ type: "function", function: { name: "exec_command", parameters: { type: "object" } } }],
+              }),
+            });
+            assert.equal(resp.status, 200);
+            if (stream) {
+              const body = await resp.text();
+              assert.match(body, /"finish_reason":"stop"/);
+              assert.doesNotMatch(body, /progress_only_retried|tool_calls|"error"/);
+            } else {
+              const json = await resp.json();
+              assert.equal(json.choices[0].message.content, contentText || null);
+              assert.equal(json.choices[0].finish_reason, "stop");
+              assert.equal(json.usage.prompt_tokens, 5000);
+              assert.equal(json.usage.completion_tokens, 1500);
+              assert.equal(json.usage.retries, undefined);
+            }
+            assert.equal(inbound, request, "completed final triggered an extra generation");
+          }
+        } finally {
+          await stop(child);
+          await new Promise((resolve) => backend.server.close(resolve));
+          rmSync(dir, { recursive: true, force: true });
+        }
+      });
+    }
+  }
+});
+
+test("empty post-tool recovery stops on an upstream HTTP failure without a third attempt", async () => {
+  let inbound = 0;
+  const backend = await mockBackend(async (_req, res) => {
+    inbound += 1;
+    if (inbound % 2 === 1) {
+      res.writeHead(200, { "Content-Type": "text/event-stream" });
+      res.end(sse([{ type: "response.completed", response: { usage: { input_tokens: 10, output_tokens: 1000 } } }]));
+    } else {
+      res.writeHead(502, { "Content-Type": "text/plain" });
+      res.end("private upstream failure");
+    }
+  });
+  const port = await openPort();
+  const dir = mkdtempSync(path.join(os.tmpdir(), "grok-oauth-empty-repair-http-failure-"));
+  const child = startForwarder(port, backend.port, writeSession(dir));
+  const base = `http://127.0.0.1:${port}`;
+  try {
+    await waitHealth(base, child);
+    for (const stream of [false, true]) {
+      const before = inbound;
+      const resp = await fetch(`${base}/v1/chat/completions`, {
+        method: "POST", headers: auth,
+        body: JSON.stringify({ model: "grok-4.6", stream,
+          messages: [
+            { role: "user", content: "update the deck" },
+            { role: "assistant", tool_calls: [{ id: "prior", type: "function", function: { name: "exec_command", arguments: "{}" } }] },
+            { role: "tool", tool_call_id: "prior", content: "done" },
+          ],
+          tools: [{ type: "function", function: { name: "exec_command", parameters: { type: "object" } } }],
+        }),
+      });
+      const body = await resp.text();
+      assert.equal(inbound - before, 2);
+      assert.equal(resp.status, stream ? 200 : 502);
+      assert.match(body, /repair request failed upstream/);
+      assert.doesNotMatch(body, /private upstream failure|"finish_reason":"(?:stop|tool_calls)"|\[DONE\]/);
+      if (stream) assert.equal((body.match(/event: error/g) || []).length, 1);
+    }
+  } finally {
+    await stop(child);
+    await new Promise((resolve) => backend.server.close(resolve));
+    rmSync(dir, { recursive: true, force: true });
+  }
 });

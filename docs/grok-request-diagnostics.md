@@ -43,7 +43,7 @@ correlation. Missing marks mean the stage was not observed, not zero latency.
 | Upstream output | Per attempt: `firstEventMs`, `firstReasoningMs`, `firstTextMs`, `firstToolMs`, `firstToolReadyMs`, `terminalMs` |
 | Forwarder release | `firstActionMs`: first text or tool action released to the gateway; post-tool actions may wait for a certified terminal |
 | Codex-facing stream | Router `firstReasoningMs`, `firstTextMs`, `firstToolMs`, `terminalMs`, observed after its output transformations |
-| Completion | `totalMs` and transport `outcome`; semantic success is separately recorded as `terminal: completed` |
+| Completion | `totalMs` and transport `outcome`; Router `requestStatus` and `generationOutcome` record handler outcome separately from committed `httpStatus` and observed `terminal` |
 
 Attempt HTTP errors, transport errors, cancellation, and a stream ending
 without a semantic terminal remain distinct. A finished HTTP response alone
@@ -67,6 +67,34 @@ available in quiet mode. Requested and forwarded effort are recorded
 separately; aliases may legitimately differ. Unknown/absent effort is `null`.
 These timings locate delay at observable boundaries; they do not measure
 provider-internal compute time or establish a speed improvement by themselves.
+
+## Background requests after a final answer
+
+The installed Codex desktop app can fork a `composer_predictions` request after
+`turn-completed` to suggest the user's next message in the composer. It inherits
+the chat's model and service tier; its reasoning effort comes from prediction
+configuration and can differ from the main turn. The observed app build gives
+this helper a 30-second deadline and interrupts it when a new main turn starts.
+These are client feature details, not Router policy or a guarantee for other
+Codex builds.
+
+Router timing records `clientSource: composer_predictions` only when Codex
+explicitly supplies that value in the serialized `x-codex-turn-metadata` field
+of `client_metadata`, or in the matching HTTP header when the body field is
+absent. Otherwise it records `unknown`. Invalid body metadata is not replaced
+by a potentially stale header. This is caller-provided diagnostic attribution,
+not authentication or permission to suppress a generation. Raw metadata,
+source thread/turn IDs and prediction text are not logged. The value is not
+inferred from `high`, prompt wording, a short response, or proximity to a final.
+Old timing rows without this field cannot identify prediction requests.
+
+A native offline app-server fork verified this transport marker using synthetic
+input and a loopback provider. Prediction requests can still use `tool_choice:
+auto`; that value is not a reliable background-request classifier. Removing
+Router's short-answer recovery prevents an extra generation but does not
+turn off Codex's composer suggestions or change their requested effort.
+The separate Router empty-completion guard is unchanged: this fix does not
+make empty normal turns successful.
 
 ## Checking tool delivery
 
@@ -111,7 +139,10 @@ HTTP JSON, WebSocket, post-tool completion and repair. Delayed-terminal cases
 verify that upstream tool readiness and action release are measured separately.
 It also covers nine compaction cases: V1 JSON and V2 JSON/SSE, each with object,
 scalar or omitted reasoning, no tool dispatch, and correlated stage/usage
-records. There are 135 scenarios in total. Focused HTTP tests cover failed,
+records. Six additional short-answer scenarios cover ordinary and explicitly marked
+prediction requests over JSON, SSE and WebSocket, with tools offered and
+reasoning-heavy usage. Each completes with exactly one upstream request.
+There are 141 scenarios in total. Focused HTTP tests cover failed,
 canceled and locally skipped compaction; unit tests cover child overrides,
 failed/incomplete/missing terminals, timing bounds and log privacy.
 

@@ -33,17 +33,12 @@ import {
   grokContextFields,
   classifyAfterToolRepair,
   createTurnState,
-  DEFAULT_PROGRESS_ONLY_MAX_TEXT,
-  DEFAULT_PROGRESS_ONLY_MIN_OUTPUT_TOKENS,
   finalizeTurn,
   isProgressOnlyStop,
   lastClientMessageWasToolResult,
-  mergeMappedUsage,
   parseSseBlockEvent,
-  requestOffersClientTools,
   privateFinalToolName,
   selectedRetryUsage,
-  shouldPreferRetryTurn,
   toolCallDeltas,
   withProgressOnlyNudge,
 } from "./grok-oauth-turn.mjs";
@@ -75,33 +70,6 @@ const INTERNAL_KEY = process.env.MODEL_ROUTER_INTERNAL_KEY;
 const QUIET = process.env.MODEL_ROUTER_QUIET === "1";
 const PROGRESS_ONLY_RETRY = process.env.CODEX_ROUTER_GROK_PROGRESS_ONLY_RETRY !== "0";
 const reasoningCarry = reasoningCarryEnabled() ? createReasoningCarryStore() : undefined;
-const PROGRESS_ONLY_MAX_TEXT = envNonNegativeInt(
-  "CODEX_ROUTER_GROK_PROGRESS_ONLY_MAX_TEXT",
-  DEFAULT_PROGRESS_ONLY_MAX_TEXT,
-);
-const PROGRESS_ONLY_MIN_OUTPUT_TOKENS = envNonNegativeInt(
-  "CODEX_ROUTER_GROK_PROGRESS_ONLY_MIN_OUTPUT_TOKENS",
-  DEFAULT_PROGRESS_ONLY_MIN_OUTPUT_TOKENS,
-);
-const MAX_PROGRESS_ONLY_CONVERSATIONS = 1_024;
-const progressOnlyConversations = new Set();
-
-function envNonNegativeInt(name, fallback) {
-  const parsed = Number(process.env[name]);
-  return Number.isFinite(parsed) && parsed >= 0 ? Math.floor(parsed) : fallback;
-}
-
-function rememberProgressOnlyConversation(id) {
-  if (!id) return;
-  // Refresh insertion order so the bounded set retains recently affected
-  // conversations rather than the first conversations seen by the process.
-  progressOnlyConversations.delete(id);
-  progressOnlyConversations.add(id);
-  while (progressOnlyConversations.size > MAX_PROGRESS_ONLY_CONVERSATIONS) {
-    progressOnlyConversations.delete(progressOnlyConversations.values().next().value);
-  }
-}
-
 async function drainUpstreamBody(body) {
   if (!body) return;
   try {
@@ -642,21 +610,6 @@ async function handleChatCompletions(request, response) {
       `[grok-oauth] reasoning-carry hits=${carryCounts.hits} misses=${carryCounts.misses} model=${model}`,
     );
   }
-  const holdOptions = {
-    maxText: PROGRESS_ONLY_MAX_TEXT,
-    minOutputTokens: PROGRESS_ONLY_MIN_OUTPUT_TOKENS,
-  };
-  const mayRetry = PROGRESS_ONLY_RETRY && automaticChoice &&
-    (afterToolResult || requestOffersClientTools(chat));
-  // Attempt 1 normally stays live. Once this exact conversation has actually
-  // produced a progress-only stop, buffer only its next short visible prefix.
-  // That prevents an aborted/retried turn from committing the same status
-  // sentence again without imposing the old first-byte hold on healthy chats.
-  let bufferShortProgress =
-    wantsStream &&
-    mayRetry &&
-    !postToolDecision && progressOnlyConversations.has(conversationKey);
-
   const controller = new AbortController();
   request.once("aborted", () => controller.abort());
   response.once("close", () => {
@@ -823,14 +776,6 @@ async function handleChatCompletions(request, response) {
         emittedDeltaCount += 1;
         continue;
       }
-      if (
-        bufferShortProgress &&
-        Object.hasOwn(delta, "content") &&
-        turnState.toolCalls.length === 0 &&
-        turnState.contentText.length <= PROGRESS_ONLY_MAX_TEXT
-      ) {
-        return;
-      }
       writeDelta(delta);
       emittedDeltaCount += 1;
     }
@@ -869,9 +814,7 @@ async function handleChatCompletions(request, response) {
   let selectedOutputEmitted = false;
 
   const firstDecision = postToolDecision ? classifyPostTool(turn) : undefined;
-  const progressOnly = postToolDecision
-    ? firstDecision.action === "fail" && turn.toolCalls.length === 0
-    : isProgressOnlyStop(turn, holdOptions);
+  const progressOnly = postToolDecision && isProgressOnlyStop(turn, { afterToolResult: true });
   if (postToolDecision && firstDecision.action === "final") {
     turn = { ...turn, contentText: firstDecision.contentText, toolCalls: [],
       deltas: [{ content: firstDecision.contentText }], finishReason: "stop" };
@@ -879,11 +822,10 @@ async function handleChatCompletions(request, response) {
     repairFailure = { code: "grok_post_tool_protocol_violation",
       message: "Grok returned an invalid or mixed final-answer tool call." };
   }
-  if (progressOnly) rememberProgressOnlyConversation(conversationKey);
-  if (mayRetry && progressOnly && !controller.signal.aborted) {
-    // Only prose-only/empty successful violations can be recovered, before any
+  if (progressOnly && !controller.signal.aborted) {
+    // Only empty successful responses can be recovered, before any
     // action has reached the client. Never replay malformed or mixed calls.
-    const retryChat = withProgressOnlyNudge(chat, { afterToolResult: postToolDecision, finalTool,
+    const retryChat = withProgressOnlyNudge(chat, { afterToolResult: true, finalTool,
       maxTools: maxClientTools, clientToolCount: clientTools.length });
     const retryRequest = toResponsesRequest(retryChat, { hostedSearchEnabled, recallReasoning, toolAlternatives });
     let secondUpstream;
@@ -903,12 +845,10 @@ async function handleChatCompletions(request, response) {
       console.error(
         `[grok-oauth] progress-only-retry-failed=true model=${model} status=${secondUpstream.status} ${upstreamAttemptTiming("repair", repairAttempt)}`,
       );
-      if (postToolDecision) {
-        repairFailure = {
-          code: "progress_only_retry_failed",
-          message: "Grok stopped after a tool result and its repair request failed upstream.",
-        };
-      }
+      repairFailure = {
+        code: "progress_only_retry_failed",
+        message: "Grok stopped after a tool result and its repair request failed upstream.",
+      };
     } else if (secondUpstream?.body) {
       const secondState = createTurnState({
         toolNameMapper: (name) => toolNameForCodex(toolAlternatives.originalName(name), { viewImageAlias }),
@@ -923,7 +863,7 @@ async function handleChatCompletions(request, response) {
           if (event?.type === "response.output_item.done" && event.item && !secondState.terminalStatus) {
             secondOutputItems.push(event.item);
           }
-          if (wantsStream && streamStarted && postToolDecision) {
+          if (wantsStream && streamStarted) {
             while (emittedRepairDeltaCount < secondState.deltas.length) {
               const delta = secondState.deltas[emittedRepairDeltaCount];
               if (Object.hasOwn(delta, "reasoning_content")) {
@@ -945,45 +885,23 @@ async function handleChatCompletions(request, response) {
       // Keep both client tools and the private final answer withheld until
       // response.completed. An item.done followed by EOF/failure is not a
       // certified repair, even when its arguments look complete.
-      if (postToolDecision) {
-        if (rejectUnsuccessfulTurn(second, "repair", repairAttempt)) return;
-      } else if (second.terminalStatus !== "completed") {
-        // An optional retry is speculative: the first answer already completed
-        // successfully, so a retry that did not complete is discarded and the
-        // first answer is kept below, exactly as for a failed HTTP retry.
-        console.error(
-          `[grok-oauth] progress-only-retry-failed=true model=${model} terminal=${second.terminalStatus} ${upstreamAttemptTiming("repair", repairAttempt)}`,
-        );
-      }
+      if (rejectUnsuccessfulTurn(second, "repair", repairAttempt)) return;
       retried = true;
-      const repair = postToolDecision
-        ? classifyPostTool(second)
-        : { action: shouldPreferRetryTurn(second) ? "tools" : "first" };
+      const repair = classifyPostTool(second);
       console.error(
         `[grok-oauth] progress-only-retried=true retries=1 model=${model} prefer=${repair.action} ${upstreamAttemptTiming("attempt", firstAttempt)} ${upstreamAttemptTiming("repair", repairAttempt)}`,
       );
       if (repair.action === "tools") {
         contextRequest = retryRequest;
         selectedOutputItems = secondOutputItems;
-        const usage = postToolDecision
-          ? selectedRetryUsage(turn.usage, second.usage)
-          : mergeMappedUsage(turn.usage, second.usage);
-        if (wantsStream && streamStarted && !postToolDecision) {
-          // The optional pre-tool retry's calls are emitted only on success.
-          for (const delta of toolCallDeltas(second)) {
-            writeDelta(delta);
-          }
-        }
         turn = {
-          contentText: postToolDecision ? "" : turn.contentText,
-          reasoningText: postToolDecision ? second.reasoningText : turn.reasoningText,
+          contentText: "",
+          reasoningText: second.reasoningText,
           toolCalls: second.toolCalls,
-          usage,
+          usage: selectedRetryUsage(turn.usage, second.usage),
           serviceTier: undefined,
           serviceTierUnknown: false,
-          deltas: postToolDecision
-            ? toolCallDeltas(second)
-            : [...turn.deltas, ...toolCallDeltas(second)],
+          deltas: toolCallDeltas(second),
           finishReason: "tool_calls",
           terminalStatus: "completed",
         };
@@ -1008,10 +926,8 @@ async function handleChatCompletions(request, response) {
           message:
             "Grok stopped after a tool result. The router retried once, but the retry neither called a tool nor returned a certified final answer.",
         };
-      } else {
-        turn = { ...turn, usage: mergeMappedUsage(turn.usage, second.usage), serviceTier: undefined, serviceTierUnknown: false };
       }
-    } else if (postToolDecision) {
+    } else {
       repairFailure = {
         code: "progress_only_retry_failed",
         message: "Grok stopped after a tool result and its repair request produced no response.",
@@ -1051,11 +967,6 @@ async function handleChatCompletions(request, response) {
       selectedOutputEmitted = true;
     }
   }
-
-  // A normal short answer, a failed optional repair, or the keep-first branch
-  // must still deliver attempt 1. The retry-tools branch has already advanced
-  // emittedDeltaCount past the suppressed prefix, so releasing is a no-op there.
-  bufferShortProgress = false;
 
   // A repair may consume multiple tiers. Do not label aggregate billing with
   // one attempt's tier, even when the selected answer came from that attempt.

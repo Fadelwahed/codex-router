@@ -34,6 +34,8 @@ let actual = "priority";
 let postTool = false;
 let aggregateUsage = false;
 let repair = false;
+let shortFinal = false;
+let prediction = false;
 let terminalDelayMs = 0;
 let emptyReplies = 0;
 let provider = "grok-oauth";
@@ -95,7 +97,7 @@ const upstream = http.createServer(async (req, res) => {
   } else if (compaction) {
     event({ type: "response.output_text.delta", delta: "Synthetic compaction summary." });
   } else {
-    for (const delta of pieces) event({ type: "response.output_text.delta", delta });
+    for (const delta of (shortFinal ? ["Done."] : pieces)) event({ type: "response.output_text.delta", delta });
   }
   if (terminalDelayMs) await new Promise(resolve => setTimeout(resolve, terminalDelayMs));
   event({ type: "response.completed", response: {
@@ -184,6 +186,12 @@ async function run(model, tier, streaming, reasoning, reasoningForm = "responses
   const requestBody = { model: `${provider}/${model}`, input: [{ type: "message", role: "user", content: "synthetic fixture" }], stream: streaming !== false,
     ...(tier === "omit" ? {} : { service_tier: tier }),
     ...(reasoning ? reasoningForm === "effort" ? { reasoning_effort: reasoning.effort } : { reasoning } : {}) };
+  if (shortFinal) {
+    requestBody.tools = [{ type: "function", name: "fixture_read", parameters: { type: "object", properties: {} } }];
+    if (prediction) requestBody.client_metadata = { "x-codex-turn-metadata": JSON.stringify({
+      thread_source: "composer_predictions", prediction_source_thread_id: "private-prediction-source",
+    }) };
+  }
   if (postTool) {
     requestBody.max_output_tokens = 4096;
     requestBody.tools = [{ type: "function", name: "fixture_read", parameters: { type: "object", properties: {} } }];
@@ -193,7 +201,7 @@ async function run(model, tier, streaming, reasoning, reasoningForm = "responses
         { type: "function_call_output", call_id: `seed_read_${index}`, output: "fixture complete" });
     }
   }
-  const expectedText = postTool ? expected.trimEnd() : expected;
+  const expectedText = shortFinal ? "Done." : postTool ? expected.trimEnd() : expected;
   let body;
   if (streaming === "ws") {
     const url = `${callerBaseUrl(routerPort, key)}/responses`.replace("http:", "ws:");
@@ -281,6 +289,8 @@ async function run(model, tier, streaming, reasoning, reasoningForm = "responses
     assert.equal(forwardTiming.forwardedReasoningEffort, reasoning?.effort ?? null);
     assert.equal(forwardTiming.requestedReasoningEffort, reasoning?.effort ?? null);
     assert.equal(routerTiming.requestedReasoningEffort, reasoning?.effort ?? null);
+    assert.equal(routerTiming.clientSource, prediction ? "composer_predictions" : "unknown");
+    assert.equal(JSON.stringify(routerTiming).includes("private-prediction-source"), false);
     assert.equal(forwardTiming.attempts.length, repair ? 2 : 1);
     for (const attempt of forwardTiming.attempts) {
       assert.ok(Number.isInteger(attempt.dispatchMs));
@@ -303,7 +313,7 @@ async function run(model, tier, streaming, reasoning, reasoningForm = "responses
       }
     }
   }
-  console.log(JSON.stringify({ provider, model, requested: tier, actual: want ?? "missing", streaming, reasoning: reasoning ?? "omitted", reasoningForm, terminalDelayMs, postTool, aggregateUsage, repair, contextEstimate, upstreamRequests: repair ? 2 : 1, textPieces: 1000, textPreserved: true }));
+  console.log(JSON.stringify({ provider, model, requested: tier, actual: want ?? "missing", streaming, reasoning: reasoning ?? "omitted", reasoningForm, terminalDelayMs, postTool, aggregateUsage, repair, contextEstimate, upstreamRequests: repair ? 2 : 1, shortFinal, prediction, textPieces: shortFinal ? 1 : 1000, textPreserved: true }));
 }
 
 async function runCompaction(v2, stream, effortFields) {
@@ -402,6 +412,15 @@ try {
     CODEX_ROUTER_SHOW_ALL_MODELS: "1", CODEX_ROUTER_QUIET: "1",
   });
   await ready(`${callerBaseUrl(routerPort, key)}/models`, router);
+  shortFinal = true;
+  for (const source of [false, true]) {
+    prediction = source;
+    for (const streaming of [true, false, "ws"]) {
+      await run("grok-4.7", "priority", streaming, { effort: "high" });
+    }
+  }
+  shortFinal = false;
+  prediction = false;
   for (const streaming of [true, false, "ws"]) {
     actual = "priority"; await run("grok-4.6", "priority", streaming);
     actual = "default"; await run("grok-4.6", "priority", streaming);

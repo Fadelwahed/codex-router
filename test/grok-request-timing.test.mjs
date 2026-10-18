@@ -117,3 +117,33 @@ test("router timing separates committed HTTP status from the settled request out
   assert.equal(rows[0].generationOutcome, undefined);
   assert.doesNotMatch(JSON.stringify(rows), /private/);
 });
+
+
+test("request source uses explicit Codex metadata without logging arbitrary caller values", () => {
+  const key = "x-codex-turn-metadata";
+  const prediction = JSON.stringify({ thread_source: "composer_predictions", prediction_source_thread_id: "private-id", tool_namespaces_info: "private" });
+  const cases = [
+    [{}, { [key]: prediction }, "composer_predictions"],
+    [{ client_metadata: { [key]: prediction } }, {}, "composer_predictions"],
+    [{ client_metadata: { [key]: '{"thread_source":"private"}' } }, { [key]: prediction }, "unknown"],
+    [{ client_metadata: { [key]: "broken" } }, { [key]: prediction }, "unknown"],
+    [{ client_metadata: { [key]: null } }, { [key]: prediction }, "unknown"],
+    [{}, { [key]: '{"thread_source":"private"}' }, "unknown"],
+    [{}, { [key]: "null" }, "unknown"],
+    [{}, { [key]: "[]" }, "unknown"],
+    [{}, { [key]: [prediction] }, "unknown"],
+    [{ instructions: "composer_predictions", reasoning: { effort: "high" } }, {}, "unknown"],
+  ];
+  for (const [payload, headers, expected] of cases) {
+    const { timing, rows } = fixture("router");
+    timing.clientRequest(payload, headers);
+    timing.finish("response_finished", 200);
+    timing.clientRequest({}, {});
+    assert.equal(rows[0].clientSource, expected);
+    assert.doesNotMatch(JSON.stringify(rows), /private|prediction_source|tool_namespaces/);
+  }
+  const { timing, rows } = fixture();
+  timing.clientRequest({}, { [key]: prediction });
+  timing.finish("response_finished", 200);
+  assert.equal(rows[0].clientSource, undefined, "forwarder joins attribution by the owned request ID");
+});
