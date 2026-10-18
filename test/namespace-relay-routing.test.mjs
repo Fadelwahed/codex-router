@@ -3434,3 +3434,52 @@ test("Console Go Muse Contributor routes carry Codex handoffs as user messages",
     "an untouched Console Go route keeps the collaboration item",
   );
 });
+
+
+test("Grok timing records a rejected streamed patch as failed despite committed HTTP 200", async () => {
+  const result = await scenario(true, {
+    model: "grok-oauth/grok-4.7",
+    routerEnv: { CODEX_ROUTER_GROK_STRUCTURED_PATCH: "1", CODEX_ROUTER_GROK_PATCH_HOOK: "0" },
+    requestPayload: (stream, model) => ({ model, stream, input: "Synthetic patch rejection.", tools: [{ type: "custom", name: "apply_patch" }] }),
+    sseBody: (body) => {
+      const name = body.tools.find(tool => tool.parameters?.properties?.operations)?.name;
+      assert.ok(name, "the actual routed structured patch schema is advertised");
+      return [
+        { type: "response.created", response: { id: "resp_timing_failure", status: "in_progress", model: body.model, output: [] } },
+        { type: "response.output_item.added", output_index: 0, item: {
+          id: "fc_timing", call_id: "call_timing", type: "function_call", name, arguments: "", status: "in_progress",
+        } },
+        { type: "response.function_call_arguments.done", item_id: "fc_timing", output_index: 0, arguments: '{"operations":[]}' },
+        { type: "response.completed", response: { id: "resp_timing_failure", status: "completed", output: [] } },
+      ].map(event => `data: ${JSON.stringify(event)}\n\n`).join("");
+    },
+  });
+  assert.equal(result.status, 200);
+  assert.equal(result.gatewayBodies.length, 1);
+  assert.doesNotMatch(result.clientBody, /"type":"response.completed"/);
+  const rows = result.router.testErrors().split("\n").filter(line => line.startsWith("[grok-timing] "))
+    .map(line => JSON.parse(line.slice("[grok-timing] ".length)));
+  assert.equal(rows.length, 1, "finish and close must not duplicate timing records");
+  assert.equal(rows[0].httpStatus, 200);
+  assert.equal(rows[0].requestStatus, 502);
+  assert.equal(rows[0].generationOutcome, "failed");
+  assert.match(result.router.testErrors(), /invalid custom tool arguments done/);
+});
+
+
+test("Grok timing waits for a successful handler outcome after the response finishes", async () => {
+  const result = await scenario(false, {
+    model: "grok-oauth/grok-4.7",
+    requestPayload: (stream, model) => ({ model, stream, input: "Synthetic completed response." }),
+    jsonBody: (body) => ({ id: "resp_timing_ok", object: "response", status: "completed", model: body.model,
+      output: [{ type: "message", role: "assistant", status: "completed", content: [{ type: "output_text", text: "done" }] }],
+      usage: { input_tokens: 10, output_tokens: 1, total_tokens: 11 },
+    }),
+  });
+  const rows = result.router.testErrors().split("\n").filter(line => line.startsWith("[grok-timing] "))
+    .map(line => JSON.parse(line.slice("[grok-timing] ".length)));
+  assert.equal(rows.length, 1);
+  assert.equal(rows[0].httpStatus, 200);
+  assert.equal(rows[0].requestStatus, 200);
+  assert.equal(rows[0].generationOutcome, "completed");
+});

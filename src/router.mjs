@@ -4483,10 +4483,16 @@ async function handleResponses(request, response, requestUrl) {
   const activity = beginRequestActivity({ request, response, controller });
   setGrokTimingRequestId(request, activity.requestId);
   const timing = createGrokRequestTiming({ layer: "router", requestId: activity.requestId });
+  let timingTransportOutcome;
+  let timingRequestResult;
   const finishTiming = (outcome) => {
-    if (route?.provider === "grok-oauth") {
+    timingTransportOutcome ??= outcome;
+    // A response may finish before the request handler settles (including
+    // compaction), or after its finally block when the outer handler reports
+    // an error. Join both facts instead of treating a committed 200 as success.
+    if (route?.provider === "grok-oauth" && timingTransportOutcome && timingRequestResult) {
       timing.identify(route.slug, requestedReasoningEffort);
-      timing.finish(outcome, response.statusCode);
+      timing.finish(timingTransportOutcome, response.statusCode, timingRequestResult);
     }
   };
   response.once("finish", () => finishTiming("response_finished"));
@@ -6164,6 +6170,8 @@ async function handleResponses(request, response, requestUrl) {
     throw error;
   } finally {
     const status = activityStatus ?? finalStatus ?? response.statusCode;
+    timingRequestResult = { requestStatus: status, generationOutcome };
+    finishTiming();
     activity.finish(status, { generationOutcome, httpStatus: turnHttpStatus });
     // Timestamped per-request timing for latency diagnosis. Never gated on
     // QUIET: the production LaunchAgent hard-sets CODEX_ROUTER_QUIET=1. A

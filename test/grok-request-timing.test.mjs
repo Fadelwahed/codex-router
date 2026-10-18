@@ -101,3 +101,19 @@ test("native client search records tool readiness after namespace restoration", 
   assert.equal(rows[0].firstToolReadyMs, 5);
   assert.equal(rows[0].terminal, "completed");
 });
+
+
+test("router timing separates committed HTTP status from the settled request outcome", () => {
+  for (const [requestStatus, generationOutcome] of [[200, "completed"], [502, "failed"], [0, "canceled"]]) {
+    const { timing, rows } = fixture("router");
+    timing.finish(requestStatus === 0 ? "connection_closed" : "response_finished", 200, { requestStatus, generationOutcome });
+    assert.equal(rows[0].httpStatus, 200);
+    assert.equal(rows[0].requestStatus, requestStatus);
+    assert.equal(rows[0].generationOutcome, generationOutcome);
+  }
+  const { timing, rows } = fixture("router");
+  timing.finish("response_finished", 200, { requestStatus: "private", generationOutcome: "private" });
+  assert.equal(rows[0].requestStatus, undefined);
+  assert.equal(rows[0].generationOutcome, undefined);
+  assert.doesNotMatch(JSON.stringify(rows), /private/);
+});

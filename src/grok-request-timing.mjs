@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { knownGenerationOutcome } from "./response-outcome.mjs";
 import { grokToolDiagnostics } from "./grok-tool-diagnostics.mjs";
 
 export const GROK_TIMING_HEADER = "x-codex-router-request-id";
@@ -115,7 +116,7 @@ export function createGrokRequestTiming({ layer, requestId, now = () => performa
         },
       };
     },
-    finish(outcome, status) {
+    finish(outcome, status, { requestStatus, generationOutcome } = {}) {
       if (finished) return;
       row.totalMs = stamp();
       row.outcome = outcome === "response_finished" ? outcome : "connection_closed";
@@ -126,6 +127,13 @@ export function createGrokRequestTiming({ layer, requestId, now = () => performa
         }
       }
       if (Number.isInteger(status) && status >= 100 && status <= 599) row.httpStatus = status;
+      if (layer === "router") {
+        if (Number.isInteger(requestStatus) && (requestStatus === 0 || requestStatus >= 100 && requestStatus <= 599)) {
+          row.requestStatus = requestStatus;
+        }
+        const settledOutcome = knownGenerationOutcome(generationOutcome);
+        if (settledOutcome) row.generationOutcome = settledOutcome;
+      }
       finished = true;
       emit(row);
     },
