@@ -129,6 +129,23 @@ proves the core tool protocol, not that a live model will select the right tool
 or that a desktop chat has the same additional MCP registrations. Runtime
 inventories make the latter observable without recording private schemas.
 
+## Structured patch argument failures
+
+`invalid custom tool arguments done: CODE` means the streamed function arguments
+could not be compiled to the native custom-tool input. The suffix is a bounded
+compiler category, such as `empty_anchor`, `embedded_line_separator`,
+`nonliteral_path`, `no_change`, or `nonfinal_eof`. No argument text or file path
+is included. Unknown exceptions and other custom codecs retain the generic
+message; a missing suffix does not establish a particular compiler failure.
+
+The structured schema forbids empty optional anchors, embedded CR/LF/NUL in
+logical lines, trimmed paths and context-only hunks. Omit `anchor` when unused.
+Only the final hunk for a path may set `endOfFile: true`; cross-hunk, Unicode and
+aggregate byte constraints are still checked by the compiler. The Router does
+not silently repair an invalid edit, execute it, or retry after committed output.
+Older generic errors cannot identify which constraint was violated. Tightening
+the schema is not proof that a live model will always follow it.
+
 ## Verification
 
 `node scripts/verify-grok-service-tier.mjs .venv/bin/python` exercises the

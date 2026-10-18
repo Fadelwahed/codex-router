@@ -2604,6 +2604,7 @@ function customToolInput(
   allowPlaceholder = false,
   property = CUSTOM_TOOL_INPUT_PROPERTY,
   codec,
+  diagnostic,
 ) {
   if (allowPlaceholder && (value === undefined || value === "")) return "";
   const argumentsText = codec?.preserveRawArguments === true ? value : coerceFunctionCallArguments(value);
@@ -2611,7 +2612,8 @@ function customToolInput(
   if (codec) {
     try {
       return codec.decodeArguments(argumentsText);
-    } catch {
+    } catch (error) {
+      if (diagnostic) diagnostic.code = codec.argumentErrorCode?.(error);
       return undefined;
     }
   }
@@ -4454,11 +4456,12 @@ export class NamespaceToolCallTransform extends Transform {
             matched.state.sourceType === "custom_tool_call"
               ? LITELLM_CUSTOM_TOOL_INPUT_PROPERTY
               : CUSTOM_TOOL_INPUT_PROPERTY;
+          const diagnostic = {};
           const input = matched.state.sourceType === "custom_tool_call" && !matched.state.codec
             ? litellmCustomToolInput(event.arguments)
-            : customToolInput(event.arguments, false, argumentProperty, matched.state.codec);
+            : customToolInput(event.arguments, false, argumentProperty, matched.state.codec, diagnostic);
           if (input === undefined) {
-            return this.#unsafeSseFrame(frame, "invalid custom tool arguments done");
+            return this.#unsafeSseFrame(frame, `invalid custom tool arguments done${diagnostic.code ? `: ${diagnostic.code}` : ""}`);
           }
           const codecReason = this.#validateCodecSource(matched.state, event.arguments);
           if (codecReason) return this.#unsafeSseFrame(frame, codecReason);

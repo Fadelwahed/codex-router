@@ -188,3 +188,27 @@ test("codec-enabled malformed/oversized framing never uses legacy fail-open", as
     assert.equal(result.output, "");
   }
 });
+
+
+test("invalid argument done reports a safe compiler category without committing an edit", async () => {
+  const line = { kind: "add", text: "PRIVATE_SOURCE_TEXT" };
+  for (const [hunks, code] of [
+    [[{ anchor: "", lines: [line] }], "empty_anchor"],
+    [[{ lines: [{ ...line, text: "PRIVATE_SOURCE_TEXT\n" }] }], "embedded_line_separator"],
+    [[{ lines: [{ ...line, kind: "context" }] }], "no_change"],
+    [[{ endOfFile: true, lines: [line] }, { lines: [line] }], "nonfinal_eof"],
+  ]) {
+    const bridge = setup();
+    const value = JSON.stringify({ operations: [{ op: "update", path: "private-name.txt", hunks }] });
+    const result = await relay(bridge, events(bridge.name, value));
+    assert.equal(result.error?.code, "ERR_NAMESPACE_RELAY_COMMITTED_STREAM");
+    assert.ok(result.error.message.includes(`invalid custom tool arguments done: ${code}`));
+    assert.doesNotMatch(result.error.message, /PRIVATE_SOURCE_TEXT|private-name/);
+    assert.doesNotMatch(result.output, /response.custom_tool_call_input.done|response.output_item.done|PRIVATE_SOURCE_TEXT|private-name/);
+  }
+  const bridge = setup();
+  const valid = JSON.stringify({ operations: [{ op: "update", path: "x", hunks: [{ lines: [line] }] }] });
+  const result = await relay(bridge, events(bridge.name, valid));
+  assert.ifError(result.error);
+  assert.equal(parsed(result.output).filter(x => x.type === "response.custom_tool_call_input.done").length, 1);
+});

@@ -5,6 +5,7 @@ import {
   compileStructuredPatchArguments,
   compileWriteArguments,
   GROK_STRUCTURED_PATCH_PARAMETERS,
+  GROK_STRUCTURED_PATCH_CODEC,
   MAX_STRUCTURED_PATCH_BYTES,
   serializeStructuredPatch,
   StructuredPatchError,
@@ -209,4 +210,46 @@ test("whole-line replacement emits no skip anchor and preserves unchanged select
   assert.equal(patch, ["*** Begin Patch", "*** Update File: sample.js", "@@",
     "-function sample() {", "-  return 1;", "-}", "+function sample() {", "+  return 2;", "+}", "*** End Patch"].join("\n"));
   assert.ok(!patch.includes("@@ function"));
+});
+
+
+test("advertised logical lines and paths reject compiler-incompatible characters", () => {
+  const branches = GROK_STRUCTURED_PATCH_PARAMETERS.properties.operations.items.anyOf;
+  const lineSchema = branches[0].properties.lines.items;
+  const linePattern = new RegExp(lineSchema.pattern, "u");
+  for (const value of ["", "Привет 🧙", "  indented", "a\u0085b", "*** End Patch"]) {
+    assert.ok(linePattern.test(value), JSON.stringify(value));
+    assert.doesNotThrow(() => serializeStructuredPatch(wrap(add("x", [value]))));
+  }
+  for (const value of ["a\nb", "a\n", "\r", "a\0b"]) {
+    assert.equal(linePattern.test(value), false, JSON.stringify(value));
+    assert.throws(() => serializeStructuredPatch(wrap(add("x", [value]))), { code: "embedded_line_separator" });
+  }
+  for (const branch of branches) {
+    const pattern = new RegExp(branch.properties.path.pattern, "u");
+    for (const value of ["x", "a b.txt", "dir/a\u0085b.txt", "🧙.txt"]) assert.ok(pattern.test(value), value);
+    for (const value of [" x", "x ", "x\n", "x\r", "x\0", "\u0085x", "x\ufeff", "x\u2028", "x\u3000"]) {
+      assert.equal(pattern.test(value), false, JSON.stringify(value));
+      assert.throws(() => serializeStructuredPatch(wrap(add(value))), StructuredPatchError);
+    }
+  }
+});
+
+test("advertised hunks require a nonempty optional anchor and at least one change", () => {
+  const hunk = GROK_STRUCTURED_PATCH_PARAMETERS.properties.operations.items.anyOf[2].properties.hunks.items;
+  assert.equal(hunk.required.includes("anchor"), false);
+  assert.equal(hunk.properties.anchor.minLength, 1);
+  const change = hunk.properties.lines.contains;
+  assert.deepEqual(change.required, ["kind"]);
+  assert.deepEqual(change.properties.kind.enum, ["add", "remove"]);
+  assert.doesNotThrow(() => serializeStructuredPatch(wrap(update([addLine("x")]))));
+  assert.throws(() => serializeStructuredPatch(wrap(update([addLine("x")], { anchor: "" }))), { code: "empty_anchor" });
+  assert.throws(() => serializeStructuredPatch(wrap(update([{ kind: "context", text: "x" }]))), { code: "no_change" });
+});
+
+test("codec diagnostics disclose only recognized compiler-owned categories", () => {
+  assert.equal(GROK_STRUCTURED_PATCH_CODEC.argumentErrorCode(new StructuredPatchError("empty_anchor")), "empty_anchor");
+  for (const error of [new Error("PRIVATE_ARGUMENT"), { code: "empty_anchor" }, new StructuredPatchError("PRIVATE_ARGUMENT")]) {
+    assert.equal(GROK_STRUCTURED_PATCH_CODEC.argumentErrorCode(error), undefined);
+  }
 });

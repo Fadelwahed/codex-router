@@ -21,6 +21,36 @@ export class StructuredPatchError extends Error {
   }
 }
 
+const diagnosticCodes = new Set([
+  "accessor_field",
+  "ambiguous_or_invalid_json",
+  "arguments_too_large",
+  "array_bounds",
+  "boolean_required",
+  "crlf_unrepresentable",
+  "duplicate_path",
+  "embedded_line_separator",
+  "empty_anchor",
+  "empty_old_string",
+  "invalid_unicode",
+  "json_string_required",
+  "line_too_long",
+  "missing_field",
+  "missing_trailing_newline",
+  "no_change",
+  "nonfinal_eof",
+  "nonliteral_path",
+  "object_required",
+  "patch_too_large",
+  "plain_object_required",
+  "sparse_array",
+  "string_required",
+  "trailing_newline_unrepresentable",
+  "unknown_field",
+  "unsupported_line_kind",
+  "unsupported_operation",
+]);
+
 function reject(code) {
   throw new StructuredPatchError(code);
 }
@@ -256,8 +286,18 @@ function normalizeGrokEdit(value) {
   reject("missing_field");
 }
 
-const textSchema = { type: "string", maxLength: MAX_LINE_LENGTH };
-const pathSchema = { ...textSchema, minLength: 1 };
+// Patterns are portable JSON Schema regexes (no Unicode property escapes).
+// A negative lookahead rejects separators anywhere, including a final LF
+// that JavaScript's `$` alone would otherwise allow.
+const textSchema = {
+  type: "string", maxLength: MAX_LINE_LENGTH,
+  pattern: "^(?![\\s\\S]*[\\r\\n\\u0000])",
+};
+const pathWhitespace = "\\u0009-\\u000d\\u0020\\u0085\\u00a0\\u1680\\u2000-\\u200a\\u2028\\u2029\\u202f\\u205f\\u3000\\ufeff";
+const pathSchema = {
+  ...textSchema, minLength: 1,
+  pattern: `${textSchema.pattern}(?![${pathWhitespace}])(?![\\s\\S]*[${pathWhitespace}]$)`,
+};
 const linesSchema = { type: "array", maxItems: MAX_LINES, items: textSchema };
 const objectSchema = (properties, required = Object.keys(properties)) => ({
   type: "object", properties, required, additionalProperties: false,
@@ -277,10 +317,11 @@ export const GROK_STRUCTURED_PATCH_PARAMETERS = objectSchema({
           hunks: {
             type: "array", minItems: 1, maxItems: MAX_HUNKS,
             items: objectSchema({
-              anchor: textSchema,
-              endOfFile: { type: "boolean" },
+              anchor: { ...textSchema, minLength: 1, description: "Omit when no anchor is needed; otherwise a nonempty literal logical line." },
+              endOfFile: { type: "boolean", description: "May be true only on the last hunk for this path." },
               lines: {
                 type: "array", minItems: 1, maxItems: MAX_LINES,
+                contains: { type: "object", properties: { kind: { enum: ["add", "remove"] } }, required: ["kind"] },
                 items: objectSchema({
                   kind: { type: "string", enum: ["context", "add", "remove"] },
                   text: textSchema,
@@ -299,6 +340,11 @@ export const GROK_STRUCTURED_PATCH_CODEC = {
   parameters: GROK_STRUCTURED_PATCH_PARAMETERS,
   maxArgumentBytes: MAX_STRUCTURED_PATCH_BYTES,
   decodeArguments: compileStructuredPatchArguments,
+  // Only compiler-owned categories may enter a relay error; never echo a
+  // provider argument, arbitrary exception message, or unrecognized code.
+  argumentErrorCode(error) {
+    return error instanceof StructuredPatchError && diagnosticCodes.has(error.code) ? error.code : undefined;
+  },
   description(original) {
     return [
       typeof original === "string" ? original : "Apply a patch to files.",

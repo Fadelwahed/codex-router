@@ -81,6 +81,41 @@ if (!python) {
   );
 }
 
+// The locked gateway includes jsonschema. Check compiler/schema parity with an
+// independent validator before starting any servers, on every protocol CI OS.
+if (structured && !nativeHook) {
+  const update = (hunk) => ({ operations: [{ op: "update", path: "x", hunks: [hunk] }] });
+  const added = { kind: "add", text: "new" };
+  const cases = [
+    ["empty anchor", update({ anchor: "", lines: [added] }), false],
+    ["embedded newline", { operations: [{ op: "add", path: "x", lines: ["a\nb"] }] }, false],
+    ["trimmed path", { operations: [{ op: "delete", path: " x" }] }, false],
+    ["no change", update({ lines: [{ kind: "context", text: "unchanged" }] }), false],
+    ["unanchored update", update({ lines: [added] }), true],
+    ["anchored update", update({ anchor: "fn", lines: [added], endOfFile: true }), true],
+    ["empty file", { operations: [{ op: "add", path: "x", lines: [] }] }, true],
+    ["Unicode", { operations: [{ op: "add", path: "🧙.txt", lines: ["Привет", ""] }] }, true],
+  ];
+  for (const [name, value, valid] of cases) {
+    if (valid) assert.doesNotThrow(() => serializeStructuredPatch(value), name);
+    else assert.throws(() => serializeStructuredPatch(value), undefined, name);
+  }
+  const checked = spawnSync(python, ["-c", [
+    "import json,sys,jsonschema",
+    "data=json.load(sys.stdin)",
+    "jsonschema.Draft202012Validator.check_schema(data['schema'])",
+    "validator=jsonschema.Draft202012Validator(data['schema'])",
+    "for name,value,expected in data['cases']:",
+    "    assert validator.is_valid(value) == expected, name",
+  ].join("\n")], {
+    input: JSON.stringify({ schema: GROK_STRUCTURED_PATCH_CODEC.parameters, cases }),
+    encoding: "utf8", timeout: 30_000,
+  });
+  assert.ifError(checked.error);
+  assert.equal(checked.status, 0, checked.stderr);
+  process.stdout.write(`ok ${cases.length} independent structured patch schema/compiler cases\n`);
+}
+
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const CALLER_KEY = "test-router-caller-capability-with-sufficient-length";
 const INTERNAL_KEY = "test-internal-service-key-with-sufficient-length";
