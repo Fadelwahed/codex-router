@@ -14,6 +14,7 @@ const FAILURES = {
   invalid_stream: [502, "ERR_NATIVE_AGENT_RELAY_INVALID_STREAM", "returned an invalid response stream"],
   invalid_arguments: [502, "ERR_NATIVE_AGENT_RELAY_INVALID_ARGUMENTS", "returned invalid task arguments"],
   missing_payload: [502, "ERR_NATIVE_AGENT_RELAY_MISSING_PAYLOAD", "omitted the task payload"],
+  conflicting_arguments: [502, "ERR_NATIVE_AGENT_RELAY_CONFLICTING_ARGUMENTS", "returned conflicting task arguments"],
   ambiguous_payload: [502, "ERR_NATIVE_AGENT_RELAY_AMBIGUOUS_PAYLOAD", "returned multiple task payloads"],
 };
 export function agentRelayError(kind) {
@@ -55,12 +56,19 @@ export function parseAgentRelayResponse(bytes, contentType = "") {
   }
   const calls = new Map();
   let completed = false;
+  const snapshot = (call, argumentsText) => {
+    if (typeof argumentsText !== "string") throw agentRelayError("invalid_arguments");
+    if (!argumentsText.startsWith(call.arguments || "")) throw agentRelayError("conflicting_arguments");
+    call.arguments = argumentsText;
+  };
   const remember = item => {
     if (item?.type !== "function_call" || item.name !== AGENT_PAYLOAD_RELAY_TOOL) return;
     const key = item.id || item.call_id;
     if (!key) throw agentRelayError("invalid_stream");
     const previous = calls.get(key);
-    calls.set(key, { ...previous, ...item });
+    const call = { ...previous, ...item, arguments: previous?.arguments || "" };
+    if (item.arguments !== undefined) snapshot(call, item.arguments);
+    calls.set(key, call);
   };
   for (const block of text.split(/\r?\n\r?\n/)) {
     const lines = block.split(/\r?\n/);
@@ -73,9 +81,13 @@ export function parseAgentRelayResponse(bytes, contentType = "") {
     if (type === "error" || type === "response.failed" || event.response?.status === "failed") throw upstreamFailure(event);
     if (type === "response.incomplete" || event.response?.status === "incomplete") throw agentRelayError("incomplete");
     if (["response.output_item.added", "response.output_item.done"].includes(type)) remember(event.item);
-    if (type === "response.function_call_arguments.done") {
+    if (["response.function_call_arguments.delta", "response.function_call_arguments.done"].includes(type)) {
       const call = [...calls.values()].find(i => event.item_id === i.id || event.call_id && event.call_id === i.call_id);
-      if (call) call.arguments = event.arguments;
+      if (call && type === "response.function_call_arguments.done") snapshot(call, event.arguments);
+      else if (call) {
+        if (typeof event.delta !== "string") throw agentRelayError("invalid_arguments");
+        call.arguments += event.delta;
+      }
     }
     if (type === "response.completed") {
       if (event.response?.status !== undefined && event.response.status !== "completed") throw agentRelayError("incomplete");

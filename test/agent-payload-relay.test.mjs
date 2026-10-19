@@ -69,3 +69,21 @@ test("outer JSON errors cannot be concealed by an inner completed response", () 
   const body = { error: { code: "rate_limit_exceeded", message: "PRIVATE" }, response: { status: "completed", output: [item] } };
   assert.throws(() => parseAgentRelayResponse(Buffer.from(JSON.stringify(body))), { status: 429, code: "ERR_NATIVE_AGENT_RELAY_RATE_LIMITED" });
 });
+
+test("relay snapshots extend the observed argument prefix without replacing task bytes", () => {
+  const prefix = item.arguments.slice(0, 10);
+  const partial = { ...added, item: { ...item, arguments: prefix } };
+  const delta = { type: "response.function_call_arguments.delta", item_id: item.id, delta: item.arguments.slice(10, 15) };
+  assert.equal(parseAgentRelayResponse(sse([partial, delta, args, { type: "response.output_item.done", item }, { ...done, response: { status: "completed", output: [item] } }])), "exact\n task\t ");
+  const conflicting = JSON.stringify({ payload: "PRIVATE_REPLACEMENT" });
+  const snapshots = [
+    { ...added, item: { ...item, arguments: conflicting } },
+    { ...args, arguments: conflicting },
+    { type: "response.output_item.done", item: { ...item, arguments: conflicting } },
+    { ...done, response: { status: "completed", output: [{ ...item, arguments: conflicting }] } },
+  ];
+  for (const event of snapshots) {
+    fails([partial, delta, args, event, done], "CONFLICTING_ARGUMENTS");
+  }
+  fails([partial, delta, { ...args, arguments: prefix }, done], "CONFLICTING_ARGUMENTS");
+});

@@ -27,7 +27,8 @@ requests do not establish the causal effect of effort.
 - The previous relay parser accepted arguments before checking the full response
   and did not classify HTTP-200 SSE errors. The candidate requires a completed
   response and one unambiguous task call, fails closed on incomplete/error
-  responses, and preserves safe 401/429 classifications and account-scoped
+  responses, rejects conflicting argument snapshots/deltas before caching a task,
+  and preserves safe 401/429 classifications and account-scoped
   rate-limit backoff. Provider messages and task contents are not logged.
 - Routed compaction inherited execution instructions at system/developer level
   while the checkpoint instruction was merely a user message. The candidate
