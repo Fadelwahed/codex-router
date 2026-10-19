@@ -599,6 +599,8 @@ async function handleChatCompletions(request, response) {
   });
   const responsesRequest = toResponsesRequest(firstChat, { hostedSearchEnabled, recallReasoning, toolAlternatives });
   timing.identify(model, chat.reasoning_effort, responsesRequest.reasoning?.effort);
+  timing.serviceTier("requested", chat.service_tier);
+  timing.serviceTier("forwarded", responsesRequest.service_tier);
   timing.parallelTools("gateway", chat.parallel_tool_calls);
   timing.parallelTools("upstream", responsesRequest.parallel_tool_calls);
   timing.tools("gateway", chat.tools);
@@ -796,7 +798,7 @@ async function handleChatCompletions(request, response) {
     firstAttempt.timing.end("stream_end");
   } catch (error) {
     firstAttempt.endedAt = Date.now();
-    firstAttempt.timing.end(controller.signal.aborted ? "cancelled" : "transport_error");
+    firstAttempt.timing.end(controller.signal.aborted ? "cancelled" : error?.code === "grok_tool_arguments_mismatch" ? "protocol_error" : "transport_error");
     logUpstreamPhaseFailure("attempt", model, firstAttempt, error);
     throw error;
   }
@@ -877,7 +879,7 @@ async function handleChatCompletions(request, response) {
         repairAttempt.timing.end("stream_end");
       } catch (error) {
         repairAttempt.endedAt = Date.now();
-        repairAttempt.timing.end(controller.signal.aborted ? "cancelled" : "transport_error");
+        repairAttempt.timing.end(controller.signal.aborted ? "cancelled" : error?.code === "grok_tool_arguments_mismatch" ? "protocol_error" : "transport_error");
         logUpstreamPhaseFailure("repair", model, repairAttempt, error);
         throw error;
       }

@@ -1,3 +1,4 @@
+import { AGENT_PAYLOAD_RELAY_TOOL, agentRelayHeaders, agentRelayError, parseAgentRelayResponse } from "./agent-payload-relay.mjs";
 import { resolveGenerationOutcome } from "./response-outcome.mjs";
 import { createGrokRequestTiming, setGrokTimingRequestId } from "./grok-request-timing.mjs";
 import { grokBridgeRequest } from "./grok-request-compat.mjs";
@@ -21,7 +22,6 @@ import {
 } from "./caller-auth.mjs";
 import {
   CHECKPOINT_WARNING,
-  COMPACTION_PROMPT,
   encodeCheckpoint,
   finalizeCheckpoint,
   isRouterCompactionValue,
@@ -31,6 +31,7 @@ import {
   renderCheckpoint,
   renderCompactionValue,
 } from "./compaction-checkpoint.mjs";
+import { compactionInstructionBoundary } from "./compaction-instructions.mjs";
 import { handlePanelRequest, isPanelRoute } from "./desktop-panel.mjs";
 import { handleGeminiRequest, isGeminiRoute } from "./gemini-surface.mjs";
 import { handleCursorRequest, isCursorRoute } from "./cursor-surface.mjs";
@@ -525,7 +526,6 @@ const NATIVE_IMAGE_PATHS = new Set([
   "/v1/images/generations",
 ]);
 const NATIVE_SEARCH_PATHS = new Set(["/alpha/search", "/v1/alpha/search"]);
-const AGENT_PAYLOAD_RELAY_TOOL = "relay_external_agent_payload";
 const configuredAgentPayloadCacheTtlMs = Number(
   process.env.MODEL_ROUTER_AGENT_PAYLOAD_CACHE_TTL_MS ||
     process.env.CODEX_ROUTER_AGENT_PAYLOAD_CACHE_TTL_MS ||
@@ -1836,83 +1836,8 @@ function encryptedAgentPayload(item) {
   };
 }
 
-function parseRelayedAgentPayload(payload) {
-  const output = payload?.item
-    ? [payload.item]
-    : Array.isArray(payload?.output)
-      ? payload.output
-      : Array.isArray(payload?.response?.output)
-        ? payload.response.output
-        : [];
-  const call = output.find(
-    (item) => item?.type === "function_call" && item.name === AGENT_PAYLOAD_RELAY_TOOL,
-  );
-  if (!call) return undefined;
-  return parseRelayedAgentArguments(call.arguments);
-}
-
-function parseRelayedAgentArguments(value) {
-  try {
-    const args = typeof value === "string" ? JSON.parse(value) : value;
-    return typeof args?.payload === "string" ? args.payload : undefined;
-  } catch {
-    return undefined;
-  }
-}
-
-function parseRelayedAgentPayloadSse(bytes) {
-  const events = bytes.toString("utf8").split(/\r?\n\r?\n/);
-  const relayItems = new Set();
-  let argumentDeltas = "";
-  for (const rawEvent of events) {
-    const data = rawEvent
-      .split(/\r?\n/)
-      .filter((line) => line.startsWith("data:"))
-      .map((line) => line.slice(5).trimStart())
-      .join("\n")
-      .trim();
-    if (!data || data === "[DONE]") continue;
-    try {
-      const event = JSON.parse(data);
-      if (
-        event?.type === "response.output_item.added" &&
-        event.item?.type === "function_call" &&
-        event.item.name === AGENT_PAYLOAD_RELAY_TOOL
-      ) {
-        if (event.item.id) relayItems.add(event.item.id);
-        if (event.item.call_id) relayItems.add(event.item.call_id);
-      }
-      const relatedArgumentEvent =
-        relayItems.size === 0 ||
-        relayItems.has(event?.item_id) ||
-        relayItems.has(event?.call_id);
-      if (
-        event?.type === "response.function_call_arguments.delta" &&
-        relatedArgumentEvent &&
-        typeof event.delta === "string"
-      ) {
-        argumentDeltas += event.delta;
-      }
-      if (
-        event?.type === "response.function_call_arguments.done" &&
-        relatedArgumentEvent
-      ) {
-        const completed = parseRelayedAgentArguments(event.arguments);
-        if (completed !== undefined) return completed;
-      }
-      const plaintext = parseRelayedAgentPayload(event);
-      if (plaintext !== undefined) return plaintext;
-    } catch {
-      // Ignore malformed or unrelated events and continue to the completion item.
-    }
-  }
-  const accumulated = parseRelayedAgentArguments(argumentDeltas);
-  if (accumulated !== undefined) return accumulated;
-  return undefined;
-}
-
 function nativeRelayContext(request) {
-  const headers = nativeHeaders(request);
+  const headers = agentRelayHeaders(nativeHeaders(request));
   const authorization =
     typeof headers.authorization === "string" ? headers.authorization : "";
   const account = nativeAccountKey(headers);
@@ -1936,17 +1861,11 @@ function agentPayloadCacheKey(encrypted, accountScope) {
 }
 
 function nativeAgentRelayRateLimitError() {
-  const error = new Error("Native collaboration payload relay is rate limited.");
-  error.status = 429;
-  error.code = "ERR_NATIVE_AGENT_RELAY_RATE_LIMITED";
-  return error;
+  return agentRelayError("rate_limited");
 }
 
 function nativeAgentRelayUnauthorizedError() {
-  const error = new Error("Native collaboration payload relay requires refreshed authentication.");
-  error.status = 401;
-  error.code = "ERR_NATIVE_AGENT_RELAY_UNAUTHORIZED";
-  return error;
+  return agentRelayError("unauthorized");
 }
 
 function purgeExpiredAgentRelayFailures(now = Date.now()) {
@@ -2112,20 +2031,10 @@ async function relayEncryptedAgentPayloadOnce(
     throw error;
   }
   let plaintext;
-  const contentType = String(upstream.headers.get("content-type") || "").toLowerCase();
-  const looksLikeSse = /^(?:event|data):/m.test(bytes.toString("utf8"));
-  if (contentType.includes("text/event-stream") || looksLikeSse) {
-    plaintext = parseRelayedAgentPayloadSse(bytes);
-  } else {
-    try {
-      plaintext = parseRelayedAgentPayload(JSON.parse(bytes.toString("utf8")));
-    } catch {
-      // The error below intentionally avoids logging the opaque collaboration body.
-    }
-  }
-  if (plaintext === undefined) {
-    const error = new Error("Native collaboration payload relay omitted the task payload.");
-    error.status = 502;
+  try {
+    plaintext = parseAgentRelayResponse(bytes, upstream.headers.get("content-type") || "");
+  } catch (error) {
+    if (error?.code === "ERR_NATIVE_AGENT_RELAY_RATE_LIMITED") rememberAgentRelayFailure(cacheKey);
     throw error;
   }
   rememberAgentPayload(cacheKey, plaintext);
@@ -3136,8 +3045,10 @@ async function summarizeWith(
     route,
     request,
   );
+  const summaryContext = compactionInstructionBoundary(payload, bridged);
   let body = {
     ...payload,
+    instructions: summaryContext.instructions,
     model: route.gatewayModel,
     // Some OpenAI-Responses gateways (Codex LBs) refuse non-streaming
     // requests outright ("Stream must be set to true"). Only those generic
@@ -3146,9 +3057,8 @@ async function summarizeWith(
     stream: providerForModel(route)?.generic === true,
     tools: [],
     input: [
-      ...bridged,
+      ...summaryContext.input,
       messageItem(prepared.catalogText),
-      messageItem(COMPACTION_PROMPT),
     ],
   };
   // Grok's forwarder can add hosted search even to an empty client tool list.
@@ -3347,7 +3257,10 @@ async function summarize(request, payload, route, signal, { allowFailover = true
     // provider sends one) is already in hand. `tokenUsageFromPayload` returns
     // undefined when it is absent, and `recordUsageEvent` then omits the token
     // fields entirely rather than metering an invented zero.
-    const usage = tokenUsageFromPayload(parsed);
+    const usage = tokenUsageFromPayload(parsed, {
+      grokServiceTier: offersGrokServiceTier(attemptRoute),
+      grokContextUsage: attemptRoute.provider === GROK_OAUTH_PROVIDER,
+    });
     if (upstreamOk) {
       clearProviderCooldown(attemptRoute.provider);
       const answer = extractResponseText(parsed);
@@ -4696,6 +4609,7 @@ async function handleResponses(request, response, requestUrl) {
       diagnostics.requestKind = compactV1 || compactV2 ? "compaction" : "generation";
       timing.kind(diagnostics.requestKind);
       timing.clientRequest(payload, request.headers);
+      timing.serviceTier("requested", payload.service_tier);
       timing.tools("client", payload.tools);
       timing.parallelTools("client", payload.parallel_tool_calls);
     }

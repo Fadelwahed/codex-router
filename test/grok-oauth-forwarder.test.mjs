@@ -1040,6 +1040,101 @@ test("streams a done-only function call with an unterminated successful terminal
   }
 });
 
+test("HTTP streaming preserves a nonempty tool argument prefix and final suffix exactly once", async () => {
+  const argumentsText = JSON.stringify({ path: "example.txt", contents: 'Привет "world"\n' });
+  const item = { type: "function_call", id: "fc_prefix", call_id: "call_prefix", name: "write_file", arguments: argumentsText };
+  let inbound = 0;
+  const backend = await mockBackend((_req, res) => {
+    inbound += 1;
+    res.writeHead(200, { "Content-Type": "text/event-stream" });
+    res.end(sse([
+      { type: "response.output_item.added", item: { ...item, arguments: argumentsText.slice(0, 12) } },
+      { type: "response.function_call_arguments.delta", item_id: item.id, delta: argumentsText.slice(12, 20) },
+      { type: "response.function_call_arguments.done", item_id: item.id, arguments: argumentsText },
+      { type: "response.output_item.done", item },
+      { type: "response.completed", response: { status: "completed", output: [item] } },
+    ]));
+  });
+  const port = await openPort();
+  const dir = mkdtempSync(path.join(os.tmpdir(), "grok-oauth-argument-prefix-"));
+  const child = startForwarder(port, backend.port, writeSession(dir));
+  try {
+    const base = `http://127.0.0.1:${port}`;
+    await waitHealth(base, child);
+    const response = await fetch(`${base}/v1/chat/completions`, {
+      method: "POST", headers: auth,
+      body: JSON.stringify({ model: "grok-4.7", stream: true, messages: [{ role: "user", content: "write the file" }],
+        tools: [{ type: "function", function: { name: item.name, parameters: { type: "object" } } }] }),
+    });
+    const body = await response.text();
+    const chunks = body.split(/\r?\n/).filter(line => line.startsWith("data: ") && line !== "data: [DONE]")
+      .map(line => JSON.parse(line.slice(6)));
+    assert.equal(response.status, 200);
+    const calls = chunks.flatMap(chunk => chunk.choices?.[0]?.delta?.tool_calls || []);
+    assert.equal(calls.map(call => call.function?.arguments || "").join(""), argumentsText);
+    assert.equal(calls.filter(call => call.id).length, 1);
+    assert.equal(chunks.filter(chunk => chunk.choices?.[0]?.finish_reason === "tool_calls").length, 1);
+    assert.equal(chunks.some(chunk => chunk.error), false);
+    assert.equal(inbound, 1);
+  } finally {
+    await stop(child);
+    await new Promise(resolve => backend.server.close(resolve));
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("HTTP streaming fails conflicting tool snapshots once without replacement arguments or replay", async () => {
+  const prefix = '{"contents":"PRIVATE_DRAFT';
+  const argumentsText = JSON.stringify({ contents: "REPLACEMENT\n", path: "f" });
+  const item = { type: "function_call", id: "fc_mismatch", call_id: "call_mismatch", name: "write_file", arguments: argumentsText };
+  const snapshots = [
+    { type: "response.function_call_arguments.done", item_id: item.id, arguments: argumentsText },
+    { type: "response.output_item.done", item },
+    { type: "response.completed", response: { status: "completed", output: [item] } },
+  ];
+  let inbound = 0;
+  const backend = await mockBackend((_req, res) => {
+    const snapshot = snapshots[inbound++];
+    res.writeHead(200, { "Content-Type": "text/event-stream" });
+    res.end(sse([
+      { type: "response.output_text.delta", delta: "Starting the edit." },
+      { type: "response.output_item.added", item: { ...item, arguments: "" } },
+      { type: "response.function_call_arguments.delta", item_id: item.id, delta: prefix },
+      snapshot,
+      { type: "response.completed", response: { status: "completed" } },
+    ]));
+  });
+  const port = await openPort();
+  const dir = mkdtempSync(path.join(os.tmpdir(), "grok-oauth-argument-mismatch-"));
+  const child = startForwarder(port, backend.port, writeSession(dir));
+  try {
+    const base = `http://127.0.0.1:${port}`;
+    await waitHealth(base, child);
+    for (let index = 0; index < snapshots.length; index += 1) {
+      const response = await fetch(`${base}/v1/chat/completions`, {
+        method: "POST", headers: auth,
+        body: JSON.stringify({ model: "grok-4.7", stream: true, messages: [{ role: "user", content: "write the file" }],
+          tools: [{ type: "function", function: { name: item.name, parameters: { type: "object" } } }] }),
+      });
+      const body = await response.text();
+      assert.equal(response.status, 200);
+      assertChatStreamError(body);
+      const chunks = body.split(/\r?\n/).filter(line => line.startsWith("data: ") && line !== "data: [DONE]")
+        .map(line => JSON.parse(line.slice(6)));
+      assert.equal(chunks.flatMap(chunk => chunk.choices?.[0]?.delta?.tool_calls || [])
+        .map(call => call.function?.arguments || "").join(""), prefix);
+      assert.doesNotMatch(body, /REPLACEMENT|"finish_reason":"tool_calls"/);
+      assert.equal(inbound, index + 1, "a committed tool stream must never be replayed");
+    }
+    const errors = await waitChildError(child, /grok_tool_arguments_mismatch/);
+    assert.doesNotMatch(errors, /PRIVATE_DRAFT|REPLACEMENT/);
+  } finally {
+    await stop(child);
+    await new Promise(resolve => backend.server.close(resolve));
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 const PROGRESS_EVENTS = [
   { type: "response.output_text.delta", delta: "Next I will update the deck." },
   {

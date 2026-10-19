@@ -277,6 +277,18 @@ function pushToolArgumentDelta(state, entry, delta) {
   });
 }
 
+function reconcileToolArguments(state, entry, complete) {
+  const streamed = streamedToolArguments(state, state.toolCalls.indexOf(entry));
+  if (!complete.startsWith(streamed)) {
+    throw Object.assign(new Error("Grok tool argument snapshots disagree with the streamed arguments."), {
+      status: 502,
+      code: "grok_tool_arguments_mismatch",
+    });
+  }
+  entry.function.arguments = complete;
+  pushToolArgumentDelta(state, entry, complete.slice(streamed.length));
+}
+
 function appendToolArgumentDelta(state, itemId, delta) {
   const entry = itemId ? state.toolByItemId.get(itemId) : undefined;
   if (!entry || !delta) return;
@@ -285,16 +297,13 @@ function appendToolArgumentDelta(state, itemId, delta) {
 }
 
 function backfillToolArgumentDeltas(state) {
-  state.toolCalls.forEach((entry, index) => {
+  state.toolCalls.forEach((entry) => {
     const finalArgs = entry.function.arguments || "";
-    const streamed = streamedToolArguments(state, index);
-    if (!finalArgs || streamed === finalArgs) return;
-    const extra = finalArgs.startsWith(streamed) ? finalArgs.slice(streamed.length) : finalArgs;
-    pushToolArgumentDelta(state, entry, extra);
+    reconcileToolArguments(state, entry, finalArgs);
   });
 }
 
-function ensureToolCall(state, item, itemId, { complete = false } = {}) {
+function ensureToolCall(state, item, itemId) {
   if (!item || !TOOL_ITEM_TYPES.has(item.type)) return undefined;
   const key = itemId || item.id || item.call_id;
   let entry = key ? state.toolByItemId.get(key) : undefined;
@@ -313,14 +322,16 @@ function ensureToolCall(state, item, itemId, { complete = false } = {}) {
           index: state.toolCalls.length - 1,
           id: entry.id,
           type: "function",
-          function: { name: entry.function.name, arguments: complete ? args : "" },
+          function: { name: entry.function.name, arguments: args },
         },
       ],
     });
   } else {
     if (item.name) entry.function.name = state.toolNameMapper(item.name);
     const args = toolArguments(item);
-    if (args) entry.function.arguments = args;
+    if (typeof item.arguments === "string" || typeof item.input === "string") {
+      reconcileToolArguments(state, entry, args);
+    }
   }
   return entry;
 }
@@ -369,9 +380,7 @@ export function applyResponsesEvent(state, event) {
     case "response.output_item.done": {
       const item = event.item;
       if (TOOL_ITEM_TYPES.has(item?.type)) {
-        ensureToolCall(state, item, item.id, {
-          complete: event.type === "response.output_item.done",
-        });
+        ensureToolCall(state, item, item.id);
       }
       break;
     }
@@ -386,16 +395,17 @@ export function applyResponsesEvent(state, event) {
       if (typeof complete === "string") {
         const entry = event.item_id ? state.toolByItemId.get(event.item_id) : undefined;
         if (entry) {
-          const extra = complete.startsWith(entry.function.arguments)
-            ? complete.slice(entry.function.arguments.length)
-            : complete;
-          entry.function.arguments = complete;
-          pushToolArgumentDelta(state, entry, extra);
+          reconcileToolArguments(state, entry, complete);
         }
       }
       break;
     }
     case "response.completed": {
+      if (completedStatus(event.response) === "completed") {
+        for (const item of event.response?.output || []) {
+          if (TOOL_ITEM_TYPES.has(item?.type)) ensureToolCall(state, item, item.id);
+        }
+      }
       recordTerminal(state, completedStatus(event.response), event.response);
       break;
     }

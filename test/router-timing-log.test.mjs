@@ -315,7 +315,7 @@ test("Grok compaction shares reasoning, correlation and measured stages, includi
     response.writeHead(200, { "Content-Type": "application/json" });
     response.end(JSON.stringify({ object: "response", status: "completed", output: [
       { type: "message", role: "assistant", content: [{ type: "output_text", text: "synthetic summary" }] },
-    ], usage: { input_tokens: 150, output_tokens: 5, total_tokens: 155 } }));
+    ], provider_specific_fields: { grok_service_tier: "priority" }, usage: { input_tokens: 150, output_tokens: 5, total_tokens: 155 } }));
   });
   const routerPort = await openPort();
   const router = run(routerEnv(gateway.port, routerPort));
@@ -341,8 +341,10 @@ test("Grok compaction shares reasoning, correlation and measured stages, includi
     return fetch(`${base}/responses${v2 ? "" : "/compact"}`, {
       method: "POST", headers: { "Content-Type": "application/json", [EXACT_ROUTE_PROBE_HEADER]: "1" }, signal,
       body: JSON.stringify({ model: "grok-oauth/grok-4.7", stream,
+        service_tier: "priority", instructions: "EXECUTION_ONLY_TOP: keep coding until implementation is complete.",
         tools: [{ type: "function", name: "write_stdin", parameters: { type: "object", properties: { session_id: { type: "integer" } } } }],
-        input: [{ type: "message", role: "user", content }, ...(v2 ? [{ type: "compaction_trigger" }] : [])],
+        input: [{ type: "message", role: "developer", content: "EXECUTION_ONLY_DEVELOPER: keep editing files." },
+          { type: "message", role: "user", content }, ...(v2 ? [{ type: "compaction_trigger" }] : [])],
         extra_headers: { [GROK_TIMING_HEADER]: "forged" }, ...extra }),
     });
   }
@@ -364,6 +366,15 @@ test("Grok compaction shares reasoning, correlation and measured stages, includi
       assert.deepEqual(sent.extra_body?.reasoning_effort, options.reasoning ?? options.reasoning_effort);
       assert.deepEqual(sent.tools, [], "a summary never dispatches client tools");
       assert.equal(sent.tool_choice, "none", "a summary also forbids ambient hosted tools");
+      assert.match(sent.instructions, /lossy continuation checkpoint/);
+      assert.doesNotMatch(sent.instructions, /EXECUTION_ONLY/);
+      assert.equal(sent.input.some(item => ["system", "developer"].includes(item.role)), false);
+      assert.match(JSON.stringify(sent.input), /EXECUTION_ONLY_TOP/);
+      assert.match(JSON.stringify(sent.input), /EXECUTION_ONLY_DEVELOPER/);
+      assert.equal(sent.extra_body.service_tier, "priority");
+      assert.equal(timing.requestedServiceTier, "priority");
+      assert.equal(row.requestedServiceTier, "priority");
+      assert.equal(row.serviceTier, "priority", "actual compaction tier comes from provider metadata");
       assert.equal(timing.requestKind, "compaction");
       assert.equal(row.requestKind, "compaction");
       assert.equal(row.providerToolCount, 0);

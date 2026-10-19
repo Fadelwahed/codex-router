@@ -1,3 +1,4 @@
+import { knownServiceTier } from "./request-diagnostics.mjs";
 import { randomUUID } from "node:crypto";
 import { knownGenerationOutcome } from "./response-outcome.mjs";
 import { grokToolDiagnostics } from "./grok-tool-diagnostics.mjs";
@@ -99,6 +100,11 @@ export function createGrokRequestTiming({ layer, requestId, now = () => performa
         (row.toolSurfaces ??= {})[stage] = grokToolDiagnostics(tools);
       }
     },
+    serviceTier(stage, value) {
+      if (!finished && ["requested", "forwarded"].includes(stage)) {
+        row[`${stage}ServiceTier`] = knownServiceTier(value) ?? null;
+      }
+    },
     parallelTools(stage, value) {
       if (!finished && ["client", "gateway", "upstream"].includes(stage)) {
         (row.parallelToolCalls ??= {})[stage] = typeof value === "boolean" ? value : null;
@@ -132,7 +138,7 @@ export function createGrokRequestTiming({ layer, requestId, now = () => performa
         },
         end(outcome) {
           attemptMark("endMs");
-          if (!finished && ["stream_end", "transport_error", "cancelled", "http_error"].includes(outcome)) data.outcome = outcome;
+          if (!finished && ["stream_end", "transport_error", "protocol_error", "cancelled", "http_error"].includes(outcome)) data.outcome = outcome;
         },
       };
     },

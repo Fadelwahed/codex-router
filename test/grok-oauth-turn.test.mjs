@@ -85,6 +85,71 @@ test("finalizeTurn backfills streamed arguments when added is followed by done w
   assert.equal(streamedArgs, '{"cmd":"dir"}');
 });
 
+const argumentCall = (argumentsText) => ({
+  type: "function_call", id: "fc_arguments", call_id: "call_arguments",
+  name: "apply_patch", arguments: argumentsText,
+});
+const argumentStream = turn => turn.deltas.flatMap(delta => delta.tool_calls || [])
+  .map(call => call.function?.arguments || "").join("");
+
+test("nonempty added arguments and later suffixes reach Chat exactly once", () => {
+  const complete = '{"contents":"final\\n","path":"f"}';
+  const turn = collectResponsesEvents([
+    { type: "response.output_item.added", item: argumentCall(complete.slice(0, 12)) },
+    { type: "response.function_call_arguments.delta", item_id: "fc_arguments", delta: complete.slice(12, 18) },
+    { type: "response.function_call_arguments.done", item_id: "fc_arguments", arguments: complete },
+    { type: "response.output_item.done", item: argumentCall(complete) },
+    { type: "response.completed", response: { status: "completed", output: [argumentCall(complete)] } },
+  ]);
+  assert.equal(argumentStream(turn), complete);
+  assert.equal(turn.toolCalls[0].function.arguments, complete);
+});
+
+test("done and terminal snapshots append only the unstreamed argument suffix", () => {
+  const complete = '{"contents":"final\\n","path":"f"}';
+  for (const stage of ["arguments", "item", "terminal"]) {
+    const snapshot = stage === "arguments"
+      ? { type: "response.function_call_arguments.done", item_id: "fc_arguments", arguments: complete }
+      : stage === "item" ? { type: "response.output_item.done", item: argumentCall(complete) }
+        : { type: "response.completed", response: { output: [argumentCall(complete)] } };
+    const turn = collectResponsesEvents([
+      { type: "response.output_item.added", item: argumentCall("") },
+      { type: "response.function_call_arguments.delta", item_id: "fc_arguments", delta: complete.slice(0, 12) },
+      snapshot, { type: "response.completed" },
+    ]);
+    assert.equal(argumentStream(turn), complete, stage);
+    assert.equal(turn.toolCalls[0].function.arguments, complete, stage);
+  }
+});
+
+test("contradictory argument snapshots fail closed without appending replacement JSON", () => {
+  const complete = '{"contents":"final\\n","path":"f"}';
+  const prefix = '{"contents":"PRIVATE_DRAFT';
+  for (const event of [
+    { type: "response.function_call_arguments.done", item_id: "fc_arguments", arguments: complete },
+    { type: "response.output_item.done", item: argumentCall(complete) },
+    { type: "response.completed", response: { output: [argumentCall(complete)] } },
+  ]) {
+    const state = createTurnState();
+    applyResponsesEvent(state, { type: "response.output_item.added", item: argumentCall("") });
+    applyResponsesEvent(state, { type: "response.function_call_arguments.delta", item_id: "fc_arguments", delta: prefix });
+    assert.throws(() => applyResponsesEvent(state, event), error => {
+      assert.equal(error.code, "grok_tool_arguments_mismatch");
+      assert.equal(error.status, 502);
+      assert.doesNotMatch(error.message, /PRIVATE_DRAFT|contents|final/);
+      return true;
+    });
+    assert.equal(argumentStream(state), prefix);
+    assert.equal(state.toolCalls[0].function.arguments, prefix);
+  }
+});
+
+test("a completed snapshot can supply an otherwise absent tool call", () => {
+  const turn = collectResponsesEvents([{ type: "response.completed", response: { output: [argumentCall("{}")] } }]);
+  assert.equal(argumentStream(turn), "{}");
+  assert.equal(turn.finishReason, "tool_calls");
+});
+
 test("collectResponsesEvents maps custom_tool_call onto a function tool call", () => {
   const turn = collectResponsesEvents([
     {

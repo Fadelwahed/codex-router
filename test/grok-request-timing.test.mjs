@@ -147,3 +147,26 @@ test("request source uses explicit Codex metadata without logging arbitrary call
   timing.finish("response_finished", 200);
   assert.equal(rows[0].clientSource, undefined, "forwarder joins attribution by the owned request ID");
 });
+
+test("timing service tiers are bounded and never confuse request with forwarding", () => {
+  const rows = [];
+  const timing = createGrokRequestTiming({ layer: "forwarder", emit: row => rows.push(row) });
+  timing.serviceTier("requested", "priority");
+  timing.serviceTier("forwarded", "default");
+  timing.serviceTier("secret", "private");
+  timing.finish("response_finished", 200);
+  timing.serviceTier("requested", "private");
+  assert.equal(rows[0].requestedServiceTier, "priority");
+  assert.equal(rows[0].forwardedServiceTier, "default");
+  assert.doesNotMatch(JSON.stringify(rows), /private|secret/);
+});
+
+test("argument protocol failures remain distinct from transport failures", () => {
+  const { timing, rows } = fixture();
+  timing.attempt().end("protocol_error");
+  timing.attempt().end("private-arguments");
+  timing.finish("response_finished", 200);
+  assert.equal(rows[0].attempts[0].outcome, "protocol_error");
+  assert.equal(rows[0].attempts[1].outcome, undefined);
+  assert.doesNotMatch(JSON.stringify(rows), /private-arguments/);
+});

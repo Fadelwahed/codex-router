@@ -122,6 +122,7 @@ function relayEventStream(payload) {
       item_id: "fc_relay",
       arguments: argumentsText,
     },
+    { type: "response.completed", response: { status: "completed", output: [] } },
   ];
   return `${events
     .map((event) => `event: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`)

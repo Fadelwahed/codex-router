@@ -224,3 +224,40 @@ loop cannot be uniquely attributed to it without the original wire capture.
 node scripts/verify-grok-apply-patch-guidance.mjs .venv/bin/python --structured --native-tool-policy --codex=/absolute/path/to/codex
 node scripts/verify-grok-app-tools.mjs .venv/bin/python --codex=/absolute/path/to/codex
 ```
+
+## Compaction instruction and service-tier boundaries
+
+Routed compaction uses checkpoint instructions at the instruction level. Original
+conversation instructions, including system/developer messages, remain available
+as JSON-quoted context rather than executable instructions for the summarizer.
+Source extraction runs before this conversion: quoted instructions never become
+new user requirement records. Ordinary turns, context limits, explicit reasoning
+effort and the requested service tier are unchanged.
+
+Router timing includes `requestedServiceTier`; forwarder timing includes both
+`requestedServiceTier` and `forwardedServiceTier`. Only known tier values are
+recorded; missing or unknown values are null. Actual compaction `serviceTier`
+comes from authenticated provider response metadata, never from the request.
+A missing actual tier does not prove Fast was disabled. Header-to-first-event
+latency is an upstream wait, not a measurement of internal model reasoning.
+
+## Native collaboration payload relays
+
+A relay creates a fresh ordinary Responses request using the caller's native
+authentication/account only, without the original turn's affinity or response
+dialect headers. Ordinary native passthrough retains those headers unchanged.
+The complete bounded response must finish successfully before a single relay
+payload can enter the account-partitioned cache. A payload followed by failure,
+truncation or an incomplete terminal is refused. HTTP-200 SSE rate-limit and
+authentication errors retain safe 429/401 classifications; rate-limit backoff is
+shared with the HTTP path. Other errors have fixed `ERR_NATIVE_AGENT_RELAY_*`
+codes. Provider error text and decrypted task contents are never logged.
+
+## Tool argument assembly
+
+The Grok adapter emits a nonempty initial argument prefix and appends only the
+missing suffix of consistent final snapshots. A contradictory snapshot fails
+with the safe code `grok_tool_arguments_mismatch`, without logging argument
+contents or appending replacement JSON. Its timing outcome is `protocol_error`;
+a network failure remains `transport_error`. A committed stream receives one
+terminal error and is not silently replayed.
