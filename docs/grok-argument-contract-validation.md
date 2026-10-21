@@ -54,3 +54,16 @@ revision. No additional live generations are authorized by that consumed budget.
 Fresh deterministic checks, remote CI, review, and local installation must be
 reported independently. Successful synthetic contract checks do not prove that
 all organic Grok argument failures have disappeared.
+
+## Follow-up CI compatibility check
+
+The October 21 CI run for `545801ba` passed the macOS and Windows test jobs,
+the native macOS application smoke, and all three Grok protocol jobs. Its Ubuntu
+job switched from Node 24.21.0 to 24.22.0 and failed in skill publication:
+`fs.cpSync` with `errorOnExist` now rejects the already-claimed destination root.
+The same old-source failure was reproduced locally with the official Node
+24.22.0 binary, verified against its published SHA-256. This installer failure
+is separate from Grok argument handling. The compatibility fix retains exclusive
+root ownership and copies children without overwriting existing entries; conflict
+recovery must preserve concurrent files, including identical-content collisions
+and interrupted refreshes.
