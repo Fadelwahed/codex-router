@@ -684,12 +684,14 @@ test("read facade publishes the character and numeric limits its compiler enforc
   for (const [name, field, value] of [
     [READ_FILE_TOOL_NAME, "target_file", "a\nb"],
     [READ_FILE_TOOL_NAME, "target_file", "a\n"],
-    [GREP_TOOL_NAME, "pattern", "a\0b"],
     [LIST_DIR_TOOL_NAME, "target_directory", "a\rb"],
   ]) {
     const schema = bridge.tools.find(tool => tool.name === name).parameters.properties[field];
     assert.equal(new RegExp(schema.pattern, "u").test(value), false);
   }
+  const grep = bridge.tools.find(tool => tool.name === GREP_TOOL_NAME);
+  // grep is deliberately absent on clients without a local rg executable.
+  if (grep) assert.equal(new RegExp(grep.parameters.properties.pattern.pattern, "u").test("a\0b"), false);
   const offset = bridge.tools.find(tool => tool.name === READ_FILE_TOOL_NAME).parameters.properties.offset;
   assert.ok(Number.isSafeInteger(offset.maximum + 2000));
   assert.equal(compileReadFileCommand(JSON.stringify({ target_file: "a", offset: Number.MAX_VALUE })), undefined);
@@ -702,7 +704,7 @@ test("function relay failures identify a fixed tool and category without argumen
     [READ_FILE_TOOL_NAME, '{"target_file":"secret-one","target_file":"secret-two"}', "ambiguous_or_invalid_json"],
     [READ_FILE_TOOL_NAME, JSON.stringify({ target_file: "private-file", limit: 0 }), "out_of_range"],
     [READ_FILE_TOOL_NAME, JSON.stringify({ target_file: "private-file", offset: null }), "invalid_type"],
-    [GREP_TOOL_NAME, JSON.stringify({ path: "private-dir" }), "missing_field"],
+    [READ_FILE_TOOL_NAME, JSON.stringify({ limit: 10 }), "missing_field"],
     [LIST_DIR_TOOL_NAME, JSON.stringify({ secret_key: "secret-value" }), "unexpected_field"],
     [RUN_TERMINAL_COMMAND_TOOL_NAME, JSON.stringify({ command: "private\0command" }), "unsupported_character"],
   ];
