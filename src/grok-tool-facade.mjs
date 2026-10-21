@@ -32,6 +32,8 @@ export const DEFAULT_READ_LIMIT = 400;
 export const DEFAULT_HEAD_LIMIT = 10;
 export const MAX_READ_LIMIT = 2000;
 
+const singleLinePattern = "^[^\\u0000\\r\\n]*(?![\\s\\S])";
+const commandPattern = "^[^\\u0000]*(?![\\s\\S])";
 const pathSchema = { type: "string", minLength: 1, maxLength: 65536 };
 const bodySchema = { type: "string", maxLength: MAX_STRUCTURED_PATCH_BYTES };
 const objectSchema = (properties, required) => ({
@@ -134,17 +136,35 @@ function parseFacadeObject(argumentsText) {
   }
 }
 
-function parseExactObject(argumentsText, required, optional = []) {
+// These are router-owned, flat primitive schemas. Validate the same constraints
+// we publish; never infer missing fields or coerce provider arguments.
+function facadeArgumentResult(argumentsText, schema) {
+  if (typeof argumentsText !== "string" || !jsonArgumentsAreUnambiguous(argumentsText)) {
+    return { code: "ambiguous_or_invalid_json" };
+  }
   const value = parseFacadeObject(argumentsText);
-  if (!value) return undefined;
-  const allowed = new Set([...required, ...optional]);
-  for (const key of Object.keys(value)) {
-    if (!allowed.has(key)) return undefined;
+  if (!value) return { code: "object_required" };
+  if (Object.keys(value).some(key => !Object.hasOwn(schema.properties, key))) return { code: "unexpected_field" };
+  if (schema.required.some(key => !Object.hasOwn(value, key))) return { code: "missing_field" };
+  for (const [key, field] of Object.entries(schema.properties)) {
+    if (!Object.hasOwn(value, key)) continue;
+    const item = value[key];
+    if (field.type === "integer") {
+      if (!Number.isInteger(item)) return { code: "invalid_type" };
+      if (item < field.minimum || (field.maximum !== undefined && item > field.maximum)) return { code: "out_of_range" };
+    } else {
+      if (typeof item !== "string") return { code: "invalid_type" };
+      const length = Array.from(item).length;
+      if (length < field.minLength || length > field.maxLength) return { code: "out_of_range" };
+      if (field.pattern && !new RegExp(field.pattern, "u").test(item)) return { code: "unsupported_character" };
+    }
   }
-  for (const key of required) {
-    if (!Object.hasOwn(value, key)) return undefined;
-  }
-  return value;
+  return { value };
+}
+
+// Only fixed tool identities and fixed codes can enter logs, never keys/values.
+function facadeArgumentErrorCode(name, schema) {
+  return (argumentsText) => `${name}:${facadeArgumentResult(argumentsText, schema).code ?? "unsupported_value"}`;
 }
 
 function terminateUnixPath(filePath) {
@@ -199,7 +219,7 @@ function fileReadCommand(filePath, offset, limit, workdir, platform = process.pl
 }
 
 export function compileReadFileCommand(argumentsText, workdir, platform = process.platform) {
-  const value = parseExactObject(argumentsText, ["target_file"], ["offset", "limit"]);
+  const value = facadeArgumentResult(argumentsText, READ_FILE_PARAMETERS).value;
   if (!value || typeof value.target_file !== "string") return undefined;
   const offset = value.offset === undefined ? 1 : value.offset;
   const limit = value.limit === undefined ? DEFAULT_READ_LIMIT : value.limit;
@@ -209,7 +229,7 @@ export function compileReadFileCommand(argumentsText, workdir, platform = proces
 }
 
 export function compileGrepCommand(argumentsText, workdir, platform = process.platform) {
-  const value = parseExactObject(argumentsText, ["pattern"], ["path", "glob"]);
+  const value = facadeArgumentResult(argumentsText, GREP_PARAMETERS).value;
   if (!value || typeof value.pattern !== "string" || value.pattern.length === 0) return undefined;
   const quote = platform === "win32" ? powershellLiteral : posixSingleQuote;
   const pattern = quote(value.pattern);
@@ -235,24 +255,24 @@ export function compileGrepCommand(argumentsText, workdir, platform = process.pl
 }
 
 const READ_FILE_PARAMETERS = objectSchema({
-  target_file: pathSchema,
-  offset: { type: "integer", minimum: 1 },
+  target_file: { ...pathSchema, pattern: singleLinePattern },
+  offset: { type: "integer", minimum: 1, maximum: Number.MAX_SAFE_INTEGER - MAX_READ_LIMIT },
   limit: { type: "integer", minimum: 1, maximum: MAX_READ_LIMIT },
 }, ["target_file"]);
 
 const GREP_PARAMETERS = objectSchema({
-  pattern: { type: "string", minLength: 1, maxLength: 65536 },
-  path: pathSchema,
-  glob: { type: "string", minLength: 1, maxLength: 1024 },
+  pattern: { type: "string", minLength: 1, maxLength: 65536, pattern: singleLinePattern },
+  path: { ...pathSchema, pattern: singleLinePattern },
+  glob: { type: "string", minLength: 1, maxLength: 1024, pattern: singleLinePattern },
 }, ["pattern"]);
 
 const LIST_DIR_PARAMETERS = objectSchema({
-  target_directory: pathSchema,
+  target_directory: { ...pathSchema, pattern: singleLinePattern },
 }, []);
 
 const RUN_TERMINAL_COMMAND_PARAMETERS = objectSchema({
-  command: { type: "string", minLength: 1, maxLength: MAX_STRUCTURED_PATCH_BYTES },
-  working_directory: pathSchema,
+  command: { type: "string", minLength: 1, maxLength: MAX_STRUCTURED_PATCH_BYTES, pattern: commandPattern },
+  working_directory: { ...pathSchema, pattern: commandPattern },
 }, ["command"]);
 
 let ripgrepCached;
@@ -310,7 +330,7 @@ export function nativeExecRelayTarget(tools, namespaces) {
 export function compileListDirCommand(argumentsText, workdir, platform = process.platform) {
   const value = argumentsText === undefined || argumentsText === ""
     ? {}
-    : parseExactObject(argumentsText, [], ["target_directory"]);
+    : facadeArgumentResult(argumentsText, LIST_DIR_PARAMETERS).value;
   if (!value) return undefined;
   const directory = value.target_directory === undefined ? "." : value.target_directory;
   if (typeof directory !== "string" || !directory) return undefined;
@@ -580,7 +600,7 @@ export function classifyShellCommand(command) {
 }
 
 export function compileRunTerminalCommand(argumentsText, platform = process.platform) {
-  const value = parseExactObject(argumentsText, ["command"], ["working_directory"]);
+  const value = facadeArgumentResult(argumentsText, RUN_TERMINAL_COMMAND_PARAMETERS).value;
   if (!value || typeof value.command !== "string" || !value.command) return undefined;
   if (value.command.includes("\0")) return undefined;
   if (Object.hasOwn(value, "working_directory") && (typeof value.working_directory !== "string" || value.working_directory.length === 0)) {
@@ -589,13 +609,16 @@ export function compileRunTerminalCommand(argumentsText, platform = process.plat
   const workdir = value.working_directory;
   const classified = classifyShellCommand(value.command);
   if (classified.kind === "read_file") {
-    return compileReadFileCommand(JSON.stringify(classified.args), workdir, platform);
+    return compileReadFileCommand(JSON.stringify(classified.args), workdir, platform)
+      ?? withWorkdir({ cmd: value.command }, workdir);
   }
   if (classified.kind === "grep") {
-    return compileGrepCommand(JSON.stringify(classified.args), workdir, platform);
+    return compileGrepCommand(JSON.stringify(classified.args), workdir, platform)
+      ?? withWorkdir({ cmd: value.command }, workdir);
   }
   if (classified.kind === "list_dir") {
-    return compileListDirCommand(JSON.stringify(classified.args), workdir, platform);
+    return compileListDirCommand(JSON.stringify(classified.args), workdir, platform)
+      ?? withWorkdir({ cmd: value.command }, workdir);
   }
   if (classified.kind === "write") {
     return JSON.stringify({ cmd: SHELL_NOT_EDITOR_COMMAND });
@@ -755,6 +778,7 @@ export function applyGrokEditFacade(tools, namespaces, route, structuredPatch, o
         nativeName: nativeExec.nativeName,
         nativeNamespace: nativeExec.nativeNamespace,
         rewriteArguments: compileReadFileCommand,
+        argumentErrorCode: facadeArgumentErrorCode(READ_FILE_TOOL_NAME, READ_FILE_PARAMETERS),
         maxArgumentBytes: MAX_STRUCTURED_PATCH_BYTES,
       });
       extra.push({
@@ -771,6 +795,7 @@ export function applyGrokEditFacade(tools, namespaces, route, structuredPatch, o
         nativeName: nativeExec.nativeName,
         nativeNamespace: nativeExec.nativeNamespace,
         rewriteArguments: compileGrepCommand,
+        argumentErrorCode: facadeArgumentErrorCode(GREP_TOOL_NAME, GREP_PARAMETERS),
         maxArgumentBytes: MAX_STRUCTURED_PATCH_BYTES,
       });
       extra.push({
@@ -787,6 +812,7 @@ export function applyGrokEditFacade(tools, namespaces, route, structuredPatch, o
         nativeName: nativeExec.nativeName,
         nativeNamespace: nativeExec.nativeNamespace,
         rewriteArguments: compileListDirCommand,
+        argumentErrorCode: facadeArgumentErrorCode(LIST_DIR_TOOL_NAME, LIST_DIR_PARAMETERS),
         maxArgumentBytes: MAX_STRUCTURED_PATCH_BYTES,
       });
       extra.push({
@@ -803,6 +829,7 @@ export function applyGrokEditFacade(tools, namespaces, route, structuredPatch, o
         nativeName: nativeExec.nativeName,
         nativeNamespace: nativeExec.nativeNamespace,
         rewriteArguments: compileRunTerminalCommand,
+        argumentErrorCode: facadeArgumentErrorCode(RUN_TERMINAL_COMMAND_TOOL_NAME, RUN_TERMINAL_COMMAND_PARAMETERS),
         maxArgumentBytes: MAX_STRUCTURED_PATCH_BYTES,
       });
       extra.push({

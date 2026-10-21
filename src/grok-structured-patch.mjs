@@ -337,6 +337,7 @@ export const GROK_STRUCTURED_PATCH_PARAMETERS = objectSchema({
 
 export const GROK_STRUCTURED_PATCH_CODEC = {
   version: GROK_STRUCTURED_PATCH_VERSION,
+  providerName: "structured_v1",
   parameters: GROK_STRUCTURED_PATCH_PARAMETERS,
   maxArgumentBytes: MAX_STRUCTURED_PATCH_BYTES,
   decodeArguments: compileStructuredPatchArguments,
@@ -347,8 +348,8 @@ export const GROK_STRUCTURED_PATCH_CODEC = {
   },
   description(original) {
     return [
-      typeof original === "string" ? original : "Apply a patch to files.",
-      "This provider interface accepts structured operations, not raw patch text. Supply literal logical lines without patch delimiters or line prefixes; use context/add/remove kinds inside update hunks. An anchor skips past its matching line; do not repeat that line as context or removal in the hunk. For a simple whole-line replacement omit anchor and supply complete removed and added lines. Codex performs the original patch validation, matching and permission checks. Old calls in history may have an input field containing native patch text; that historical envelope is not accepted for new calls.",
+      "Apply file edits through the native client patch tool. This provider interface accepts structured operations, not raw patch text. Supply literal logical lines without patch delimiters or line prefixes; use context/add/remove kinds inside update hunks. An anchor skips past its matching line; do not repeat that line as context or removal in the hunk. For a simple whole-line replacement omit anchor and supply complete removed and added lines. Codex performs the original patch validation, matching and permission checks. Historical calls use a separate history-only tool identity and cannot be invoked. The provider wire contract is the structured parameters declared for this tool; the client execution reference below describes the native client and its permissions, not an alternative argument format.",
+      typeof original === "string" ? `Client execution reference (verbatim):\n${JSON.stringify(original)}` : undefined,
     ].filter(Boolean).join("\n\n");
   },
 };

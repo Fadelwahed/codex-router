@@ -678,3 +678,54 @@ test("whole-line replacement rejects malformed payloads before client dispatch",
     assert.equal(Buffer.concat(chunks).toString(), "");
   }
 });
+
+test("read facade publishes the character and numeric limits its compiler enforces", () => {
+  const bridge = setup();
+  for (const [name, field, value] of [
+    [READ_FILE_TOOL_NAME, "target_file", "a\nb"],
+    [READ_FILE_TOOL_NAME, "target_file", "a\n"],
+    [GREP_TOOL_NAME, "pattern", "a\0b"],
+    [LIST_DIR_TOOL_NAME, "target_directory", "a\rb"],
+  ]) {
+    const schema = bridge.tools.find(tool => tool.name === name).parameters.properties[field];
+    assert.equal(new RegExp(schema.pattern, "u").test(value), false);
+  }
+  const offset = bridge.tools.find(tool => tool.name === READ_FILE_TOOL_NAME).parameters.properties.offset;
+  assert.ok(Number.isSafeInteger(offset.maximum + 2000));
+  assert.equal(compileReadFileCommand(JSON.stringify({ target_file: "a", offset: Number.MAX_VALUE })), undefined);
+  assert.equal(compileGrepCommand(JSON.stringify({ pattern: "ok", glob: "x".repeat(1025) })), undefined);
+});
+
+test("function relay failures identify a fixed tool and category without argument values", async () => {
+  const bridge = setup();
+  const cases = [
+    [READ_FILE_TOOL_NAME, '{"target_file":"secret-one","target_file":"secret-two"}', "ambiguous_or_invalid_json"],
+    [READ_FILE_TOOL_NAME, JSON.stringify({ target_file: "private-file", limit: 0 }), "out_of_range"],
+    [READ_FILE_TOOL_NAME, JSON.stringify({ target_file: "private-file", offset: null }), "invalid_type"],
+    [GREP_TOOL_NAME, JSON.stringify({ path: "private-dir" }), "missing_field"],
+    [LIST_DIR_TOOL_NAME, JSON.stringify({ secret_key: "secret-value" }), "unexpected_field"],
+    [RUN_TERMINAL_COMMAND_TOOL_NAME, JSON.stringify({ command: "private\0command" }), "unsupported_character"],
+  ];
+  for (const [name, args, code] of cases) {
+    await assert.rejects(relay(bridge, name, args), error => {
+      assert.equal(error.code, "ERR_NAMESPACE_RELAY_COMMITTED_STREAM");
+      assert.ok(error.message.includes(code === "ambiguous_or_invalid_json"
+        ? "ambiguous function arguments"
+        : `invalid function relay arguments done: ${name}:${code}`), error.message);
+      assert.doesNotMatch(error.message, /private|secret/);
+      return true;
+    });
+  }
+});
+
+
+test("valid native terminal commands survive narrower read-facade optimization limits", async () => {
+  const command = `rg --line-number --color never --max-count 50 -e 'a' --glob '${"*".repeat(1025)}' -- '.' | head -n 50`;
+  const args = JSON.stringify({ command, working_directory: "repo" });
+  const expected = JSON.stringify({ cmd: command, workdir: "repo" });
+  assert.equal(compileRunTerminalCommand(args), expected);
+  const events = await relay(setup(), RUN_TERMINAL_COMMAND_TOOL_NAME, args);
+  const done = events.find(event => event.type === "response.output_item.done");
+  assert.equal(done.item.arguments, expected);
+  assert.equal(done.item.name, "exec_command");
+});

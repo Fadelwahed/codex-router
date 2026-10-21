@@ -8,7 +8,7 @@ const PARAMETERS = new Set([
   "query", "limit", "session_id", "chars", "input", "operations", "path", "old_string", "new_string", "contents",
 ]);
 const NAMES = new Set([
-  "exec_command", "write_stdin", "shell_command", "apply_patch", "replace_lines",
+  "exec_command", "write_stdin", "shell_command", "apply_patch", "apply_patch_structured_v1", "replace_lines",
   "search_replace", "write", "run_terminal_command", "exec", "tool_search",
 ]);
 

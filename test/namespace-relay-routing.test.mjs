@@ -3023,7 +3023,8 @@ test("Grok structured patch default crosses the real Router with collision, choi
     assert.deepEqual(outgoing.tools.find((tool) => tool.name === "future_custom"), { type: "custom", name: "future_custom", description: "leave me" });
     assert.deepEqual(outgoing.tool_choice, { type: "function", name: tool.name });
     const old = outgoing.input.find((item) => item.call_id === "call_history");
-    assert.equal(old.name, tool.name);
+    assert.notEqual(old.name, tool.name);
+    assert.equal(outgoing.tools.some((tool) => tool.name === old.name), false);
     assert.equal(Object.hasOwn(old, "id"), false);
     assert.equal(JSON.parse(old.arguments).input, grokApplyPatchPayload(stream, outgoing.model).input[1].input);
     assert.deepEqual(outgoing.input.find((item) => item.type === "function_call_output"), { type: "function_call_output", call_id: "call_history", output: "Done!" });

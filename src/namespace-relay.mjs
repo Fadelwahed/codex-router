@@ -60,6 +60,8 @@ const SPAWN_AGENT_MODELS = new WeakMap();
 const TOOL_SEARCH_RELAYS = new WeakMap();
 const CUSTOM_TOOL_RELAYS = new WeakMap();
 const CUSTOM_TOOL_CODECS = new WeakMap();
+// Legacy argument envelopes remain evidence in history, never executable tools.
+const HISTORICAL_CUSTOM_TOOLS = new WeakMap();
 const FUNCTION_RELAYS = new WeakMap();
 // Flattened custom definitions retain the exact native identity beside the
 // object. A literal plain name containing `__` must never acquire a namespace.
@@ -383,8 +385,14 @@ export function bridgeCustomTools(
   const nativeToProvider = new Map();
   const providerToNative = new Map();
   const providerCodecs = new Map();
+  const historicalNames = new Map();
+  const historicalOnly = new Set();
   for (const [identity, { native, wireName }] of nativeTools) {
-    const availableName = availableCustomToolName(wireName, visibleNames);
+    const codec = native.namespace === undefined ? codecs?.get(native.name) : undefined;
+    const availableName = availableCustomToolName(
+      codec?.providerName ? `${wireName}_${codec.providerName}` : wireName,
+      visibleNames,
+    );
     const providerName = Number.isInteger(maxNameLength)
       ? reserveSpecialProviderName(
           namespaces,
@@ -394,7 +402,17 @@ export function bridgeCustomTools(
       : availableName;
     visibleNames.add(providerName);
     nativeToProvider.set(identity, providerName);
-    providerToNative.set(providerName, native.namespace === undefined ? native.name : native);
+    const declared = tools?.some((tool) => tool?.type === "custom" && keyOf(tool) === identity);
+    if (!codec?.providerName || declared) {
+      providerToNative.set(providerName, native.namespace === undefined ? native.name : native);
+    }
+    if (codec?.providerName) {
+      const candidate = availableCustomToolName(`${wireName}_history_v1`, visibleNames);
+      const historicalName = reserveSpecialProviderName(namespaces, `custom-history:${identity}`, candidate);
+      visibleNames.add(historicalName);
+      historicalNames.set(identity, historicalName);
+      historicalOnly.add(historicalName);
+    }
     // History/forced choice alone never grants a codec-backed tool. It must
     // be a plain native custom tool declared in this exact client request.
     if (
@@ -405,6 +423,7 @@ export function bridgeCustomTools(
   }
   CUSTOM_TOOL_RELAYS.set(namespaces, providerToNative);
   CUSTOM_TOOL_CODECS.set(namespaces, providerCodecs);
+  HISTORICAL_CUSTOM_TOOLS.set(namespaces, historicalOnly);
 
   let changedTools = false;
   const routedTools = Array.isArray(tools)
@@ -487,7 +506,9 @@ export function bridgeCustomTools(
       const routedCall = withoutIncompatibleFunctionItemId({
         ...rest,
         type: "function_call",
-        name: providerName,
+        name: historicalArguments === undefined
+          ? historicalNames.get(keyOf(item)) ?? providerName
+          : providerName,
         arguments: historicalArguments ?? JSON.stringify({ [CUSTOM_TOOL_INPUT_PROPERTY]: customInput }),
       });
       SPECIAL_FUNCTION_REFERENCES.add(routedCall);
@@ -555,6 +576,7 @@ export function registerFunctionRelays(namespaces, relays) {
         ? { nativeNamespace: relay.nativeNamespace }
         : {}),
       rewriteArguments: relay.rewriteArguments,
+      ...(typeof relay.argumentErrorCode === "function" ? { argumentErrorCode: relay.argumentErrorCode } : {}),
       maxArgumentBytes: Number.isInteger(relay.maxArgumentBytes) && relay.maxArgumentBytes > 0
         ? relay.maxArgumentBytes
         : 256 * 1024,
@@ -1719,6 +1741,7 @@ function providerOwnedToolNames(namespaces) {
     ...(nameRelay?.providerToNative.keys() || []),
     ...(nameRelay?.plainProviderNames || []),
     ...(CUSTOM_TOOL_RELAYS.get(namespaces)?.keys() || []),
+    ...(HISTORICAL_CUSTOM_TOOLS.get(namespaces) || []),
     ...(FUNCTION_RELAYS.get(namespaces)?.keys() || []),
   ]);
   const toolSearch = TOOL_SEARCH_RELAYS.get(namespaces);
@@ -1983,6 +2006,11 @@ export function flattenToolSearchHistory(
   // a matching model-visible name cannot be attributed to a discovery.
   for (const name of CUSTOM_TOOL_RELAYS.get(namespaces)?.keys() || []) {
     const identity = `special:custom:${name}`;
+    identityOwners.set(identity, CURRENT_DEFINITION);
+    addOwner(providerOwners, name, identity);
+  }
+  for (const name of HISTORICAL_CUSTOM_TOOLS.get(namespaces) || []) {
+    const identity = `special:history:${name}`;
     identityOwners.set(identity, CURRENT_DEFINITION);
     addOwner(providerOwners, name, identity);
   }
@@ -2378,6 +2406,7 @@ function flattenToolChoiceReference(reference, namespaces) {
       PLAIN_TOOL_NAMES.get(namespaces)?.has(name) ||
       NAME_ALIASES.get(namespaces)?.plainProviderNames.has(name) ||
       CUSTOM_TOOL_RELAYS.get(namespaces)?.has(name) ||
+      HISTORICAL_CUSTOM_TOOLS.get(namespaces)?.has(name) ||
       TOOL_SEARCH_RELAYS.get(namespaces)?.providerName === name;
     if (!providerName && alreadyProviderVisible) return reference;
     providerName ||= exactPlainProviderName || providerNameForWire(namespaces, name);
@@ -2493,6 +2522,7 @@ export function buildNamespaceLookups(namespaces) {
     toolSearch: TOOL_SEARCH_RELAYS.get(namespaces),
     customTools,
     customCodecs: CUSTOM_TOOL_CODECS.get(namespaces),
+    historicalCustomTools: HISTORICAL_CUSTOM_TOOLS.get(namespaces),
     functionRelays: FUNCTION_RELAYS.get(namespaces),
   };
 }
@@ -2730,6 +2760,9 @@ function rewriteNamespaceFunctionCallItem(
   { allowIncompleteToolSearch = false, effortForModel } = {},
 ) {
   if (!item || item.type !== "function_call") return undefined;
+  if (lookups.historicalCustomTools?.has(item.name)) {
+    throw new NamespaceRelayCommittedStreamError("historical tool identity is not callable");
+  }
   if (!rawCodecItem(item, lookups) && !jsonArgumentsAreUnambiguous(item.arguments, { allowEmpty: true })) return undefined;
   const exactPlainProviderIdentity =
     lookups.identityAliases &&
@@ -2858,6 +2891,15 @@ export function rewriteNamespaceResponsePayload(payload, lookups, sessionModel, 
   effortForModel,
 } = {}) {
   if (!payload || typeof payload !== "object" || Array.isArray(payload)) return undefined;
+  // Reject the provider-only history identity in every response shape, even
+  // when a forged namespace or custom-call type tries to bypass restoration.
+  for (const item of [payload.item, ...(Array.isArray(payload.output) ? payload.output : []),
+    ...(Array.isArray(payload.response?.output) ? payload.response.output : [])]) {
+    if (["function_call", "custom_tool_call"].includes(item?.type) &&
+        lookups.historicalCustomTools?.has(item.name)) {
+      throw new NamespaceRelayCommittedStreamError("historical tool identity is not callable");
+    }
+  }
   let rewritten =
     rewriteNamespaceFunctionCall(payload, lookups, sessionModel, { effortForModel }) || payload;
   let changed = rewritten !== payload;
@@ -3104,7 +3146,8 @@ export class NamespaceToolCallTransform extends Transform {
     // must not run the namespace rewrites (they exist for routed providers)
     // or re-serialize model-authored events it did not change.
     this.#injectOnly = Boolean(options.injectOnly);
-    this.#requiresCodec = !this.#injectOnly && this.#lookups.customCodecs?.size > 0;
+    this.#requiresCodec = !this.#injectOnly &&
+      (this.#lookups.customCodecs?.size > 0 || this.#lookups.historicalCustomTools?.size > 0);
     this.#maxJsonCaptureBytes =
       Number.isInteger(options.maxJsonCaptureBytes) && options.maxJsonCaptureBytes > 0
         ? options.maxJsonCaptureBytes
@@ -4439,7 +4482,9 @@ export class NamespaceToolCallTransform extends Transform {
           if (matched.state.kind === "function_codec") {
             const rewrittenArguments = matched.state.functionRelay?.rewriteArguments(event.arguments);
             if (typeof rewrittenArguments !== "string") {
-              return this.#unsafeSseFrame(frame, "invalid function relay arguments done");
+              const code = matched.state.functionRelay?.argumentErrorCode?.(event.arguments);
+              const diagnostic = typeof code === "string" && /^[a-z_]{1,32}:[a-z_]{1,48}$/.test(code) ? `: ${code}` : "";
+              return this.#unsafeSseFrame(frame, `invalid function relay arguments done${diagnostic}`);
             }
             const codecReason = this.#validateCodecSource(matched.state, event.arguments);
             if (codecReason) return this.#unsafeSseFrame(frame, codecReason);

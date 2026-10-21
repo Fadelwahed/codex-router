@@ -98,3 +98,13 @@ test("app diagnostics do not log lookalikes or arbitrary search metadata", () =>
   assert.deepEqual(Object.keys(result.known), ["tool_search"]);
   assert.doesNotMatch(JSON.stringify(result), new RegExp(secret));
 });
+
+test("structured patch diagnostics retain the declared schema without exposing history or lookalike names", () => {
+  const result = grokToolDiagnostics([
+    { type: "function", name: "apply_patch_structured_v1", parameters: { type: "object", properties: { operations: { type: "array" } } } },
+    { type: "function", name: "apply_patch_history_v1" },
+    { type: "function", name: "private_apply_patch_structured_v1" },
+  ]);
+  assert.deepEqual(Object.keys(result.known), ["apply_patch_structured_v1"]);
+  assert.deepEqual(result.known.apply_patch_structured_v1.declarations[0].parameters, ["operations"]);
+});

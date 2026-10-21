@@ -697,7 +697,7 @@ async function handleMockRequest(request, response) {
     return;
   }
   const history = (body.input || []).find(
-    (item) => item?.type === "function_call" && item.name === toolName,
+    (item) => item?.type === "function_call" && item.call_id === "call_history",
   );
   const historyArgs = typeof history?.arguments === "string" ? history.arguments : "";
   if (structured && historyArgs.includes("CODEC_CANCEL_WIRE")) {
@@ -951,7 +951,10 @@ cancellation_boundary_callback = CustomLogger()
     (item) => item?.type === "function_call" && item.call_id === "call_history",
   );
   assert.ok(historyCall, "history call_id must survive LiteLLM and the Grok forwarder");
-  assert.equal(historyCall.name, grokApply[0].name);
+  if (structured) {
+    assert.notEqual(historyCall.name, grokApply[0].name);
+    assert.equal(grokTools.some((tool) => tool.name === historyCall.name), false);
+  } else assert.equal(historyCall.name, grokApply[0].name);
   assert.deepEqual(JSON.parse(historyCall.arguments), structured ? { input: HISTORY_PATCH } : { content: HISTORY_PATCH });
   const historyResult = (grokRequest.input || []).find(
     (item) => item?.type === "function_call_output" && item.call_id === "call_history",
