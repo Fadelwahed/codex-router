@@ -212,3 +212,23 @@ test("invalid argument done reports a safe compiler category without committing 
   assert.ifError(result.error);
   assert.equal(parsed(result.output).filter(x => x.type === "response.custom_tool_call_input.done").length, 1);
 });
+
+
+test("JSON and separator categories survive streaming without exposing or committing invalid edits", async () => {
+  const privateText = "PRIVATE_SOURCE_TEXT";
+  for (const [value, code] of [
+    ["", "arguments_empty_json"],
+    [JSON.stringify({ operations: "" }), "operations_empty_json"],
+    [JSON.stringify({ operations: '[{"op":' }), "operations_invalid_json"],
+    [JSON.stringify({ operations: '[{"op":"delete","op":"add","path":"PRIVATE_SOURCE_TEXT"}]' }), "operations_ambiguous_json"],
+    [JSON.stringify({ operations: [{ op: "delete", path: `${privateText}\n` }] }), "embedded_path_separator"],
+    [JSON.stringify({ operations: [{ op: "update", path: "x", hunks: [{ anchor: `${privateText}\n`, lines: [{ kind: "add", text: "x" }] }] }] }), "embedded_anchor_separator"],
+  ]) {
+    const bridge = setup();
+    const result = await relay(bridge, events(bridge.name, value));
+    assert.equal(result.error?.code, "ERR_NAMESPACE_RELAY_COMMITTED_STREAM");
+    assert.ok(result.error.message.includes(`invalid custom tool arguments done: ${code}`));
+    assert.doesNotMatch(result.error.message, /PRIVATE_SOURCE_TEXT/);
+    assert.doesNotMatch(result.output, /response.custom_tool_call_input.done|response.output_item.done|PRIVATE_SOURCE_TEXT/);
+  }
+});

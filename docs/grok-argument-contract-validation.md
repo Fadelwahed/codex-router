@@ -67,3 +67,44 @@ is separate from Grok argument handling. The compatibility fix retains exclusive
 root ownership and copies children without overwriting existing entries; conflict
 recovery must preserve concurrent files, including identical-content collisions
 and interrupted refreshes.
+
+
+## October 22 incident and bounded diagnostic follow-up
+
+The installed `9f5a6fd4` composite still rejected an organic patch at
+07:44:06 UTC with `ambiguous_or_invalid_json`. The upstream completed in one
+attempt after 50.773 seconds; the local relay refused the arguments after
+51.003 seconds. A later turn reported `embedded_line_separator`. Original
+argument values were not retained, so neither failure can be attributed to a
+specific malformed field or to transport corruption from those logs alone.
+
+A new approved experiment used four of at most eight generations, with a
+15-minute campaign limit. It ran from 08:02:04 through 08:09:43 UTC against the
+real isolated Grok OAuth forwarder, using synthetic multi-file patch tasks at
+`xhigh` effort. Three requests produced valid patches in 32.3, 76.8, and 110.1
+seconds. Their argument sizes were 4,681, 13,753, and 33,922 bytes; upstream
+terminal arguments and assembled Chat arguments were byte-identical, and all
+three used an operations array. The fourth request hit the probe's 240-second
+limit before any function arguments were emitted. It is a timeout, not a
+successful patch or a reproduction of the JSON failure. No further live calls
+were made. This is not an A/B measurement or evidence of a lower failure rate.
+
+The live path did not include Router/LiteLLM. Offline replay of the three
+captured responses through Router, the locked LiteLLM, and the forwarder
+produced the exact expected native patch without retries. Applying the three
+patches to synthetic files also produced the expected bytes. This validates
+those captured responses, not the missing organic failure payloads.
+
+The follow-up source change improves diagnostics only. Empty, syntactically
+invalid, and ambiguous JSON now have distinct fixed categories at the outer
+arguments and encoded-operations boundaries. Separator failures distinguish
+paths, anchors, and file lines. No input values, parser excerpts, or paths enter
+those messages. Validation still refuses invalid edits and does not retry
+committed output. Schema, context size, provider prompts, and accepted patch
+bytes are unchanged. The original incident remains unreproduced and unresolved.
+
+Local verification: 611 relevant Grok/namespace tests passed with one skip;
+`npm run check` passed. Two new diagnostic regression tests fail on the prior
+source. Independent comparison of 426 inputs found no acceptance or output
+changes. Remote CI and installation are separate receipts and must be tied to
+the final commit.

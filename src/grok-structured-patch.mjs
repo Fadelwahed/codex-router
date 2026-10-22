@@ -23,13 +23,20 @@ export class StructuredPatchError extends Error {
 
 const diagnosticCodes = new Set([
   "accessor_field",
-  "ambiguous_or_invalid_json",
+  "arguments_empty_json",
+  "arguments_invalid_json",
+  "arguments_ambiguous_json",
+  "operations_empty_json",
+  "operations_invalid_json",
+  "operations_ambiguous_json",
   "arguments_too_large",
   "array_bounds",
   "boolean_required",
   "crlf_unrepresentable",
   "duplicate_path",
   "embedded_line_separator",
+  "embedded_path_separator",
+  "embedded_anchor_separator",
   "empty_anchor",
   "empty_old_string",
   "invalid_unicode",
@@ -76,16 +83,16 @@ function array(value, min, max) {
   }
 }
 
-function line(value) {
+function line(value, separatorCode = "embedded_line_separator") {
   if (typeof value !== "string") reject("string_required");
   if (value.length > MAX_LINE_LENGTH) reject("line_too_long");
-  if (/[\r\n\0]/u.test(value)) reject("embedded_line_separator");
+  if (/[\r\n\0]/u.test(value)) reject(separatorCode);
   if (!value.isWellFormed()) reject("invalid_unicode");
   return value;
 }
 
 function path(value) {
-  line(value);
+  line(value, "embedded_path_separator");
   // Native headers trim paths, and Rust's trim also removes Unicode white space
   // (such as U+0085) that JavaScript's leaves. Refuse inputs whose literal path
   // would change under either.
@@ -131,7 +138,7 @@ export function serializeStructuredPatch(value) {
         for (const [index, hunk] of operation.hunks.entries()) {
           object(hunk, ["lines"], ["anchor", "endOfFile"]);
           if (Object.hasOwn(hunk, "anchor")) {
-            line(hunk.anchor);
+            line(hunk.anchor, "embedded_anchor_separator");
             if (!hunk.anchor) reject("empty_anchor");
           }
           if (Object.hasOwn(hunk, "endOfFile") && typeof hunk.endOfFile !== "boolean") {
@@ -178,12 +185,23 @@ function splitLogicalLines(text) {
 function parseArgumentObject(argumentsText) {
   if (typeof argumentsText !== "string") reject("json_string_required");
   if (Buffer.byteLength(argumentsText, "utf8") > MAX_STRUCTURED_PATCH_BYTES) reject("arguments_too_large");
-  if (!jsonArgumentsAreUnambiguous(argumentsText)) reject("ambiguous_or_invalid_json");
+  return parsePatchJson(argumentsText, "arguments");
+}
+
+// Only fixed scope/category names leave this boundary. Do not include parser
+// messages, source excerpts, paths, or argument values in relay diagnostics.
+function parsePatchJson(text, scope) {
+  if (text.trim() === "") reject(`${scope}_empty_json`);
+  let value;
   try {
-    return JSON.parse(argumentsText);
+    value = JSON.parse(text);
   } catch {
-    reject("ambiguous_or_invalid_json");
+    reject(`${scope}_invalid_json`);
   }
+  // JSON.parse accepts duplicate keys and lossy numbers; these are still
+  // refused even though the syntax is valid.
+  if (!jsonArgumentsAreUnambiguous(text)) reject(`${scope}_ambiguous_json`);
+  return value;
 }
 
 // Whole logical lines serialized to native patch syntax. Matching is performed
@@ -239,12 +257,7 @@ function writeToOperations(value) {
 
 function parseOperationsField(operations) {
   if (typeof operations === "string") {
-    if (!jsonArgumentsAreUnambiguous(operations)) reject("ambiguous_or_invalid_json");
-    try {
-      return JSON.parse(operations);
-    } catch {
-      reject("ambiguous_or_invalid_json");
-    }
+    return parsePatchJson(operations, "operations");
   }
   return operations;
 }

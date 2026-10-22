@@ -253,3 +253,43 @@ test("codec diagnostics disclose only recognized compiler-owned categories", () 
     assert.equal(GROK_STRUCTURED_PATCH_CODEC.argumentErrorCode(error), undefined);
   }
 });
+
+
+test("JSON diagnostics distinguish argument and encoded operations failures without values", () => {
+  for (const [text, category] of [
+    ["", "empty_json"], [" \n\t", "empty_json"],
+    ['{"PRIVATE_SOURCE_TEXT":', "invalid_json"],
+    ['{"PRIVATE_SOURCE_TEXT":1,"PRIVATE_SOURCE_TEXT":2}', "ambiguous_json"],
+    ['{"number":9007199254740993}', "ambiguous_json"],
+  ]) {
+    for (const scope of ["arguments", "operations"]) {
+      const input = scope === "arguments" ? text : JSON.stringify({ operations: text });
+      const code = `${scope}_${category}`;
+      assert.throws(() => compileStructuredPatchArguments(input), error => {
+        assert.equal(error.code, code);
+        assert.equal(GROK_STRUCTURED_PATCH_CODEC.argumentErrorCode(error), code);
+        assert.equal(error.message, `Invalid structured apply_patch arguments (${code}).`);
+        return true;
+      });
+    }
+  }
+});
+
+test("separator diagnostics identify paths, anchors and file lines without their contents", () => {
+  for (const separator of ["\n", "\r", "\0"]) {
+    const privateText = `PRIVATE_SOURCE_TEXT${separator}PRIVATE_FILE_NAME`;
+    for (const [value, code] of [
+      [wrap(add(privateText)), "embedded_path_separator"],
+      [wrap(update([addLine("x")], { anchor: privateText })), "embedded_anchor_separator"],
+      [wrap(add("x", [privateText])), "embedded_line_separator"],
+      [wrap(update([addLine(privateText)])), "embedded_line_separator"],
+    ]) {
+      assert.throws(() => compileStructuredPatchArguments(JSON.stringify(value)), error => {
+        assert.equal(error.code, code);
+        assert.equal(GROK_STRUCTURED_PATCH_CODEC.argumentErrorCode(error), code);
+        assert.doesNotMatch(error.message, /PRIVATE_SOURCE_TEXT|PRIVATE_FILE_NAME/);
+        return true;
+      });
+    }
+  }
+});
