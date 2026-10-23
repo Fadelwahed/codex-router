@@ -12007,8 +12007,9 @@ test("router response pipelines preserve ambiguous provider bytes exactly", asyn
     );
     const failureText = failed.toString("utf8");
     assert.match(failureText, /"namespace":"collaboration"/u);
-    assert.match(failureText, /event: error/u);
-    assert.match(failureText, /local_router_stream_failed/u);
+    assert.match(failureText, /event: response.failed/u);
+    assert.match(failureText, /ERR_NAMESPACE_RELAY_COMMITTED_STREAM/u);
+    assert.match(failureText, /"code":"invalid_prompt"/u);
     assert.doesNotMatch(failureText, new RegExp(postCommitMarker, "u"));
     const lifecycleFailed = await turn(
       "special-lifecycle-failure",
@@ -12017,8 +12018,9 @@ test("router response pipelines preserve ambiguous provider bytes exactly", asyn
     );
     const lifecycleFailureText = lifecycleFailed.toString("utf8");
     assert.match(lifecycleFailureText, /"type":"custom_tool_call"/u);
-    assert.match(lifecycleFailureText, /event: error/u);
-    assert.match(lifecycleFailureText, /local_router_stream_failed/u);
+    assert.match(lifecycleFailureText, /event: response.failed/u);
+    assert.match(lifecycleFailureText, /ERR_NAMESPACE_RELAY_COMMITTED_STREAM/u);
+    assert.match(lifecycleFailureText, /"code":"invalid_prompt"/u);
     assert.doesNotMatch(lifecycleFailureText, new RegExp(lifecycleMarker, "u"));
   } finally {
     await stopChild(router);

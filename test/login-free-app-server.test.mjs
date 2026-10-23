@@ -349,9 +349,14 @@ async function verifySignedOutTurn(binary, { initialProvider = "openai" } = {}) 
     const notifications = await runAppServerTurn(binary, env, model, expectedProvider);
     assert.equal(requests.length, 1);
     if (upgrades.length > 0) {
-      assert.equal(upgrades.length, 1);
-      assert.equal(upgrades[0].url, "/v1/responses");
-      assert.equal(upgrades[0].headers.authorization, `Bearer ${CALLER_KEY}`);
+      // Codex may retire an idle authenticated socket before creating the
+      // turn on a new connection. Connections are not generations: the single
+      // upstream request above is the no-replay assertion. Authenticate every
+      // connection, including unused ones, rather than pinning their count.
+      for (const upgrade of upgrades) {
+        assert.equal(upgrade.url, "/v1/responses");
+        assert.equal(upgrade.headers.authorization, `Bearer ${CALLER_KEY}`);
+      }
       assert.equal(
         requests[0].url,
         `/_codex-router/${CALLER_KEY}/v1/responses`,
@@ -367,6 +372,8 @@ async function verifySignedOutTurn(binary, { initialProvider = "openai" } = {}) 
     }
     assert.equal(requests[0].body.model, model);
     assert.match(JSON.stringify(notifications), new RegExp(MARKER));
+    assert.equal(notifications.find((entry) => entry.method === "turn/completed")?.params?.turn?.status, "completed");
+    assert.equal(notifications.some((entry) => entry.method === "error"), false, "the turn must not recover through an automatic retry");
   } finally {
     for (const socket of upgradedSockets) socket.destroy();
     await new Promise((resolve) => server.close(resolve));
