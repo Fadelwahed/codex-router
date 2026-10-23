@@ -399,18 +399,14 @@ jobs:
           set -euo pipefail
           app="$RUNNER_TEMP/Codex Router.app"
           outer="$app/Contents/MacOS/ModelRouterTray"
-          embedded="$app/Contents/Resources/Control Center.app/Contents/MacOS/Codex Router"
           log="$RUNNER_TEMP/model-router-macos-smoke.log"
 
           query_lifecycle() {
-            node -e '
-              const { execFileSync } = require("node:child_process");
-              const env = { ...process.env };
-              delete env.ELECTRON_RUN_AS_NODE;
-              process.stdout.write(execFileSync(process.argv[1], ["--query-lifecycle"], {
-                env, encoding: "utf8", timeout: 10000, killSignal: "SIGKILL",
-              }));
-            ' "$embedded"
+            # A GUI query helper registers as this same macOS application. If
+            # it overlaps NSWorkspace.openApplication, LaunchServices can fail
+            # the real window launch. Observe the existing record without
+            # starting another application, using the exact same validator.
+            node scripts/query-control-center-lifecycle.mjs
           }
 
           wait_for_lifecycle() {
