@@ -104,7 +104,7 @@ async function run({ foreground = false, disabled = false, mode = "healthy", see
       return { label: "fixture gateway", code: 0 };
     } },
     "./litellm-config.mjs": { writeLiteLlmConfig: () => {} },
-    "./model-registry.mjs": { MODELS: [] },
+    "./model-registry.mjs": { MODELS: [], COMPATIBILITY_LAYER: { enabled: true } },
     "./local-models.mjs": { readLocalModelSelection: () => ({ enabled: [] }) },
     "./antigravity-oauth-status.mjs": { antigravityOAuthStartupState: () => ({ startForwarder: false }), antigravityOAuthStatus: () => ({}) },
     "./antigravity-probe-activation.mjs": { attemptAntigravityProbePromotionAfterReadiness: async () => true },

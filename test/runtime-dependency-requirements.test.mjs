@@ -21,7 +21,7 @@ function apiProvider(id, protocol = "openai") {
     credential: { file: `${id}.secret`, environment: ["FIXTURE_UNUSED_KEY"] } };
 }
 
-function fixture({ providers = [], models = [], selected = [], generic, userModels } = {}) {
+function fixture({ providers = [], models = [], selected = [], generic, userModels, compatibilityEnabled } = {}) {
   const directory = mkdtempSync(path.join(fixtureBase, "runtime-dependencies-"));
   const home = path.join(directory, "codex");
   const state = path.join(directory, "state");
@@ -35,6 +35,8 @@ function fixture({ providers = [], models = [], selected = [], generic, userMode
     JSON.stringify({ version: 1, providers: generic }));
   if (userModels) writeFileSync(path.join(state, "user-models.json"),
     JSON.stringify({ version: 1, models: userModels }));
+  if (compatibilityEnabled !== undefined) writeFileSync(path.join(state, "compatibility-layer.json"),
+    JSON.stringify({ version: 1, enabled: compatibilityEnabled }));
   const env = { ...process.env };
   for (const name of Object.keys(env)) {
     if (/^(MODEL_ROUTER_|CODEX_ROUTER_|KIMI_|GROK_|GOOGLE_|GCLOUD_)/.test(name) || /(?:_API_KEY|_TOKEN)$/.test(name)) {
@@ -224,4 +226,16 @@ test("pending Antigravity proof gets its adoption listener before enablement; ga
   } finally {
     rmSync(staged.directory, { recursive: true, force: true });
   }
+});
+
+test("explicit compatibility opt-out excludes selected hidden Chat and OAuth routes", () => {
+  const providers = [apiProvider("fixture-chat"), {
+    id: "kimi-oauth", kind: "oauth", displayName: "Kimi", ownedBy: "fixture", proxyBaseEnv: "FIXTURE_KIMI_PROXY",
+  }];
+  const options = { providers, selected: ["fixture-chat", "kimi-oauth"], models: [
+    model("fixture-chat", "vision", { listed: false, inputModalities: ["text", "image"] }),
+    model("kimi-oauth", "kimi"),
+  ] };
+  assert.equal(requirements(options).needsGateway, true);
+  assert.deepEqual(requirements({ ...options, compatibilityEnabled: false }), { needsGateway: false, services: [] });
 });

@@ -1,3 +1,4 @@
+import { compatibilityLayerError } from "./compatibility-layer-state.mjs";
 import { normalizeAzureOpenAIResponsesRequest } from "./azure-openai-compat.mjs";
 import http from "node:http";
 import {
@@ -35,6 +36,7 @@ import { PORTS, TARGET } from "./paths.mjs";
 import {
   API_MODELS,
   MODEL_BY_GATEWAY_ID,
+  COMPATIBILITY_DISABLED_MODELS,
   PROVIDERS,
   RUNTIME_PROVIDERS,
   providerForModel,
@@ -1038,6 +1040,12 @@ function normalizeBody(buffer, contentType, route) {
   delete payload.client_metadata;
   delete payload.access_programs;
   const requestedModel = String(payload.model || "");
+  if (COMPATIBILITY_DISABLED_MODELS.has(requestedModel.replace(/^responses\//, ""))) {
+    const error = new Error(compatibilityLayerError(requestedModel).error.message);
+    error.status = 409;
+    error.code = "compatibility_layer_disabled";
+    throw error;
+  }
   // LiteLLM's Responses bridge prefixes the gateway id with `responses/` on
   // the upstream wire format; the forwarder still owns the id translation.
   const model =
@@ -2389,7 +2397,8 @@ const server = http.createServer((request, response) => {
     );
     if (!response.headersSent) {
       writeJson(response, status, {
-        error: transport || {
+        error: error.code === "compatibility_layer_disabled"
+          ? compatibilityLayerError("the requested route").error : transport || {
           type: "provider_api_proxy_error",
           message: "The API-provider forwarder could not complete the request.",
         },
