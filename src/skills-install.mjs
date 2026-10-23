@@ -806,7 +806,14 @@ function publishStagedSkill(staged, target, publicationToken, { onPublicationCla
       flag: "wx",
     });
     onPublicationClaimed?.({ target });
-    cpSync(staged.content, target, { recursive: true, force: false, errorOnExist: true });
+    // Copy each entry from staged.content into target individually to avoid
+    // Node.js version differences in cpSync errorOnExist behavior when the
+    // target directory already exists (created above with the marker file).
+    for (const entry of readdirSync(staged.content)) {
+      const sourcePath = path.join(staged.content, entry);
+      const targetPath = path.join(target, entry);
+      cpSync(sourcePath, targetPath, { recursive: true, force: false, errorOnExist: true });
+    }
     const stagedDigest = directoryDigest(staged.content);
     const targetDigest = directoryDigest(target, { ignoreRootEntries: [PUBLISH_MARKER] });
     if (!stagedDigest || stagedDigest !== targetDigest) {
