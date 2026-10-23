@@ -9,7 +9,7 @@ import { fileURLToPath } from "node:url";
 
 import { privateFileIsProtected } from "../src/file-security.mjs";
 import { acquireFileLock } from "../src/file-lock.mjs";
-import { ageToolResultsWithRecovery, readRetainedToolResult, retainToolResult, hasLocalReadbackTool, hasVerifiedToolResultReadback, toolResultRecoveryScope, toolResultReadbackTools } from "../src/tool-result-recovery.mjs";
+import { ageToolResultsWithRecovery, readRetainedToolResult, retainToolResult, searchRetainedToolResults, hasLocalReadbackTool, hasVerifiedToolResultReadback, toolResultRecoveryScope, toolResultReadbackTools } from "../src/tool-result-recovery.mjs";
 import { expireRetainedToolResults } from "../src/tool-result-retention.mjs";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
@@ -91,6 +91,114 @@ test("aging accepts a Desktop-wrapped receipt only after verified local readback
   assert.match(result.input[1].output, /tool-result-read.mjs/u);
   assert.ok(result.input[1].output.length < full.length, "the middle is omitted after proof verification");
   assert.match(result.input[1].output, /hidden-evidence-2937/u, "the end excerpt is retained");
+});
+
+test("scope search returns exact evidence only from the reference permission scope", async t => {
+  const options={...await fixture(t),now:Date.now()};
+  const reference=await retainToolResult("reference without the requested value",options);
+  const exact="prefix\r\n😀needle-7439\r\nactual original evidence\r\ntail";
+  const saved=await retainToolResult(exact,{...options,callId:"matching"});
+  const foreign=await retainToolResult("needle-7439 FOREIGN PRIVATE RESULT",{...options,scope:"other-thread",callId:"foreign"});
+  const result=searchRetainedToolResults(reference.handle,{...options,find:"needle-7439",limit:2000});
+  assert.equal(result.complete,true);
+  assert.equal(result.matches.length,1);
+  assert.equal(result.matches[0].handle,saved.handle);
+  assert.equal(result.matches[0].text,exact);
+  assert.equal(JSON.stringify(result).includes(foreign.handle),false);
+  assert.equal(JSON.stringify(result).includes("FOREIGN PRIVATE RESULT"),false);
+  assert.equal(hasVerifiedToolResultReadback([{type:"function_call_output",output:JSON.stringify(result)}],options.scope,options),true);
+  const absent=searchRetainedToolResults(reference.handle,{...options,find:"FOREIGN PRIVATE RESULT"});
+  assert.deepEqual(absent.matches,[]);
+  assert.equal(absent.complete,true);
+  const cli=spawnSync(process.execPath,[path.join(root,"src/tool-result-read.mjs"),reference.handle,"--store",options.directory,"--scope-search","--find","needle-7439"],{encoding:"utf8",timeout:20000,windowsHide:true});
+  assert.equal(cli.status,0,cli.stderr);
+  assert.equal(JSON.parse(cli.stdout).matches[0].text,exact);
+  for(const args of [
+    ["--scope-search"],
+    ["--cursor","1"],
+    ["--scope-search","--find","x","--offset","1"],
+    ["--scope-search","--scope-search","--find","x"],
+  ]){
+    const bad=spawnSync(process.execPath,[path.join(root,"src/tool-result-read.mjs"),reference.handle,"--store",options.directory,...args],{encoding:"utf8",timeout:20000,windowsHide:true});
+    assert.notEqual(bad.status,0);
+  }
+});
+
+test("scope search bounds excerpts, detects index changes, and cannot treat corrupt evidence as absent", async t => {
+  const options={...await fixture(t),now:Date.now()};const saved=[];
+  for(let i=0;i<4;i++)saved.push(await retainToolResult(`😀needle-${i}\r\n${"evidence\n".repeat(50)}`,{...options,callId:String(i)}));
+  const first=searchRetainedToolResults(saved[0].handle,{...options,find:"needle",limit:20});
+  assert.equal(first.matches.length,1);
+  assert.equal(first.complete,false);
+  assert.ok(first.matches[0].text.length<=21);
+  const next=searchRetainedToolResults(saved[0].handle,{...options,find:"needle",limit:20,cursor:first.nextCursor,index:first.index});
+  assert.notEqual(next.matches[0].handle,first.matches[0].handle);
+  assert.throws(()=>searchRetainedToolResults(saved[0].handle,{...options,find:"needle",cursor:first.nextCursor,index:"bad-index"}),{code:"search_changed"});
+  await retainToolResult("new entry",{...options,callId:"new-entry"});
+  assert.throws(()=>searchRetainedToolResults(saved[0].handle,{...options,find:"needle",cursor:first.nextCursor,index:first.index}),{code:"search_changed"});
+  writeFileSync(path.join(options.directory,`${saved[1].handle}.result`),"corrupt");
+  const unavailable=searchRetainedToolResults(saved[0].handle,{...options,find:"absent"});
+  assert.equal(unavailable.complete,false);
+  assert.ok(unavailable.unavailable>0);
+  assert.equal(JSON.stringify(unavailable).includes(saved[1].handle),false);
+  assert.throws(()=>searchRetainedToolResults(saved[1].handle,{...options,find:"needle"}),{code:"corrupt"});
+  assert.throws(()=>searchRetainedToolResults(saved[0].handle,{...options,find:"needle",now:Date.now()+20000}),{code:"expired"});
+});
+
+test("scope search authenticates its reference and rejects invalid ranges", async t => {
+  const options = { ...await fixture(t), now: Date.now() };
+  const saved = await retainToolResult("😀needle", options);
+  const search = extra => searchRetainedToolResults(saved.handle, { ...options, find: "needle", ...extra });
+  for (const find of [undefined, "", "x".repeat(2001)]) {
+    assert.throws(() => search({ find }), { code: "invalid_search" });
+  }
+  for (const extra of [{ limit: 0 }, { limit: 16001 }, { limit: NaN }, { cursor: -1 }, { cursor: 0.5 }]) {
+    assert.throws(() => search(extra), { code: "invalid_range" });
+  }
+  assert.throws(() => search({ cursor: 1 }), { code: "search_changed" });
+  assert.throws(() => searchRetainedToolResults("../invalid", { ...options, find: "needle" }), { code: "invalid_handle" });
+  assert.throws(() => searchRetainedToolResults("a".repeat(43), { ...options, find: "needle" }), { code: "missing_or_expired" });
+  const narrow = search({ limit: 1 });
+  assert.equal(narrow.matches[0].text, "😀", "reuse the reader's surrogate-pair boundary");
+  const file = path.join(options.directory, `${saved.handle}.result`);
+  const record = JSON.parse(readFileSync(file, "utf8"));
+  record.scope = hash("forged-scope");
+  writeFileSync(file, JSON.stringify(record));
+  assert.throws(() => search({}), { code: "corrupt" }, "a changed scope invalidates the handle signature");
+});
+
+test("scope search paginates the 32-match cap without losing or duplicating evidence", async t => {
+  const options = { ...await fixture(t), now: Date.now(),
+    writeEmpty: async (file, text) => writeFileSync(file, text, { flag: "wx", mode: 0o600 }) };
+  const saved = [];
+  for (let i = 0; i < 33; i++) saved.push(await retainToolResult(`needle-${i}`, { ...options, callId: String(i) }));
+  const first = searchRetainedToolResults(saved[0].handle, { ...options, find: "needle", limit: 16000 });
+  assert.equal(first.matches.length, 32);
+  assert.equal(first.complete, false);
+  const last = searchRetainedToolResults(saved[0].handle, { ...options, find: "needle", limit: 16000,
+    cursor: first.nextCursor, index: first.index });
+  assert.equal(last.complete, true);
+  assert.equal(last.nextCursor, null);
+  assert.equal(last.matches.length, 1);
+  assert.deepEqual(new Set([...first.matches, ...last.matches].map(item => item.handle)), new Set(saved.map(item => item.handle)));
+});
+
+test("scope search enforces byte and elapsed budgets between archives", async t => {
+  const options = { ...await fixture(t), now: Date.now(),
+    writeEmpty: async (file, text) => writeFileSync(file, text, { flag: "wx", mode: 0o600 }) };
+  const saved = [];
+  for (let i = 0; i < 3; i++) saved.push(await retainToolResult("x".repeat(8 * 1024 * 1024), { ...options, callId: String(i) }));
+  t.mock.method(Date, "now", () => options.now);
+  const bytes = searchRetainedToolResults(saved[0].handle, { ...options, find: "absent" });
+  assert.equal(bytes.searched, 2, "two serialized 8MiB records exhaust the byte budget");
+  assert.equal(bytes.complete, false);
+  assert.equal(bytes.nextCursor, 2);
+  let ticks = 0;
+  t.mock.method(Date, "now", () => options.now + ticks++ * 1001);
+  const timed = searchRetainedToolResults(saved[0].handle, { ...options, find: "absent" });
+  assert.equal(timed.searched, 1, "the elapsed budget stops before the second file");
+  assert.equal(timed.complete, false);
+  assert.equal(timed.nextCursor, 1);
 });
 
 test("a real committed snapshot survives restart and reads exact Unicode/CRLF bytes in pages", async t => {
