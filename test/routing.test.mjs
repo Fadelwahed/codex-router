@@ -464,7 +464,7 @@ test("router requires the configured path capability before any model route", as
     const publicPayload = await publicHealth.json();
     assert.deepEqual(
       Object.keys(publicPayload).sort(),
-      ["activity", "degraded", "ok", "service", "version"],
+      ["activity", "compatibilityLayer", "degraded", "ok", "service", "version"],
     );
     // `degraded` names which local service is unreachable so doctor can say the
     // gateway died rather than "the router is not ready". It is a closed set of

@@ -1,3 +1,4 @@
+import { COMPATIBILITY_LAYER } from "./model-registry.mjs";
 import { execFileSync, spawnSync } from "node:child_process";
 import { existsSync, readFileSync, statSync } from "node:fs";
 import path from "node:path";
@@ -112,7 +113,12 @@ import { loopbackProxyBypassStatus } from "./loopback-proxy-bypass.mjs";
 import { serviceProxyOptInProblem } from "./proxy-environment.mjs";
 
 const checks = [];
+
 const add = (status, name, detail, fix) => checks.push({ status, name, detail, fix });
+add(COMPATIBILITY_LAYER.invalid ? "warn" : "ok", "Compatibility layer policy",
+  COMPATIBILITY_LAYER.invalid ? "invalid settings; optional compatibility routes are disabled" :
+    COMPATIBILITY_LAYER.enabled ? "enabled" : "disabled; native and Responses routes only",
+  "Run control compatibility-layer on|off, then prepare dependencies, restart and refresh catalogs.");
 const jsonOutput = process.argv.includes("--json");
 const homebrewManaged = isHomebrewManaged();
 const usesBundledVenv = !process.env.MODEL_ROUTER_LITELLM_BIN &&
@@ -242,7 +248,7 @@ function repair() {
   // installed without pip RECORD metadata. A healthy package can still use
   // doctor --fix to regenerate config and services, but damaged package files
   // must be rebuilt by Homebrew itself before the service transaction starts.
-  if (homebrewManaged && usesBundledVenv) {
+  if (COMPATIBILITY_LAYER.enabled && homebrewManaged && usesBundledVenv) {
     const problem = bundledVenvProblem();
     if (problem) {
       throw new Error(`Homebrew-managed LiteLLM is damaged (${problem}). ${dependencyFix}.`);
@@ -469,6 +475,10 @@ const routedTransportActive = codexTarget
 let idleInstall = false;
 try {
   selection = providerSelectionStatus();
+  if (!COMPATIBILITY_LAYER.enabled) {
+    const activeProviders = new Set(MODELS.map((model) => model.provider));
+    selection = { ...selection, providers: selection.providers.filter((id) => activeProviders.has(id)) };
+  }
   idleInstall =
     selection.explicit && selection.providers.length === 0 && discoveryDisabled();
   requiredRoutedModels = selectedConfiguredListedModels();
@@ -590,7 +600,7 @@ let unroutable = [];
 try {
   const rendered = readFileSync(LITELLM_CONFIG_PATH, "utf8");
   unroutable = catalogRoutedModels
-    .filter((model) => !rendered.includes(`model_name: "${model.gatewayModel}"`))
+    .filter((model) => COMPATIBILITY_LAYER.enabled && !rendered.includes(`model_name: "${model.gatewayModel}"`))
     .map((model) => model.slug);
 } catch {
   // The missing-config case is already reported by the gateway config check.
@@ -801,9 +811,9 @@ add(
   "Change per-model visibility in the desktop Models settings.",
 );
 add(
-  existsSync(LITELLM_CONFIG_PATH) ? "ok" : "fail",
+  !COMPATIBILITY_LAYER.enabled || existsSync(LITELLM_CONFIG_PATH) ? "ok" : "fail",
   "Generated gateway config",
-  LITELLM_CONFIG_PATH,
+  COMPATIBILITY_LAYER.enabled ? LITELLM_CONFIG_PATH : "compatibility layer disabled",
   "Run ./bin/doctor --fix.",
 );
 
@@ -818,7 +828,9 @@ add(
 // without the bundled `.venv`, and a fresh checkout has no venv until the
 // installer runs.
 let venvCheck;
-if (usesBundledVenv) {
+if (!COMPATIBILITY_LAYER.enabled) {
+  venvCheck = { status: "ok", detail: "compatibility layer disabled; Python is not probed" };
+} else if (usesBundledVenv) {
   const venvProblem = bundledVenvProblem();
   venvCheck = venvProblem
     ? {
