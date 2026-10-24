@@ -246,7 +246,7 @@ test("a gateway spawn error cleans up forwarders that are already listening", { 
   writeFileSync(path.join(stateDir, "caller-secret"), "spawn-caller-key-with-sufficient-length\n", { mode: 0o600 });
 
   const child = spawn(process.execPath, [
-    "--import", path.join(root, "test", "fixtures", "startup-spawn-error.mjs"),
+    "--import", new URL("./fixtures/startup-spawn-error.mjs", import.meta.url).href,
     path.join(root, "src", "foreground-start.mjs"),
   ], {
     cwd: root,
