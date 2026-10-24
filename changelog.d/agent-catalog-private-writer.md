@@ -1,0 +1,1 @@
+- **Routed agent definitions use the shared private-file writer.** Catalog sync creates exclusive temporary files, cleans up unpublished bytes on failure, and avoids a duplicate Windows ACL helper while preserving exact definitions and catalog rollback.
