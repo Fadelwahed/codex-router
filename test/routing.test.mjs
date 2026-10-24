@@ -105,12 +105,19 @@ function run(script, env, { nodeArgs = [] } = {}) {
     env?.MODEL_ROUTER_STATE_DIR || env?.CODEX_ROUTER_STATE_DIR
       ? {}
       : { MODEL_ROUTER_STATE_DIR: mkdtempSync(path.join(os.tmpdir(), "routing-state-")) };
+  const isolatedState = env?.MODEL_ROUTER_STATE_DIR || env?.CODEX_ROUTER_STATE_DIR || stateIsolation.MODEL_ROUTER_STATE_DIR;
   const child = spawnNodeFixture(path.join(root, "src", script), {
     nodeArgs,
     cwd: root,
     env: {
       ...process.env,
       ...stateIsolation,
+      MODEL_ROUTER_STATE_DIR: isolatedState,
+      CODEX_ROUTER_STATE_DIR: isolatedState,
+      CODEX_HOME: path.join(isolatedState, "codex"),
+      ...(script === "router.mjs" && env?.CODEX_ROUTER_GATEWAY_BASE_URL ? {
+        CODEX_ROUTER_API_BASE_URL: env.CODEX_ROUTER_GATEWAY_BASE_URL,
+      } : {}),
       CODEX_ROUTER_CALLER_KEY: CALLER_KEY,
       CODEX_ROUTER_INTERNAL_KEY: INTERNAL_KEY,
       KIMI_INTERNAL_KEY: INTERNAL_KEY,

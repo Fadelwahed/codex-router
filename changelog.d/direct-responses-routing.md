@@ -1,0 +1,1 @@
+- Route Responses-native models through the credential-owning API forwarder even when the compatibility layer is enabled for other models. Normal turns and remote compaction keep the existing preparation, tool identities, stream validation and credential boundaries; models needing translation continue through the gateway.
