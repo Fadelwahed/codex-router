@@ -72,6 +72,7 @@ import { moonshotSchemaRoute } from "./moonshot-schema-routes.mjs";
 import { reasoningTagStripperTransform } from "./reasoning-tag-stripper.mjs";
 import { reasoningTagOptionsForRoute } from "./reasoning-tag-policy.mjs";
 import { routeExecution } from "./route-execution-plan.mjs";
+import { runtimeDependencyRequirements } from "./runtime-dependency-requirements.mjs";
 import {
   messageEnvelopeCompatTransform,
 } from "./zai-responses-compat.mjs";
@@ -1660,29 +1661,26 @@ async function probeService(url) {
 }
 
 async function healthPayload() {
-  const enabled = new Set(readProviderSelection());
-  const apiEnabled = [...RUNTIME_PROVIDERS.values()].some(
-    (provider) => provider.kind === "openai-compatible" && (
-      provider.generic === true || enabled.has(provider.id)
-    ),
-  );
-  const [oauth, api, grokOauth, gateway] = await Promise.all([
-    COMPATIBILITY_LAYER.enabled && enabled.has("kimi-oauth")
+  const required = new Set(runtimeDependencyRequirements({ includePendingActivation: false }).services);
+  const [oauth, api, grokOauth, gateway, antigravityOauth, devinCli] = await Promise.all([
+    required.has("kimi")
       ? serviceHealth(OAUTH_HEALTH)
       : { reachable: true, enabled: false },
-    apiEnabled ? serviceHealth(API_HEALTH) : { reachable: true, enabled: false },
-    // The Grok OAuth forwarder is started unconditionally but is only a real
-    // dependency for an operator who selected the provider, so it is gated the
-    // way the Kimi OAuth forwarder is: an unselected provider reports standby
-    // rather than being probed on a port nobody routes through.
-    COMPATIBILITY_LAYER.enabled && enabled.has("grok-oauth")
+    required.has("api") ? serviceHealth(API_HEALTH) : { reachable: true, enabled: false },
+    required.has("grok")
       ? serviceHealth(GROK_OAUTH_HEALTH)
       : { reachable: true, enabled: false },
-    COMPATIBILITY_LAYER.enabled ? serviceHealth(GATEWAY_HEALTH) : { reachable: true, enabled: false },
+    required.has("gateway") ? serviceHealth(GATEWAY_HEALTH) : { reachable: true, enabled: false },
+    required.has("antigravity")
+      ? serviceHealth(loopback(PORTS.antigravityOauth, "/health"))
+      : { reachable: true, enabled: false },
+    required.has("devin")
+      ? serviceHealth(loopback(PORTS.devinCli, "/health"))
+      : { reachable: true, enabled: false },
   ]);
   // Naming the unreachable dependency is the difference between "the router is
   // broken" and "the gateway is restarting". It costs nothing to carry: these
-  // are four fixed local service names, so it is safe on the unauthenticated
+  // are fixed local service names, so it is safe on the unauthenticated
   // leaf too, which is the only one `waitForRouterHealth` and therefore doctor
   // can read.
   const degraded = [
@@ -1690,6 +1688,8 @@ async function healthPayload() {
     ["api", api],
     ["grokOauth", grokOauth],
     ["gateway", gateway],
+    ["antigravityOauth", antigravityOauth],
+    ["devinCli", devinCli],
   ]
     .filter(([, service]) => !service.reachable)
     .map(([name]) => name);
@@ -1706,6 +1706,8 @@ async function healthPayload() {
     api,
     grokOauth,
     gateway,
+    antigravityOauth,
+    devinCli,
   };
 }
 
