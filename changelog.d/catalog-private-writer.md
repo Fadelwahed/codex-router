@@ -1,0 +1,1 @@
+- **Model catalogs use the shared private atomic writer.** Native captures, aliases, announcements, merged catalogs and their snapshot restores keep their existing formats and publication behavior while avoiding duplicate Windows ACL hardening. Failed replacements clean only their own unpublished temporary, preserving colliding or replaced files belonging to another writer.
