@@ -40,7 +40,7 @@ const completed = { id: "resp_redirect_control", object: "response", status: "co
 async function fixture(t) {
   const directory = mkdtempSync(path.join(os.tmpdir(), "generation-redirect-"));
   const servers = [], children = [];
-  const observed = { origin: 0, target: 0, models: [], status: 307 };
+  const observed = { origin: 0, target: 0, models: [], status: 307, unconfiguredApi: 0 };
   t.after(async () => {
     for (const child of children) {
       if (child.exitCode === null && child.signalCode === null) {
@@ -55,6 +55,7 @@ async function fixture(t) {
     }
     assert.ok(path.resolve(directory).startsWith(`${path.resolve(os.tmpdir())}${path.sep}`));
     rmSync(directory, { recursive: true, force: true });
+    assert.equal(observed.unconfiguredApi, 0, "every direct API request must use the fixture-owned forwarder");
   });
   const listen = async handler => {
     const server = http.createServer(handler);
@@ -62,6 +63,13 @@ async function fixture(t) {
     await new Promise((resolve, reject) => { server.once("error", reject); server.listen(0, "127.0.0.1", resolve); });
     return `http://127.0.0.1:${server.address().port}`;
   };
+  // Missing route wiring must fail locally, never reach an installed forwarder.
+  const unconfiguredApi = await listen(async (request, response) => {
+    for await (const chunk of request) { /* consume only synthetic fixture data */ }
+    observed.unconfiguredApi += 1;
+    response.writeHead(401, { "content-type": "application/json" });
+    response.end('{"error":{"message":"fixture API route was not configured"}}');
+  });
   const target = await listen(async (request, response) => {
     for await (const chunk of request) { /* consume any redirected request */ }
     observed.target += 1;
@@ -109,6 +117,7 @@ async function fixture(t) {
     CODEX_ROUTER_CALLER_KEY: caller, CODEX_ROUTER_INTERNAL_KEY: internal, KIMI_INTERNAL_KEY: internal,
     CODEX_ROUTER_NO_DISCOVERY: "1", CODEX_ROUTER_SHOW_ALL_MODELS: "1", CODEX_ROUTER_QUIET: "1",
     CODEX_ROUTER_GATEWAY_BASE_URL: `${origin}/v1`, CODEX_NATIVE_BASE_URL: origin,
+    CODEX_ROUTER_API_BASE_URL: `${unconfiguredApi}/v1`, CODEX_ROUTER_API_HEALTH_URL: `${unconfiguredApi}/health`,
   });
   mkdirSync(environment.CODEX_HOME);
   async function start(script, overrides = {}) {
@@ -205,7 +214,9 @@ test("a refused redirect target cannot make the Router replay through the API fo
   writeFileSync(path.join(f.directory, "compatibility-layer.json"), JSON.stringify({ version: 1, enabled: false }));
   f.observed.redirectTarget = `http://127.0.0.1:${await openPort()}/v1/responses`;
   const api = await f.start("api-forwarder");
-  const base = await f.start("router", { CODEX_ROUTER_API_BASE_URL: api });
+  const base = await f.start("router", {
+    CODEX_ROUTER_API_BASE_URL: api, CODEX_ROUTER_API_HEALTH_URL: new URL("/health", api).href,
+  });
   const response = await fetch(`${base}/responses`, { method: "POST", headers: { "content-type": "application/json" },
     body: JSON.stringify({ model: f.models[0].slug, stream: false, input: "local consumed POST regression" }),
     signal: AbortSignal.timeout(10_000) });
@@ -252,7 +263,10 @@ test("a redirected vision read does not try another engine", { timeout: 30_000 }
   }));
   f.observed.textModel = f.models[2].upstreamModel;
   const api = await f.start("api-forwarder");
-  const base = await f.start("router", { CODEX_ROUTER_NO_DISCOVERY: "0", CODEX_ROUTER_GATEWAY_BASE_URL: api });
+  const base = await f.start("router", {
+    CODEX_ROUTER_NO_DISCOVERY: "0", CODEX_ROUTER_GATEWAY_BASE_URL: api,
+    CODEX_ROUTER_API_BASE_URL: api, CODEX_ROUTER_API_HEALTH_URL: new URL("/health", api).href,
+  });
   const response = await fetch(`${base}/responses`, { method: "POST", headers: { "content-type": "application/json" },
     body: JSON.stringify({ model: f.models[2].slug, stream: false, input: [{ type: "message", role: "user", content: [
       { type: "input_text", text: "read this local synthetic image" }, { type: "input_image", image_url: image },
