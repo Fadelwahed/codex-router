@@ -29,9 +29,21 @@ import { fileURLToPath } from "node:url";
 // Antigravity kernel leases occupy 10000-29999 on POSIX. A fixture listener
 // there can deny token promotion for its entire lock-wait horizon. Keep both
 // segments outside those leases, the managed router ports, and ephemeral ports.
-const PORT_RANGES = [[5_000, 9_999], [30_000, 32_767]];
+// A successful bind does not make a port usable by fetch: its bad-port policy
+// rejects e.g. SANE's 6566 before opening a connection. Adding a test file can
+// reshuffle blocks onto those ports, so exclude them from the address space.
+const PORT_RANGES = [
+  [5_000, 5_059],
+  [5_062, 5_999],
+  [6_001, 6_565],
+  [6_567, 6_664],
+  [6_670, 6_678],
+  [6_680, 6_696],
+  [6_698, 9_999],
+  [30_000, 32_767],
+];
 const PORT_COUNT = PORT_RANGES.reduce((count, [first, last]) => count + last - first + 1, 0);
-function portAt(index) {
+export function portAt(index) {
   for (const [first, last] of PORT_RANGES) {
     const count = last - first + 1;
     if (index < count) return first + index;

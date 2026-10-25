@@ -71,6 +71,7 @@ import {
 import { moonshotSchemaRoute } from "./moonshot-schema-routes.mjs";
 import { reasoningTagStripperTransform } from "./reasoning-tag-stripper.mjs";
 import { reasoningTagOptionsForRoute } from "./reasoning-tag-policy.mjs";
+import { routeExecution } from "./route-execution-plan.mjs";
 import {
   messageEnvelopeCompatTransform,
 } from "./zai-responses-compat.mjs";
@@ -1123,10 +1124,10 @@ async function nativeResponsesWebSocketFetch(url, init, { fallbackFetch, onSent,
 }
 
 function routedResponsesTarget(route) {
-  // With compatibility disabled the registry exposes only Responses-native
-  // routes. Send them to the credential-owning API forwarder, as already done
-  // for DeepSeek and provider WebSockets; no translation gateway is present.
-  if (!COMPATIBILITY_LAYER.enabled || usesDeepSeekResponses(route) || usesProviderResponsesWebSocket(route)) {
+  // Retain the credential-owning forwarder's canonical preparation and frame
+  // validation. Responses-native models do not need an extra translator when
+  // other selected models still require the compatibility gateway.
+  if (routeExecution(route, { providerForModel }).transport === "direct-responses") {
     return `${API_BASE}/responses`;
   }
   return `${GATEWAY_BASE}/responses`;

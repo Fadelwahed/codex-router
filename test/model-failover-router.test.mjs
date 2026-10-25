@@ -291,6 +291,8 @@ function run(
     env: {
       ...process.env,
       MODEL_ROUTER_STATE_DIR: stateDir,
+      CODEX_ROUTER_STATE_DIR: stateDir,
+      CODEX_HOME: path.join(stateDir, "codex"),
       CODEX_ROUTER_CALLER_KEY: CALLER_KEY,
       CODEX_ROUTER_INTERNAL_KEY: INTERNAL_KEY,
       KIMI_INTERNAL_KEY: INTERNAL_KEY,
@@ -318,6 +320,7 @@ function routerEnv(gatewayPort, routerPort) {
   return {
     CODEX_ROUTER_PORT: String(routerPort),
     CODEX_ROUTER_GATEWAY_BASE_URL: `http://127.0.0.1:${gatewayPort}/v1`,
+    CODEX_ROUTER_API_BASE_URL: `http://127.0.0.1:${gatewayPort}/v1`,
     CODEX_ROUTER_OAUTH_HEALTH_URL: `http://127.0.0.1:${gatewayPort}/health`,
     CODEX_ROUTER_API_HEALTH_URL: `http://127.0.0.1:${gatewayPort}/health`,
     CODEX_ROUTER_GROK_OAUTH_HEALTH_URL: `http://127.0.0.1:${gatewayPort}/health`,
