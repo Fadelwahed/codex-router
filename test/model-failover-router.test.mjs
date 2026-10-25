@@ -325,6 +325,8 @@ function routerEnv(gatewayPort, routerPort) {
     CODEX_ROUTER_API_HEALTH_URL: `http://127.0.0.1:${gatewayPort}/health`,
     CODEX_ROUTER_GROK_OAUTH_HEALTH_URL: `http://127.0.0.1:${gatewayPort}/health`,
     CODEX_ROUTER_GATEWAY_HEALTH_URL: `http://127.0.0.1:${gatewayPort}/health`,
+    MODEL_ROUTER_ANTIGRAVITY_OAUTH_PORT: String(gatewayPort),
+    MODEL_ROUTER_DEVIN_CLI_PORT: String(gatewayPort),
   };
 }
 

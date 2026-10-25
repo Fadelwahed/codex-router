@@ -105,7 +105,9 @@ async function run({ foreground = false, disabled = false, mode = "healthy", see
     } },
     "./litellm-config.mjs": { writeLiteLlmConfig: () => {} },
     "./model-registry.mjs": { MODELS: [], COMPATIBILITY_LAYER: { enabled: true } },
-    "./local-models.mjs": { readLocalModelSelection: () => ({ enabled: [] }) },
+    "./runtime-dependency-requirements.mjs": { runtimeDependencyRequirements: () => ({
+      needsGateway: true, services: ["kimi", "api", "grok", "gateway"],
+    }) },
     "./antigravity-oauth-status.mjs": { antigravityOAuthStartupState: () => ({ startForwarder: false }), antigravityOAuthStatus: () => ({}) },
     "./antigravity-probe-activation.mjs": { attemptAntigravityProbePromotionAfterReadiness: async () => true },
     "./spawnable-command.mjs": { spawnableCommand: (command, args) => ({ command, args, options: {} }) },

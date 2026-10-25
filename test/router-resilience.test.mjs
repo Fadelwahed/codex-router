@@ -43,6 +43,11 @@ function run(env) {
       KIMI_INTERNAL_KEY: INTERNAL_KEY,
       CODEX_ROUTER_SHOW_ALL_MODELS: "1",
       CODEX_ROUTER_QUIET: "1",
+      // This Router-only fixture uses one owned server for dependency health.
+      ...(env.CODEX_ROUTER_GATEWAY_HEALTH_URL ? {
+        MODEL_ROUTER_ANTIGRAVITY_OAUTH_PORT: new URL(env.CODEX_ROUTER_GATEWAY_HEALTH_URL).port,
+        MODEL_ROUTER_DEVIN_CLI_PORT: new URL(env.CODEX_ROUTER_GATEWAY_HEALTH_URL).port,
+      } : {}),
       ...env,
     },
     stdio: ["ignore", "ignore", "pipe"],

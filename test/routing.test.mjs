@@ -122,6 +122,11 @@ function run(script, env, { nodeArgs = [] } = {}) {
       CODEX_ROUTER_INTERNAL_KEY: INTERNAL_KEY,
       KIMI_INTERNAL_KEY: INTERNAL_KEY,
       CODEX_ROUTER_SHOW_ALL_MODELS: "1",
+      // Router-only tests provide one owned dependency-health stand-in.
+      ...(script === "router.mjs" && env?.CODEX_ROUTER_GATEWAY_HEALTH_URL ? {
+        MODEL_ROUTER_ANTIGRAVITY_OAUTH_PORT: new URL(env.CODEX_ROUTER_GATEWAY_HEALTH_URL).port,
+        MODEL_ROUTER_DEVIN_CLI_PORT: new URL(env.CODEX_ROUTER_GATEWAY_HEALTH_URL).port,
+      } : {}),
       ...env,
     },
   });
@@ -297,6 +302,46 @@ test("the Grok OAuth forwarder is probed only when its provider is enabled", asy
   }
 });
 
+test("selected Antigravity and Devin listeners must be healthy", async () => {
+  const healthy = await mockServer((_request, response) => json(response, 200, { ok: true }));
+  try {
+    for (const [provider, variable, field] of [
+      ["antigravity-oauth", "MODEL_ROUTER_ANTIGRAVITY_OAUTH_PORT", "antigravityOauth"],
+      ["devin-cli", "MODEL_ROUTER_DEVIN_CLI_PORT", "devinCli"],
+    ]) {
+      for (const reachable of [true, false]) {
+        const state = mkdtempSync(path.join(os.tmpdir(), "selected-listener-health-"));
+        writeFileSync(path.join(state, "enabled-providers.json"), JSON.stringify({ version: 1, providers: [provider] }));
+        const registry = path.join(state, "registry.json");
+        writeFileSync(registry, JSON.stringify({ version: 1,
+          providers: [{ id: provider, displayName: "Fixture", ownedBy: "fixture", kind: "oauth", proxyBaseEnv: "FIXTURE_PROXY_BASE" }],
+          models: [{ slug: `${provider}/fixture`, gatewayModel: "fixture", upstreamModel: "fixture", provider,
+            listed: true, displayName: "Fixture", description: "Synthetic health route", contextWindow: 128000,
+            autoCompact: 110000, priority: 1, defaultEffort: "medium", compHash: "fixture",
+            reasoningLevels: [{ effort: "medium", description: "Fixture" }], inputModalities: ["text"] }],
+        }));
+        const port = await openPort();
+        const router = run("router.mjs", {
+          CODEX_ROUTER_PORT: String(port), CODEX_ROUTER_STATE_DIR: state, MODEL_ROUTER_REGISTRY: registry,
+          CODEX_ROUTER_GATEWAY_HEALTH_URL: `http://127.0.0.1:${healthy.port}/health`,
+          [variable]: String(reachable ? healthy.port : await openPort()),
+        });
+        try {
+          await waitFor(`${routerBase(port)}/models`, router);
+          const response = await fetch(`${routerBase(port)}/health`);
+          const payload = await response.json();
+          assert.equal(response.status, reachable ? 200 : 503, JSON.stringify(payload));
+          assert.equal(payload[field].reachable, reachable);
+          assert.deepEqual(payload.degraded, reachable ? [] : [field]);
+        } finally {
+          await stopChild(router);
+          rmSync(state, { recursive: true, force: true });
+        }
+      }
+    }
+  } finally { await closeServer(healthy.server); }
+});
+
 test("router requires the configured path capability before any model route", async () => {
   const sessionDirectory = mkdtempSync(path.join(os.tmpdir(), "model-router-session-"));
   const sessionIndex = path.join(sessionDirectory, "session_index.jsonl");
@@ -467,7 +512,7 @@ test("router requires the configured path capability before any model route", as
     assert.doesNotMatch(router.testErrors(), new RegExp(errorSentinel));
 
     const publicHealth = await fetch(`http://127.0.0.1:${routerPort}/health`);
-    assert.equal(publicHealth.status, 200);
+    assert.equal(publicHealth.status, 200, await publicHealth.clone().text());
     const publicPayload = await publicHealth.json();
     assert.deepEqual(
       Object.keys(publicPayload).sort(),
@@ -475,11 +520,11 @@ test("router requires the configured path capability before any model route", as
     );
     // `degraded` names which local service is unreachable so doctor can say the
     // gateway died rather than "the router is not ready". It is a closed set of
-    // three fixed local service names -- never a URL, a credential, or the
+    // fixed local service names -- never a URL, a credential, or the
     // per-service payloads the protected leaf carries.
     assert.ok(
       publicPayload.degraded.every((name) =>
-        ["oauth", "api", "grokOauth", "gateway"].includes(name)),
+        ["oauth", "api", "grokOauth", "gateway", "antigravityOauth", "devinCli"].includes(name)),
       JSON.stringify(publicPayload.degraded),
     );
     assert.equal(publicPayload.activity.state, "error");
