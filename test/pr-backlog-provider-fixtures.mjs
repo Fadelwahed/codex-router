@@ -36,6 +36,25 @@ function evaluate(code, env, args = []) {
   });
 }
 
+function selectGatewayRoute(f, port) {
+  const env = { ...f.env, AIMLAPI_API_KEY: upstreamKey, AIMLAPI_API_BASE_URL: `http://127.0.0.1:${port}/v1` };
+  writeFileSync(path.join(f.state, "compatibility-layer.json"), '{"version":1,"enabled":true}', { mode: 0o600 });
+  evaluate(`
+    import { userModelEntry, writeUserModels } from './src/user-models.mjs';
+    import { writeProviderSelection } from './src/provider-selection.mjs';
+    writeUserModels([userModelEntry({ providerId: 'aimlapi', upstreamId: 'vendor/venv-fixture', priority: 101 })]);
+    writeProviderSelection(['aimlapi']);
+  `, env);
+  // Startup loads a fresh registry after these persisted fixture mutations.
+  const plan = JSON.parse(evaluate(`
+    import { runtimeDependencyRequirements } from './src/runtime-dependency-requirements.mjs';
+    console.log(JSON.stringify(runtimeDependencyRequirements({ includePendingActivation: false })));
+  `, env));
+  assert.equal(plan.needsGateway, true, JSON.stringify(plan));
+  assert.deepEqual(plan.services, ["api", "gateway"]);
+  return env;
+}
+
 function launch(script, env) {
   const child = spawn(process.execPath, [path.join(root, "src", script)], {
     cwd: root, env, detached: process.platform !== "win32", stdio: ["ignore", "pipe", "pipe"],
@@ -185,6 +204,11 @@ export async function runProviderScenarios(t) {
     } finally { await forwarder.stop(); }
   });
 
+  await t.test("the venv fixture explicitly selects a loopback Chat route requiring the gateway", async (t) => {
+    const f = fixture(t);
+    selectGatewayRoute(f, await freePort());
+  });
+
   await t.test("startup proceeds past two real venv probe timeouts and keeps conclusive failures fatal", { skip: process.platform === "win32" }, async (t) => {
     for (const outcome of ["timeout-ready", "timeout-unready", "failed", "missing"]) {
       await t.test(outcome, async (t) => {
@@ -202,7 +226,7 @@ export async function runProviderScenarios(t) {
         for (const [name, key] of [["internal-secret", internalKey], ["caller-secret", "fixture-caller-key-with-sufficient-length"]]) writeFileSync(path.join(f.state, name), key, { mode: 0o600 });
         const ports = await Promise.all(Array.from({ length: 5 }, () => freePort()));
         // Keep the symlinked main entry recognizable to forwarders with an isMain guard.
-        const env = { ...f.env, CODEX_ROUTER_SOURCE_ROOT: source, NODE_OPTIONS: "--preserve-symlinks-main",
+        const env = { ...selectGatewayRoute(f, ports[1]), CODEX_ROUTER_SOURCE_ROOT: source, NODE_OPTIONS: "--preserve-symlinks-main",
           MODEL_ROUTER_PORT: String(ports[0]), MODEL_ROUTER_GATEWAY_PORT: String(ports[1]), MODEL_ROUTER_OAUTH_PORT: String(ports[2]), MODEL_ROUTER_API_PORT: String(ports[3]), MODEL_ROUTER_GROK_OAUTH_PORT: String(ports[4]),
           CODEX_ROUTER_VENV_PROBE_TIMEOUT_MS: "1000", CODEX_ROUTER_VENV_PROBE_RETRY_TIMEOUT_MS: "1000",
           CODEX_ROUTER_GATEWAY_HEALTH_TIMEOUT_MS: "1500", CODEX_ROUTER_STARTUP_HEALTH_TIMEOUT_MS: "20000",
