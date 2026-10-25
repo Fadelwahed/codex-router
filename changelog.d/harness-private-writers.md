@@ -1,0 +1,1 @@
+- **Harness configuration documents use the shared private-file writer.** DSH settings/credentials and generic client documents preserve their exact bytes and publication order while using exclusive temporary files, ownership-aware failure cleanup and one Windows ACL operation per published file.

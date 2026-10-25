@@ -1,0 +1,1 @@
+- Publish gateway YAML and its bundled callbacks through exclusive private-file writes, preserving bytes and callback-before-config ordering while protecting colliding temporaries, cleaning failed writes and avoiding duplicate Windows ACL operations.
