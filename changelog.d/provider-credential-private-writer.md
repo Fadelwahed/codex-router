@@ -1,0 +1,1 @@
+- **Provider API keys use the shared private atomic writer.** Built-in and generic provider key files retain their existing validation, paths and bytes, while avoiding duplicate Windows ACL hardening. Failures before publication preserve the previous key, and temporary-file collisions or cleanup races preserve files belonging to another writer.
