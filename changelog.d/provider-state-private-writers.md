@@ -1,0 +1,1 @@
+- **Provider configuration state uses exclusive private-file writes.** Enabled-provider selections and Vertex project/location settings retain their formats, validation and directory permissions while preserving colliding temporary files, cleaning up failed writes and avoiding duplicate Windows ACL operations.
