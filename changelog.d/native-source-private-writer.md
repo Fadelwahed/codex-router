@@ -1,0 +1,1 @@
+- Publish native catalog source records through exclusive private-file writes, preserving pending/active adoption behavior while protecting colliding temporaries, cleaning failed writes and avoiding duplicate Windows ACL operations.
