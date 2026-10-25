@@ -22,15 +22,17 @@ and `setToolResultReadbackHint` in `src/tool-result-aging-state.mjs`; omitting
 the size resets that model's floor, and setting the hint to false removes it.
 Settings are read for each request after the new runtime has been adopted.
 The notice policy falls back to the existing 32KiB behavior when the planned
-wire-byte savings are below 128KiB, avoiding a probe for small histories.
+model-visible text savings are below 128KiB, avoiding a probe for small histories.
 
 The notice is off by default. It adds a wire-only developer message only when
 the Router has committed exact original text but has not observed a valid
 same-context local readback proof. It asks for one read-only `--limit 1` probe;
 it does not bypass proof, force a tool choice, execute a tool, or change the
 client's saved history. The
-notice is suppressed after a failed read attempt, so denied access does not
-create an automatic probe loop. Signed proofs in bounded Desktop JSON result
+notice is suppressed after an unsuccessful read attempt, including a malformed,
+forged, expired or different-scope receipt, so it does not create an automatic
+probe loop. Full text and the recovery footer remain available for an explicit
+read. Signed proofs in bounded Desktop JSON result
 wrappers are decoded and verified with the same signature, expiry and scope
 checks as direct exec output; wrapping is never permission to omit data.
 Normal function-call arguments remain exact. The

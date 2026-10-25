@@ -323,18 +323,20 @@ export function recoveryInstruction(snapshot) {
     "An expired, missing or corrupt archive is unavailable evidence; do not repeat the original tool to reconstruct it.";
 }
 
-function hasFailedReadbackAttempt(input) {
+function hasFailedReadbackAttempt(input, scope, directories) {
   const completed = new Map(input.filter(item =>
     ["function_call_output", "custom_tool_call_output"].includes(item?.type))
-    .map(item => [item.call_id, item.output]));
+    .map(item => [item.call_id, item]));
   return input.some(item => {
     if (!["function_call", "custom_tool_call"].includes(item?.type) || !completed.has(item.call_id)) return false;
     const args = typeof item.arguments === "string" ? item.arguments : String(item.input || "");
     if (!args.includes("tool-result-read.mjs")) return false;
-    // An attempted read that returned no proof must not create an automatic
-    // retry loop. This only suppresses the optional hint; it never authorizes
-    // omission. A past successful proof can be renewed after it expires.
-    return ![...readbackTexts(completed.get(item.call_id))].some(text => text.includes('"readbackProof"'));
+    // A field name, forged token or expired/foreign receipt is not a successful
+    // read. Suppress optional retries; exact text and its recovery footer remain
+    // available. Only the existing verifier can establish omission permission.
+    return !directories.some(directory => hasVerifiedToolResultReadback(
+      [completed.get(item.call_id)], scope, { directory },
+    ));
   });
 }
 
@@ -390,7 +392,7 @@ export async function ageToolResultsWithRecovery(input, { tools, scope = "", ret
       ? item.output + footer : [...item.output, { type: "input_text", text: footer }] });
   }
   if (pending.size) result.input = result.input.map((item, index) => pending.get(index) || item);
-  if (readbackHint && pending.size && !hasFailedReadbackAttempt(input)) {
+  if (readbackHint && pending.size && !hasFailedReadbackAttempt(input, scope, [...verified.keys()])) {
     // A per-model opt-in, constructed solely from this request's committed
     // snapshots. Keep the permission proof requirement; never synthesize one
     // from the router's own filesystem access. This notice is a wire-only
