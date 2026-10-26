@@ -35,7 +35,10 @@ async function run(platform, command, mode = 'success', { wrapper = false } = {}
   const launch = kind => { events.push({ kind: 'launch', verb: kind, blocked: Boolean(record) }); };
   const fs = {
     existsSync: () => true, mkdirSync: () => {}, chmodSync: () => {}, renameSync: () => {},
-    writeFileSync: () => {}, writeSync: () => {},
+    writeFileSync: () => {
+      events.push({ kind: 'launcher-write' });
+      if (mode === 'launcher-write-error') throw new Error('fixture launcher write failed');
+    }, writeSync: () => {},
     readFileSync: file => {
       if (String(file).endsWith('startup-attempts.json') && record) return JSON.stringify(record);
       if (String(file).endsWith('service-process.json') && processRecordPresent) return JSON.stringify(processRecord);
@@ -121,7 +124,16 @@ async function run(platform, command, mode = 'success', { wrapper = false } = {}
       events.push({ kind: 'platform-spawn' }); return { status: 0 };
     } },
     './paths.mjs': { CODEX_HOME: fixturePath.join(fixtureRoot, 'codex'), LOG_PATH: fixturePath.join(fixtureRoot, 'log'), PORTS: { router: 4200 }, SOURCE_ROOT: sourceRoot, STATE_DIR: stateDir, TARGET: 'codex', TARGET_DISPLAY_NAME: 'Codex Router', SERVICE_LABEL: 'io.github.codex-router', LAUNCH_AGENT_PATH: fixturePath.join(fixtureRoot, 'router.plist'), SERVICE_PROCESS_STATE_PATH: fixturePath.join(stateDir, 'service-process.json') },
-    './file-security.mjs': { ensureCheckoutReadable: () => {}, protectPrivateFile: () => {}, writePrivateJson: (file, value) => { if (String(file).endsWith('startup-attempts.json')) record = value; } },
+    './file-security.mjs': {
+      ensureCheckoutReadable: () => {}, protectPrivateFile: () => {},
+      writePrivateFile: (file, bytes) => {
+        assert.equal(events.at(-1)?.kind, 'write-guard', 'private launcher write follows the service guard');
+        assert.equal(fixturePath.dirname(file), stateDir);
+        fs.writeFileSync(file, bytes);
+        return file;
+      },
+      writePrivateJson: (file, value) => { if (String(file).endsWith('startup-attempts.json')) record = value; },
+    },
     './log-rotation.mjs': { rotateLog: () => {} },
     './provider-api-key-service-environment.mjs': { providerApiKeyServiceEnvironment: noopEnvironment },
     './zai-stream-timeouts.mjs': { serviceZaiCodingStreamEnvironment: noopEnvironment },
@@ -130,7 +142,7 @@ async function run(platform, command, mode = 'success', { wrapper = false } = {}
     './proxy-environment.mjs': { serviceProxyEnvironment: noopEnvironment, environmentProxyOptedIn: () => false },
     './grok-patch-hook-settings.mjs': { serviceGrokPatchHookEnvironment: noopEnvironment },
     './startup-timeout.mjs': { serviceStartupTimeoutEnvironment: noopEnvironment, startupTimeoutMs: (_name, fallback) => fallback },
-    './service-write-guard.mjs': { skipServiceManagerCall: () => false, assertServiceWriteIsolated: () => {} },
+    './service-write-guard.mjs': { skipServiceManagerCall: () => false, assertServiceWriteIsolated: () => { events.push({ kind: 'write-guard' }); } },
     './windows-task-state.mjs': { windowsScheduledTaskState: async () => mode.startsWith('clear-error-deferred')
       ? { launcherAlive: false, instanceCount: 0, lastTaskResult: 69 } : undefined },
     './router-health.mjs': { waitForRouterHealth: () => new Promise(() => {}) },
@@ -210,6 +222,14 @@ for (const mode of ['query-unknown', 'query-unknown-after-stop', 'malformed-prin
 await check('darwin slow stop shares one finite deadline', 'darwin', 'restart', 'slow-still-loaded', r => { assert.ok(r.error); noLaunch(r); assert.ok(r.elapsedMs <= 15_000, `spent ${r.elapsedMs}ms`); });
 await check('linux failed stop prevents second reset and new start', 'linux', 'restart', 'stop-error', r => { assert.ok(r.error); noLaunch(r); assert.equal(r.events.filter(x => x.kind === 'reset' && x.phase === 'after-stop').length, 0); });
 await check('Windows unknown ownership retains process/failure records without launch', 'win32', 'restart', 'ownership-unknown', r => { assert.equal(r.error?.code, 'SERVICE_STOP_UNVERIFIED'); noLaunch(r); assert.ok(r.processRecordPresent); assert.ok(r.recordPresent); assert.equal(r.events.filter(x => x.kind === 'reset' && x.phase === 'after-stop').length, 0); });
+await check('Windows launcher write failure prevents stop, reset and recovery launch', 'win32', 'install', 'launcher-write-error', r => {
+  assert.equal(r.exitCode, 1);
+  assert.match(r.diagnostics.join('\n'), /fixture launcher write failed/);
+  noLaunch(r);
+  assert.ok(r.recordPresent); assert.ok(r.processRecordPresent); assert.equal(r.oldStopped, false);
+  assert.equal(r.events.filter(x => x.kind === 'reset').length, 0);
+  assert.equal(r.events.filter(x => x.kind === 'launcher-write').length, 1);
+});
 await check('Windows surviving registration recovery tolerates optional reset failure', 'win32', 'install', 'register-error+clear-error-after-stop', r => { assert.equal(r.error, undefined); assert.equal(launches(r).length, 1); assert.ok(r.oldStopped); assert.ok(r.diagnostics.some(x => x.includes('Could not reset automatic startup cooldown (EACCES)'))); });
 const report = { sourceRoot: root, sourceSha256: Object.fromEntries(Object.entries(sources).map(([name, text]) => [name, createHash('sha256').update(text).digest('hex')])), cases: results.length, passed: results.filter(x => x.passed).length, failed: results.filter(x => !x.passed).length, results };
 return report;
@@ -220,7 +240,7 @@ if (process.env.CODEX_ROUTER_RESET_TEST_CHILD === '1') {
 } else {
   test('actual service sources preserve stop/reset/launch ordering and failure boundaries', async () => {
     const report = await runChecks();
-    assert.equal(report.cases, 25);
+    assert.equal(report.cases, 26);
     assert.equal(report.failed, 0, JSON.stringify(report.results.filter(result => !result.passed), null, 2));
   });
 }
