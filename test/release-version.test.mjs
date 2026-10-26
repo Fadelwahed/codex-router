@@ -143,9 +143,7 @@ test("releases are tag-driven and validate every asset before publishing", () =>
   );
   assert.match(ci, /Smoke the unified macOS app lifecycle/);
   assert.match(ci, /"\$outer" --supervised/);
-  assert.match(ci, /execFileSync\(process\.argv\[1\], \["--query-lifecycle"\]/);
-  assert.match(ci, /timeout: 10000, killSignal: "SIGKILL"/);
-  assert.match(ci, /delete env\.ELECTRON_RUN_AS_NODE/);
+  assert.match(ci, /node scripts\/query-control-center-lifecycle\.mjs/);
   assert.match(ci, /if ! last_state=\$\(query_lifecycle\); then\s+diagnose_app_launch\s+cat "\$log" >&2 \|\| true\s+return 1/);
   assert.match(ci, /terminate_bundle io\.github\.codex-router\.control-center/);
   assert.match(ci, /terminate_bundle io\.github\.codex-router\.tray/);

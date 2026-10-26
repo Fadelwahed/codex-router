@@ -112,9 +112,17 @@ function run(
 
 function runWithBlockedAtomicWrite(command, codexHome, stateDir) {
   const driver = `
-import { mkdirSync } from "node:fs";
+import fs from "node:fs";
+import { syncBuiltinESMExports } from "node:module";
 process.argv = [process.execPath, ${JSON.stringify(manager)}, ${JSON.stringify(command)}];
-mkdirSync(${JSON.stringify(path.join(codexHome, "config.toml.tmp."))} + process.pid);
+const rename = fs.renameSync;
+fs.renameSync = (temporary, target) => {
+  if (target === ${JSON.stringify(path.join(codexHome, "config.toml"))}) {
+    throw new Error("injected config publication failure");
+  }
+  return rename(temporary, target);
+};
+syncBuiltinESMExports();
 await import(${JSON.stringify(pathToFileURL(manager).href)} + "?blocked-write=" + process.pid);
 `;
   return execFileSync(
@@ -845,10 +853,19 @@ base_url = "https://rollback.invalid/v1"
 
   try {
     run("login-free-enable", codexHome, stateDir, ["deepseek/deepseek-v4-pro"]);
+    // Refresh an owned legacy-port generation so the pending state actually
+    // differs. An already-current state cannot detect an omitted rollback.
+    const state = JSON.parse(readFileSync(providerModePath, "utf8"));
+    assert.equal(state.managedBaseUrl, "http://127.0.0.1:46192/v1");
+    state.managedBaseUrl = "http://127.0.0.1:4102/v1";
+    writeFileSync(providerModePath, `${JSON.stringify(state, null, 2)}\n`);
+    writeFileSync(configPath, readFileSync(configPath, "utf8").replaceAll(
+      "http://127.0.0.1:46192/v1", state.managedBaseUrl,
+    ));
     const beforeConfig = readFileSync(configPath, "utf8");
     const beforeState = readFileSync(providerModePath, "utf8");
 
-    assert.throws(() => runWithBlockedAtomicWrite("enable", codexHome, stateDir));
+    assert.throws(() => runWithBlockedAtomicWrite("enable", codexHome, stateDir), /injected config publication failure/);
     assert.equal(readFileSync(configPath, "utf8"), beforeConfig);
     assert.equal(
       readFileSync(providerModePath, "utf8"),

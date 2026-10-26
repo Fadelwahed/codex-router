@@ -1,0 +1,1 @@
+- **Model selection settings use exclusive private-file writes.** Default-model history, picker visibility/order and local-model selections retain their formats and permissions while preserving colliding temporary files, cleaning up failed writes and avoiding duplicate Windows ACL operations.

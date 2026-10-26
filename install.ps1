@@ -343,7 +343,13 @@ try {
   }
 
   $Python = Join-Path $ScriptDirectory ".venv\Scripts\python.exe"
-  if ((Get-InstallStep "python-deps") -eq "skip") {
+  $CompatibilityRequired = (& node src/compatibility-layer-state.mjs required | Select-Object -Last 1)
+  if ($LASTEXITCODE -ne 0 -or $CompatibilityRequired -notin @("required", "unused")) {
+    throw "Could not read compatibility policy."
+  }
+  if ($CompatibilityRequired -eq "unused") {
+    Write-Host "Compatibility layer disabled; skipping Python dependencies and probes (including forced repair)."
+  } elseif ((Get-InstallStep "python-deps") -eq "skip") {
     Write-Host "LiteLLM already matches the pinned versions; skipping the Python install."
   } elseif (Get-Command "uv" -ErrorAction SilentlyContinue) {
     $VenvHomeOk = (& node src/install-plan.mjs venv-home-ok 2>$null | Select-Object -Last 1) -eq "ok"

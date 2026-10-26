@@ -428,6 +428,7 @@ async function emitProbe() {
               subagents: subagentSettings,
               picker: modelPickerSnapshot(),
               toolResultAging: toolResultAgingSnapshot(),
+              compatibilityLayer: (await import("./compatibility-layer-state.mjs")).readCompatibilityLayerSettings(),
               localModels: {
                 ...localModelsSnapshot({
                   inventory: localInventory,
@@ -1576,14 +1577,16 @@ async function handleSubagents(action, value, flag, rest = []) {
     const slug = String(value || "").trim();
     if (!slug) throw new Error("Usage: control subagents explain <model-slug> [--json]");
     const [
-      { MODELS },
+      { MODELS, RUNTIME_PROVIDERS },
       { readProviderSelection, canonicalProviderId },
+      { genericProviderConfigured },
       { readHiddenModels },
       { explainSubagentRoute, formatSubagentExplanation },
       { CODEX_AGENTS_DIR },
     ] = await Promise.all([
       import("./model-registry.mjs"),
       import("./provider-selection.mjs"),
+      import("./generic-provider-readiness.mjs"),
       import("./model-picker-state.mjs"),
       import("./subagent-explain.mjs"),
       import("./paths.mjs"),
@@ -1592,7 +1595,9 @@ async function handleSubagents(action, value, flag, rest = []) {
     const explanation = explainSubagentRoute({
       slug,
       models: MODELS,
-      providerEnabled: (providerId) => selected.has(canonicalProviderId(providerId)),
+      providerEnabled: (providerId) => RUNTIME_PROVIDERS.get(providerId)?.generic === true
+        ? genericProviderConfigured(providerId)
+        : selected.has(canonicalProviderId(providerId)),
       hidden: readHiddenModels(),
       reasoningLevels: await modelReasoningLevels(slug),
       agentsDir: CODEX_AGENTS_DIR,
@@ -1885,7 +1890,7 @@ async function handleSubagents(action, value, flag, rest = []) {
 }
 
 const TOOL_RESULT_AGING_USAGE =
-  "Usage: control tool-result-aging status|on|off|native <on|off>|ttl <days|off|default>|" +
+  "Usage: control tool-result-aging status|on|off|native <on|off>|ttl <days|off|default>|read <handle> [--offset N] [--limit N] [--find TEXT]|" +
   "purge [--yes] [--dry-run] [--expired]";
 
 // Emptying the store deletes the only copy of bytes the model already saw, so
@@ -1917,9 +1922,11 @@ async function handleToolResultAgingPurge(flags) {
         "Set one with ./bin/control tool-result-aging ttl <days>, or purge without --expired.",
     );
   }
-  const result = expiredOnly
+  const operation = () => expiredOnly
     ? expireRetainedToolResults({ dryRun: previewOnly, ttlMs })
     : purgeRetainedToolResults({ dryRun: previewOnly });
+  const { withRetainedToolResultsLock } = await import("./tool-result-recovery.mjs");
+  const result = previewOnly ? operation() : await withRetainedToolResultsLock(operation);
   const age =
     result.oldestAgeMs === undefined ? "" : `, oldest ${describeRetentionAge(result.oldestAgeMs)} old`;
   const scope = expiredOnly ? ` older than ${describeRetentionTtl(ttlMs)}` : "";
@@ -1964,6 +1971,11 @@ async function handleToolResultAging(action, nativeAction, flags = []) {
   const desired = action || "status";
   if (desired === "status") {
     process.stdout.write(`${JSON.stringify(toolResultAgingSnapshot())}\n`);
+    return;
+  }
+  if (desired === "read") {
+    const { readToolResultCommand } = await import("./tool-result-read.mjs");
+    process.stdout.write(`${JSON.stringify(readToolResultCommand(flags))}\n`);
     return;
   }
   if (desired === "purge") {
@@ -3687,6 +3699,20 @@ if (args.includes("--probe")) {
   await setRouterDefault(args[1], args[2]);
 } else if (args[0] === "subagents") {
   await handleSubagents(args[1], args[2], args[3], args.slice(2));
+} else if (args[0] === "compatibility-layer") {
+  const { readCompatibilityLayerSettings, setCompatibilityLayerEnabled, COMPATIBILITY_LAYER_PATH } =
+    await import("./compatibility-layer-state.mjs");
+  const action = args[1] || "status";
+  if (!["status", "on", "off"].includes(action) || args.length > 2) {
+    throw new Error("Usage: control compatibility-layer status|on|off");
+  }
+  if (action !== "status") {
+    const { assertStateOwnership } = await import("./state-owner.mjs");
+    assertStateOwnership("change compatibility layer settings");
+  }
+  process.stdout.write(`${JSON.stringify(action === "status"
+    ? { ...readCompatibilityLayerSettings(), path: COMPATIBILITY_LAYER_PATH }
+    : setCompatibilityLayerEnabled(action === "on"))}\n`);
 } else if (args[0] === "tool-result-aging") {
   await handleToolResultAging(args[1], args[2], args.slice(2));
 } else if (args[0] === "local-models") {

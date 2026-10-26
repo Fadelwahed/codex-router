@@ -1,0 +1,1 @@
+- **Start only the services selected routes require.** Reuse the installation execution plan for forwarder, LiteLLM and health gating, so native-only and Responses-only stacks can start with compatibility enabled and an unused gateway absent. Explicit pending Antigravity proof activation still starts its listener and waits for readiness.

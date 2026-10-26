@@ -3,9 +3,13 @@ import { createHash } from "node:crypto";
 import test from "node:test";
 
 import {
-  ageToolResults,
+  ageToolResults as applyAging,
   shapeToolResult,
 } from "../src/tool-result-aging.mjs";
+
+function ageToolResults(input, options) {
+  return applyAging(input, { retain: () => "Read the exact archived result using the local shell.", ...options });
+}
 
 function call(id, name = "exec_command") {
   return { type: "function_call", call_id: id, name, arguments: "{}" };
@@ -14,6 +18,151 @@ function call(id, name = "exec_command") {
 function output(id, value) {
   return { type: "function_call_output", call_id: id, output: value };
 }
+
+test("Cua runtime documentation survives aging and shaping while ordinary results still age", () => {
+  for (const identity of [
+    { namespace: "mcp__cua_repl", name: "js" },
+    { name: "mcp__cua_repl__js" },
+    { name: "mcp__cua_repl.js" },
+  ]) {
+    for (const heading of ["## Computer Use\n## API\n", "# Other Browser APIs\n# API Reference\n"]) {
+      for (const structured of [false, true]) {
+        const doc = heading + "API contract\n".repeat(5000);
+        const value = structured ? [{ type: "input_text", text: doc }, { type: "input_text", text: "initial page" }] : doc;
+        const input = [
+          { ...call("docs"), ...identity }, output("docs", value),
+          { ...call("page"), ...identity }, output("page", "page snapshot\n".repeat(5000)),
+          call("other"), output("other", doc),
+          { type: "message", role: "assistant", content: "Continue." },
+        ];
+        const retained = [];
+        const result = ageToolResults(input, {
+          frontier: 0, minBytes: 16384, denseShaping: true,
+          retain: (_text, info) => { retained.push(info.callId); return "Read archived output."; },
+        });
+        assert.equal(result.input[1], input[1]);
+        assert.deepEqual(retained, ["page", "other"]);
+        assert.equal(result.stats.toolResultsAged, 2);
+      }
+    }
+  }
+});
+
+test("instruction readers are protected across tools and wrappers, ordinary data is not", () => {
+  const examples = [
+    ["exec_command", {cmd:'Get-Content C:/repo/AGENTS.md'}, true],
+    ["exec_command", {cmd:'cat /skills/demo/SKILL.md'}, true],
+    ["read_file", {path:'/repo/CLAUDE.md'}, true],
+    ["read_file", {path:'/repo/GEMINI.md'}, true],
+    ["functions.exec", 'text(await tools.exec_command({cmd:"Get-Content C:/skills/demo/SKILL.md"}));', true],
+    ["skills.read", {resource:'skill://demo/reference'}, true],
+    ["functions.exec", 'await tools.skills.read({resource:"reference"})', true],
+    ["mcp__other__read_documentation", {}, true],
+    ["mcp__cua_repl__js", {code:'await cua.rewriteDocumentation()'}, true],
+    ["read_file", {path:'/repo/data.json'}, false],
+    ["exec_command", {cmd:'rg --files -g SKILL.md'}, false],
+    ["exec_command", {cmd:'cat /repo/SKILL.md.backup'}, false],
+    ["exec_command", {cmd:'echo AGENTS.md'}, false],
+  ];
+  for (const [name, args, protectedRead] of examples) {
+    const input = [
+      {...call('instruction', name), arguments: typeof args === 'string' ? args : JSON.stringify(args)},
+      output('instruction', 'Documentation and ordinary text\n'.repeat(3000)),
+      {type:'message', role:'assistant', content:'Continue'},
+    ];
+    for (const denseShaping of [false, true]) {
+      const result = ageToolResults(input, {frontier:0, minBytes:16384, denseShaping});
+      assert.equal(result.input[1] === input[1], protectedRead, JSON.stringify([name,args,denseShaping]));
+    }
+  }
+});
+
+for (const [label, name, args, protectedRead] of [
+  ["instruction search", "exec_command", { cmd: 'rg -n "permission" C:/repo/AGENTS.md' }, true],
+  ["quoted instruction target", "exec_command", { cmd: 'rg -n "permission" "C:/repo space/AGENTS.md"' }, true],
+  ["explicit search pattern", "exec_command", { cmd: 'rg -e permission C:/repo/AGENTS.md' }, true],
+  ["instruction glob content", "exec_command", { cmd: 'rg -g AGENTS.md permission C:/repo' }, true],
+  ["instruction name in pattern", "exec_command", { cmd: 'rg -n AGENTS.md C:/repo/data.txt' }, false],
+  ["pattern with context options", "exec_command", { cmd: 'rg -n -A 5 AGENTS.md data.txt' }, false],
+  ["inline pattern option", "exec_command", { cmd: 'rg --regexp=AGENTS.md data.txt' }, false],
+  ["inline instruction glob", "exec_command", { cmd: 'rg --glob=AGENTS.md permission .' }, true],
+  ["read words in pattern", "exec_command", { cmd: 'rg "Get-Content AGENTS.md" C:/repo/data.txt' }, false],
+  ["file listing", "exec_command", { cmd: 'rg --files -g SKILL.md' }, false],
+  ["listing flag after targets", "exec_command", { cmd: 'rg permission AGENTS.md --files' }, false],
+  ["flag-shaped positional pattern", "exec_command", { cmd: 'rg -- --files AGENTS.md' }, true],
+  ["flag-shaped explicit pattern", "exec_command", { cmd: 'rg -e --files AGENTS.md' }, true],
+  ["matching file names only", "exec_command", { cmd: 'rg -l permission AGENTS.md' }, false],
+  ["echo and README", "exec_command", { cmd: 'echo AGENTS.md README.md' }, false],
+  ["quoted commands are data", "exec_command", { cmd: 'echo "cat AGENTS.md; Get-Content SKILL.md"' }, false],
+  ["mixed real read", "exec_command", { cmd: 'Get-Content data.json; Get-Content AGENTS.md' }, true],
+  ["mixed data and echo", "exec_command", { cmd: 'Get-Content data.json; echo AGENTS.md README.md' }, false],
+  ["backup is ordinary data", "exec_command", { cmd: 'cat SKILL.md.backup' }, false],
+  ["uncertain script", "exec_command", { cmd: 'python -c "load_document(\'AGENTS.md\')"' }, true],
+  ["real path only", "read_file", { path: '/repo/data.json', description: 'AGENTS.md' }, false],
+  ["multiple instruction paths", "mcp__filesystem__read_multiple_files", { paths: ['/repo/data.json', '/repo/SKILL.md'] }, true],
+  ["search query is not a file read", "search", { query: 'Get-Content AGENTS.md README.md' }, false],
+  ["literal wrapped command", "functions.exec", 'text(await tools.exec_command({cmd:"Get-Content C:/repo/AGENTS.md"}));', true],
+  ["wrapped instruction search", "functions.exec", { code: 'text(await tools.exec_command({cmd:"rg -n permission AGENTS.md"}));' }, true],
+  ["wrapped echo", "functions.exec", 'text(await tools.exec_command({cmd:"echo AGENTS.md README.md"}));', false],
+  ["printed wrapped command", "functions.exec", 'text("tools.exec_command({cmd:\"cat AGENTS.md\"})");', false],
+  ["commented wrapped command", "functions.exec", '// tools.exec_command({cmd:"cat AGENTS.md"})\ntext("ordinary data");', false],
+  ["dynamic wrapped command", "functions.exec", 'const p="AGENTS.md"; await tools.exec_command({cmd:p});', true],
+  ["computed wrapper call", "functions.exec", 'await tools["exec_command"]({cmd:"cat AGENTS.md"});', true],
+  ["read inside template expression", "functions.exec", 'text(`${await tools.read_file({path:"AGENTS.md"})}`);', true],
+  ["wrapped file read", "functions.exec", 'text(await tools.read_file({path:"/repo/SKILL.md"}));', true],
+  ["wrapped skills read", "functions.exec", 'text(await tools.skills.read({resource:"reference"}));', true],
+  ["printed skills read", "functions.exec", 'text("tools.skills.read({resource:\"reference\"})");', false],
+  ["runtime documentation method", "mcp__cua_repl__js", { code: 'await cua.rewriteDocumentation()' }, true],
+  ["printed runtime method", "mcp__cua_repl__js", { code: 'nodeRepl.write("cua.rewriteDocumentation()")' }, false],
+  ["malformed command field", "exec_command", { cmd: 42 }, false],
+  ["malformed runtime code field", "mcp__cua_repl__js", { code: 42 }, false],
+]) {
+  test(`instruction classification: ${label}`, () => {
+    for (const denseShaping of [false, true]) {
+      for (const structured of [false, true]) {
+        const text = 'Instruction and ordinary data\n'.repeat(3000);
+        const value = structured ? [{ type: 'input_text', text }] : text;
+        const input = [
+          { ...call('read', name), arguments: typeof args === 'string' ? args : JSON.stringify(args) },
+          output('read', value),
+          { type: 'message', role: 'assistant', content: 'Continue.' },
+        ];
+        let retained = 0;
+        const result = ageToolResults(input, {
+          frontier: 0, minBytes: 16384, denseShaping,
+          retain: () => { retained += 1; return 'Read archived output.'; },
+        });
+        assert.equal(result.input[1] === input[1], protectedRead);
+        assert.equal(retained, protectedRead ? 0 : 1);
+        assert.equal(result.input[0], input[0]);
+        assert.equal(result.input[1].call_id, 'read');
+        assert.equal(result.input[2], input[2]);
+      }
+    }
+  });
+}
+
+test("instruction protection accepts normalized function and custom-call payloads", () => {
+  const calls = [
+    { type: 'function_call', namespace: 'functions', name: 'exec', arguments: { code: 'await tools.read_file({path:"AGENTS.md"})' } },
+    { type: 'custom_tool_call', name: 'functions.exec', input: 'await tools.exec_command({cmd:"rg -n permission AGENTS.md"})' },
+    { type: 'custom_tool_call', name: 'exec_command', input: { cmd: 'Get-Content AGENTS.md' } },
+  ];
+  for (const invocation of calls) {
+    for (const denseShaping of [false, true]) {
+      const input = [
+        { ...invocation, call_id: 'instruction' },
+        { type: invocation.type === 'custom_tool_call' ? 'custom_tool_call_output' : 'function_call_output',
+          call_id: 'instruction', output: [{ type: 'input_text', text: 'Important instructions\n'.repeat(3000) }] },
+        { type: 'message', role: 'assistant', content: 'Continue.' },
+      ];
+      let retained = 0;
+      const result = ageToolResults(input, { frontier: 0, denseShaping, retain: () => { retained += 1; return 'Read archive.'; } });
+      assert.equal(result.input, input);
+      assert.equal(retained, 0);
+    }
+  }
+});
 
 test("ages a large consumed result while preserving its call pairing and recovery evidence", () => {
   const value = `HEAD\n${"middle\n".repeat(8_000)}TAIL`;
@@ -32,7 +181,7 @@ test("ages a large consumed result while preserving its call pairing and recover
   assert.equal(result.stats.toolResultsAged, 1);
   assert.ok(result.stats.toolResultBytesSaved > 40_000);
   assert.equal(result.input[1].call_id, "old");
-  assert.match(result.input[1].output, /Repeat the preceding exec_command call/);
+  assert.match(result.input[1].output, /Read the exact archived result/);
   assert.match(result.input[1].output, /HEAD/);
   assert.match(result.input[1].output, /TAIL/);
   assert.match(
@@ -135,7 +284,7 @@ test("dense compaction shapes a noisy newest result with a recoverable RTK recei
   assert.match(compacted.input[1].output, /RTK-style compaction/u);
   assert.match(compacted.input[1].output, /same line repeated 999 more times/u);
   assert.match(compacted.input[1].output, /ERROR final link failed/u);
-  assert.match(compacted.input[1].output, /Repeat the preceding exec_command call/u);
+  assert.match(compacted.input[1].output, /Read the exact archived result/u);
   assert.match(
     compacted.input[1].output,
     new RegExp(createHash("sha256").update(value).digest("hex")),
@@ -189,7 +338,9 @@ test("does not split surrogate pairs at either preview boundary", () => {
   ];
   const result = ageToolResults(input, { frontier: 0 });
   assert.doesNotMatch(result.input[1].output, /�/);
-  assert.equal((result.input[1].output.match(/😀/gu) || []).length, 2);
+  assert.equal(result.stats.toolResultsAged, 1);
+  assert.equal((result.input[1].output.match(/😀/gu) || []).length, 0,
+    "a pair straddling a preview boundary is omitted whole");
 });
 
 // The failure this instrumentation exists for: a session that spends its whole
@@ -255,4 +406,10 @@ test("a pass that ages a result leaves the reasoning and assistant turns around 
     result.input.filter((item) => item.type === "reasoning"),
     [reasoning],
   );
+});
+
+test("missing or failed retention never drops original output", () => {
+  const input = [call("a"), output("a", "x".repeat(40000)), { type: "reasoning" }];
+  assert.equal(applyAging(input, {frontier: 0}).input, input);
+  assert.equal(applyAging(input, {frontier: 0, retain() { throw new Error("disk full"); }}).input, input);
 });

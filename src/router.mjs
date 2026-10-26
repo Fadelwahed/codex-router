@@ -1,4 +1,5 @@
 import { AGENT_PAYLOAD_RELAY_TOOL, agentRelayHeaders, agentRelayError, parseAgentRelayResponse } from "./agent-payload-relay.mjs";
+import { compatibilityLayerError } from "./compatibility-layer-state.mjs";
 import { rejectGenerationRedirect } from "./generation-redirect.mjs";
 import { resolveGenerationOutcome } from "./response-outcome.mjs";
 import { createGrokRequestTiming, setGrokTimingRequestId } from "./grok-request-timing.mjs";
@@ -73,6 +74,8 @@ import {
 import { moonshotSchemaRoute } from "./moonshot-schema-routes.mjs";
 import { reasoningTagStripperTransform } from "./reasoning-tag-stripper.mjs";
 import { reasoningTagOptionsForRoute } from "./reasoning-tag-policy.mjs";
+import { routeExecution } from "./route-execution-plan.mjs";
+import { runtimeDependencyRequirements } from "./runtime-dependency-requirements.mjs";
 import {
   messageEnvelopeCompatTransform,
 } from "./zai-responses-compat.mjs";
@@ -107,6 +110,8 @@ import {
 } from "./paths.mjs";
 import {
   MODEL_BY_SLUG,
+  COMPATIBILITY_DISABLED_MODELS,
+  COMPATIBILITY_LAYER,
   RUNTIME_PROVIDERS,
   USER_MODELS_SKIPPED,
   providerForModel,
@@ -284,7 +289,7 @@ import {
 import { readHiddenModels } from "./model-picker-state.mjs";
 import { readVisionBridgeSettings } from "./vision-bridge-state.mjs";
 import { installedNativeVisionEngines } from "./vision-engines.mjs";
-import { ageToolResults } from "./tool-result-aging.mjs";
+import { ageToolResultsWithRecovery, toolResultRecoveryScope, toolResultReadbackTools } from "./tool-result-recovery.mjs";
 import { MAX_IMAGE_HISTORY_BYTES, readResponsesRequest } from "./responses-request-body.mjs";
 import {
   IMAGE_REJECTION_MAX_RETRIES,
@@ -295,6 +300,7 @@ import {
 import {
   nativeToolResultAgingEnabled,
   toolResultAgingEnabled,
+  toolResultAgingOptions,
 } from "./tool-result-aging-state.mjs";
 import { VERSION } from "./version.mjs";
 import {
@@ -1123,11 +1129,10 @@ async function nativeResponsesWebSocketFetch(url, init, { fallbackFetch, onSent,
 }
 
 function routedResponsesTarget(route) {
-  // WebSocket-transport providers terminate at the api-forwarder directly,
-  // exactly like DeepSeek Responses: LiteLLM has no WebSocket leg, and the
-  // forwarder owns both the credential boundary and the pooled upstream
-  // connections. Their litellm.yaml entries stay but go unused.
-  if (usesDeepSeekResponses(route) || usesProviderResponsesWebSocket(route)) {
+  // Retain the credential-owning forwarder's canonical preparation and frame
+  // validation. Responses-native models do not need an extra translator when
+  // other selected models still require the compatibility gateway.
+  if (routeExecution(route, { providerForModel }).transport === "direct-responses") {
     return `${API_BASE}/responses`;
   }
   return `${GATEWAY_BASE}/responses`;
@@ -1660,29 +1665,26 @@ async function probeService(url) {
 }
 
 async function healthPayload() {
-  const enabled = new Set(readProviderSelection());
-  const apiEnabled = [...RUNTIME_PROVIDERS.values()].some(
-    (provider) => provider.kind === "openai-compatible" && (
-      provider.generic === true || enabled.has(provider.id)
-    ),
-  );
-  const [oauth, api, grokOauth, gateway] = await Promise.all([
-    enabled.has("kimi-oauth")
+  const required = new Set(runtimeDependencyRequirements({ includePendingActivation: false }).services);
+  const [oauth, api, grokOauth, gateway, antigravityOauth, devinCli] = await Promise.all([
+    required.has("kimi")
       ? serviceHealth(OAUTH_HEALTH)
       : { reachable: true, enabled: false },
-    apiEnabled ? serviceHealth(API_HEALTH) : { reachable: true, enabled: false },
-    // The Grok OAuth forwarder is started unconditionally but is only a real
-    // dependency for an operator who selected the provider, so it is gated the
-    // way the Kimi OAuth forwarder is: an unselected provider reports standby
-    // rather than being probed on a port nobody routes through.
-    enabled.has("grok-oauth")
+    required.has("api") ? serviceHealth(API_HEALTH) : { reachable: true, enabled: false },
+    required.has("grok")
       ? serviceHealth(GROK_OAUTH_HEALTH)
       : { reachable: true, enabled: false },
-    serviceHealth(GATEWAY_HEALTH),
+    required.has("gateway") ? serviceHealth(GATEWAY_HEALTH) : { reachable: true, enabled: false },
+    required.has("antigravity")
+      ? serviceHealth(loopback(PORTS.antigravityOauth, "/health"))
+      : { reachable: true, enabled: false },
+    required.has("devin")
+      ? serviceHealth(loopback(PORTS.devinCli, "/health"))
+      : { reachable: true, enabled: false },
   ]);
   // Naming the unreachable dependency is the difference between "the router is
   // broken" and "the gateway is restarting". It costs nothing to carry: these
-  // are four fixed local service names, so it is safe on the unauthenticated
+  // are fixed local service names, so it is safe on the unauthenticated
   // leaf too, which is the only one `waitForRouterHealth` and therefore doctor
   // can read.
   const degraded = [
@@ -1690,6 +1692,8 @@ async function healthPayload() {
     ["api", api],
     ["grokOauth", grokOauth],
     ["gateway", gateway],
+    ["antigravityOauth", antigravityOauth],
+    ["devinCli", devinCli],
   ]
     .filter(([, service]) => !service.reachable)
     .map(([name]) => name);
@@ -1701,10 +1705,13 @@ async function healthPayload() {
     degraded,
     activity: activityPayload(),
     resources: resourceLimitsPayload(),
+    compatibilityLayer: { enabled: COMPATIBILITY_LAYER.enabled, invalid: COMPATIBILITY_LAYER.invalid === true },
     oauth,
     api,
     grokOauth,
     gateway,
+    antigravityOauth,
+    devinCli,
   };
 }
 
@@ -3151,13 +3158,13 @@ async function summarize(request, payload, route, signal, { allowFailover = true
   // the same function as a routed turn. The per-image token charge is the
   // conversation's route; a failover hop reuses this input, and the byte budget
   // that stops a 413 does not depend on the route.
-  const reduce = (imageLimits) => {
-    const reduced = prepareProviderInput(normalized, route, {
+  const reduce = async (imageLimits) => {
+    const reduced = await prepareProviderInput(normalized, route, {
+      recoveryTools: toolResultReadbackTools(payload),
+      recoveryScope: toolResultRecoveryScope(threadIdFromHeaders(request.headers), payload),
       agingEnabled,
-      // The client has already decided this conversation needs compaction.
-      // Dense RTK-style shaping gives its summarizer more distinct evidence
-      // without changing ordinary turns, and every shaped result keeps the
-      // exact rerun path.
+      // A tool-less summarizer cannot follow archive receipts. The shared
+      // reduction gate therefore keeps its exact text, even with aging on.
       denseShaping: agingEnabled,
       imageLimits,
     });
@@ -3168,7 +3175,7 @@ async function summarize(request, payload, route, signal, { allowFailover = true
       stats: { ...reduced.toolResultAging, ...reduced.imageBudget },
     };
   };
-  let aged = reduce();
+  let aged = await reduce();
   let imageRetries = 0;
 
   // The models this compaction may be moved to, in order, starting with the one
@@ -3307,7 +3314,7 @@ async function summarize(request, payload, route, signal, { allowFailover = true
       : undefined;
     if (imageLimits && !signal?.aborted) {
       imageRetries += 1;
-      aged = reduce(imageLimits);
+      aged = await reduce(imageLimits);
       logImageRejectionRetry(attemptRoute, "compaction", imageRetries, aged.stats);
       index -= 1;
       continue;
@@ -3534,7 +3541,7 @@ async function handleRoutedCompaction(
 }
 
 async function handleModels(response) {
-  const models = catalogModels();
+  const models = catalogModels().filter((model) => !COMPATIBILITY_DISABLED_MODELS.has(model.slug || model.id));
   const data = models.map((model) => ({
     id: model.slug,
     object: "model",
@@ -4100,7 +4107,9 @@ async function prepareRoutedRequest({
   agingEnabled,
   imageLimits,
 }) {
-  const prepared = prepareProviderInput(normalizedInput, route, {
+  const prepared = await prepareProviderInput(normalizedInput, route, {
+    recoveryTools: toolResultReadbackTools(payload),
+    recoveryScope: toolResultRecoveryScope(threadIdFromHeaders(request.headers), payload),
     agingEnabled,
     imageLimits,
   });
@@ -4131,14 +4140,17 @@ async function prepareRoutedRequest({
 // tokens a screenshot is trimmed sooner than a native route that pays 1024.
 // `imageLimits` tightens the budget for a resend after a provider refused the
 // image content anyway.
-function prepareProviderInput(
+async function prepareProviderInput(
   normalizedInput,
   route,
-  { agingEnabled, denseShaping = false, imageLimits } = {},
+  { agingEnabled, denseShaping = false, imageLimits, recoveryTools, recoveryScope } = {},
 ) {
-  const aged = ageToolResults(normalizedInput, {
+  const aged = await ageToolResultsWithRecovery(normalizedInput, {
+    tools: recoveryTools,
+    scope: recoveryScope,
     enabled: agingEnabled,
     denseShaping,
+    ...toolResultAgingOptions(route?.slug),
   });
   const bounded = boundImagePayload(aged.input, {
     ...imageLimits,
@@ -4512,6 +4524,11 @@ async function handleResponses(request, response, requestUrl) {
     }
     controller.signal.throwIfAborted();
     requestedModel = typeof payload.model === "string" ? payload.model : "";
+    if (COMPATIBILITY_DISABLED_MODELS.has(requestedModel) ||
+        COMPATIBILITY_DISABLED_MODELS.has(readNativeAliases()[requestedModel])) {
+      writeJson(response, 409, compatibilityLayerError(requestedModel));
+      return;
+    }
     markResponsesStream(response, { model: requestedModel });
     let registeredRoute =
       MODEL_BY_SLUG.get(requestedModel) ??
@@ -4544,7 +4561,12 @@ async function handleResponses(request, response, requestUrl) {
     // provider is hidden leaves the turn native rather than trading a quota
     // failure for a routing error.
     if (!registeredRoute && requestedModel) {
-      const redirect = MODEL_BY_SLUG.get(readNativeRedirect());
+      const redirectSlug = readNativeRedirect();
+      if (COMPATIBILITY_DISABLED_MODELS.has(redirectSlug)) {
+        writeJson(response, 409, compatibilityLayerError(redirectSlug));
+        return;
+      }
+      const redirect = MODEL_BY_SLUG.get(redirectSlug);
       if (redirect && routeProviderEnabled(redirect.provider)) {
         registeredRoute = redirect;
       }
@@ -4556,7 +4578,12 @@ async function handleResponses(request, response, requestUrl) {
     // Codex asks for a review per command, and without this every one of them
     // pays a full round trip to learn the same thing again (#787).
     if (!registeredRoute && isAutoReviewModel(requestedModel) && autoReviewFallbackEngaged()) {
-      const reviewer = MODEL_BY_SLUG.get(readAutoReviewFallback().model);
+      const reviewerSlug = readAutoReviewFallback().model;
+      if (COMPATIBILITY_DISABLED_MODELS.has(reviewerSlug)) {
+        writeJson(response, 409, compatibilityLayerError(reviewerSlug));
+        return;
+      }
+      const reviewer = MODEL_BY_SLUG.get(reviewerSlug);
       if (reviewer && routeProviderEnabled(reviewer.provider)) {
         registeredRoute = reviewer;
         autoReviewFallbackUsed = true;
@@ -4912,7 +4939,9 @@ async function handleResponses(request, response, requestUrl) {
         // exempt: compactV1 keeps its chaining, and a summary should read the
         // true content rather than a receipt.
         if (!compactV1 && !compactV2) {
-          const aged = ageToolResults(native.input, {
+          const aged = await ageToolResultsWithRecovery(native.input, {
+            tools: toolResultReadbackTools(payload),
+            scope: toolResultRecoveryScope(threadIdFromHeaders(request.headers), payload),
             enabled: nativeToolResultAgingEnabled(),
           });
           native.input = aged.input;
@@ -5900,6 +5929,7 @@ async function handleResponses(request, response, requestUrl) {
       writeStreamErrorEvent(response, {
         code: INVALID_FUNCTION_CALL_ARGUMENTS_CODE,
         message: error.message,
+        localRejection: true,
       });
       if (!response.writableEnded && !response.destroyed) response.end();
       recordTurnUsage({
@@ -6163,6 +6193,10 @@ async function handleNativeRequest(request, response, requestUrl, defaultModel) 
       body = await decodeBody(encoded, request.headers["content-encoding"]);
       payload = await parseBodyAsync(body);
       requestedModel = typeof payload.model === "string" ? payload.model : defaultModel;
+      if (COMPATIBILITY_DISABLED_MODELS.has(requestedModel)) {
+        writeJson(response, 409, compatibilityLayerError(requestedModel));
+        return;
+      }
       const binding = searchSidecarBindingForModel(requestedModel);
       if (binding) {
         servingProvider = `search:${binding.providerId}`;
@@ -6415,6 +6449,12 @@ async function handleEmbeddings(request, response, requestUrl) {
     const payload = await parseBodyAsync(body);
     controller.signal.throwIfAborted();
     requestedModel = typeof payload.model === "string" ? payload.model : "";
+    if (COMPATIBILITY_DISABLED_MODELS.has(requestedModel) ||
+        COMPATIBILITY_DISABLED_MODELS.has(readNativeAliases()[requestedModel])) {
+      status = 409;
+      writeJson(response, status, compatibilityLayerError(requestedModel));
+      return;
+    }
     route = MODEL_BY_SLUG.get(requestedModel);
     if (!route) {
       status = 400;
@@ -6547,6 +6587,12 @@ async function handleDecisions(request, response, requestUrl) {
     const payload = await parseBodyAsync(body);
     controller.signal.throwIfAborted();
     requestedModel = typeof payload.model === "string" ? payload.model : "";
+    if (COMPATIBILITY_DISABLED_MODELS.has(requestedModel) ||
+        COMPATIBILITY_DISABLED_MODELS.has(readNativeAliases()[requestedModel])) {
+      status = 409;
+      writeJson(response, status, compatibilityLayerError(requestedModel));
+      return;
+    }
     route = MODEL_BY_SLUG.get(requestedModel);
     if (!route) {
       status = 400;
@@ -6661,6 +6707,7 @@ async function handleRequest(request, response) {
       service: health.service,
       version: health.version,
       degraded: health.degraded,
+      compatibilityLayer: health.compatibilityLayer,
       activity: health.activity,
     });
     return;
@@ -6812,14 +6859,17 @@ const server = http.createServer((request, response) => {
       });
     } else {
       // The body is already streaming, so there is no status left to change.
-      // Destroying here reset the socket and cost the chunked terminator,
-      // which the client reported only as a decode failure. The event code
-      // stays `local_router_stream_failed`: a diagnosed cause is extra detail
-      // about the same failure, not a different one for a client to branch on.
+      // Preserve local safety rejections as terminal failures, rather than
+      // treating them as transport failures eligible for automatic replay.
+      // Ordinary transport failures retain their retryable classification.
+      const localRejection = error?.code === "ERR_NAMESPACE_RELAY_COMMITTED_STREAM";
       endStreamedResponse(response, {
-        message: transport
-          ? `The local router lost the upstream response stream: ${transport.cause}.${transport.hint}`
-          : undefined,
+        ...(localRejection ? { code: error.code, localRejection: true } : {}),
+        message: localRejection
+          ? error.message
+          : transport
+            ? `The local router lost the upstream response stream: ${transport.cause}.${transport.hint}`
+            : undefined,
       });
     }
   });

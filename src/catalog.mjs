@@ -1,16 +1,13 @@
 import { spawnSync } from "node:child_process";
 import {
   existsSync,
-  mkdirSync,
   readFileSync,
-  renameSync,
   unlinkSync,
-  writeFileSync,
 } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
-import { protectPrivateFile } from "./file-security.mjs";
+import { writePrivateFile } from "./file-security.mjs";
 import { isManagedCodexBaseUrl } from "./caller-auth.mjs";
 import { applyInstructionOverlay } from "./instruction-overlays.mjs";
 import {
@@ -209,15 +206,7 @@ export function nativeCatalogCanRefreshInPlace() {
 }
 
 function atomicContents(target, contents) {
-  mkdirSync(path.dirname(target), { recursive: true, mode: 0o700 });
-  const temporary = `${target}.tmp.${process.pid}`;
-  writeFileSync(temporary, contents, {
-    encoding: "utf8",
-    mode: 0o600,
-  });
-  protectPrivateFile(temporary);
-  renameSync(temporary, target);
-  protectPrivateFile(target);
+  writePrivateFile(target, contents);
 }
 
 function atomicJson(target, value) {
@@ -1111,12 +1100,21 @@ function publishedPickerPriorities(nativeModels, orderedRoutedModels, { routedFi
 // merged-catalog path filters through `selectedConfiguredListedModels()`; this
 // function keeps the same rule for the login-free path instead of trusting its
 // caller to pre-filter, so no future call site can publish dead slots again.
-export function buildLoginFreeCatalog(native, routedModelsList, { pickerOrder = "native-first" } = {}) {
+export function buildLoginFreeCatalog(native, routedModelsList, {
+  pickerOrder = "native-first",
+  hiddenModels = new Set(),
+  visibleModels,
+} = {}) {
   const configured = new Set(configuredProviderIds());
   const usableModels = routedModelsList.filter(
     (model) => !model.provider || configured.has(model.provider),
   );
-  const assignments = buildNativeAliasAssignments(native.models, usableModels);
+  // Apply picker policy before allocating scarce native slots. Hiding an alias
+  // afterwards still leaves a native slug routing to an unselected paid model.
+  const aliasModels = usableModels.filter((model) =>
+    !hiddenModels.has(model.slug) && (!visibleModels || visibleModels.has(model.slug)),
+  );
+  const assignments = buildNativeAliasAssignments(native.models, aliasModels);
   const aliasedSlugs = new Set(assignments.map(({ model }) => model.slug));
   const aliases = Object.fromEntries(
     assignments.map(({ nativeModel, model }) => [nativeModel.slug, model.slug]),
@@ -1269,7 +1267,11 @@ export function publishCatalog({ refreshNative = refresh, output = true } = {}) 
   const catalogModels = applyVisionBridge(routedModels, visionEngine);
   const pickerOrder = readPickerOrder();
   const { models: merged, aliases } = loginFree
-    ? buildLoginFreeCatalog(native, catalogModels, { pickerOrder })
+    ? buildLoginFreeCatalog(native, catalogModels, {
+        pickerOrder,
+        hiddenModels: effectiveHiddenModels,
+        visibleModels: pickerState.hasExplicitVisibility ? visibleModels : undefined,
+      })
     : {
         models: buildMergedCatalog(native, routedCatalog ? catalogModels : [], {
           includeNative: openaiAuthenticated,

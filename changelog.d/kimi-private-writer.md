@@ -1,0 +1,1 @@
+- Preserve Kimi token file synchronization while publishing through the shared private writer, avoiding fixed temporary collisions and cleaning up failed unpublished writes.

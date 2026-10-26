@@ -1,0 +1,1 @@
+- **Generated router secrets use the shared private atomic writer.** Fresh internal, caller and Cursor public keys no longer repeat Windows ACL hardening after publication. Existing keys still receive permission repair on `ensure` and `status`, and failed writes preserve the previous key while cleaning only their own temporary file.

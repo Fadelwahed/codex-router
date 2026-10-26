@@ -101,7 +101,7 @@ jobs:
       - name: Set up Homebrew
         id: set-up-homebrew
         if: steps.changed.outputs.run == 'true'
-        uses: Homebrew/actions/setup-homebrew@eb02c69dbabdb66ff183c614f4ce7ab3c077592c # 2026.10.12.1
+        uses: Homebrew/actions/setup-homebrew@4790763c0a3ba4036f72634dc079c4a7dfcd4878 # 2026.10.19.1
       - name: Cache Homebrew Bundler RubyGems
         id: cache-homebrew-gems
         if: steps.changed.outputs.run == 'true'
@@ -130,7 +130,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - name: Set up Homebrew
-        uses: Homebrew/actions/setup-homebrew@eb02c69dbabdb66ff183c614f4ce7ab3c077592c # 2026.10.12.1
+        uses: Homebrew/actions/setup-homebrew@4790763c0a3ba4036f72634dc079c4a7dfcd4878 # 2026.10.19.1
       - name: Build and test the formula from source
         run: packaging/homebrew/check-core-readiness.sh --install
 
@@ -399,18 +399,14 @@ jobs:
           set -euo pipefail
           app="$RUNNER_TEMP/Codex Router.app"
           outer="$app/Contents/MacOS/ModelRouterTray"
-          embedded="$app/Contents/Resources/Control Center.app/Contents/MacOS/Codex Router"
           log="$RUNNER_TEMP/model-router-macos-smoke.log"
 
           query_lifecycle() {
-            node -e '
-              const { execFileSync } = require("node:child_process");
-              const env = { ...process.env };
-              delete env.ELECTRON_RUN_AS_NODE;
-              process.stdout.write(execFileSync(process.argv[1], ["--query-lifecycle"], {
-                env, encoding: "utf8", timeout: 10000, killSignal: "SIGKILL",
-              }));
-            ' "$embedded"
+            # A GUI query helper registers as this same macOS application. If
+            # it overlaps NSWorkspace.openApplication, LaunchServices can fail
+            # the real window launch. Observe the existing record without
+            # starting another application, using the exact same validator.
+            node scripts/query-control-center-lifecycle.mjs
           }
 
           diagnose_app_launch() {
