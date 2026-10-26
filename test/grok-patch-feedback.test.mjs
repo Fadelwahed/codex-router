@@ -22,10 +22,17 @@ test("feedback requires negotiated capability and opt-in on supported routes", (
   for (const slug of ["grok-oauth/grok-4.6", "grok-oauth/grok-4.7", "grok-api/grok-4.7", "gpt-6.1-sol"]) {
     for (const flag of [undefined, "0", "1"]) for (const cap of [undefined, "structured-patch-v1", "patch-feedback-v2"]) {
       const expected = slug.startsWith("grok-oauth/") && flag === "1" && cap === "patch-feedback-v2";
-      assert.equal(grokPatchFeedbackEnabled({ slug }, { "x-codex-router-patch-hook": cap }, { CODEX_ROUTER_GROK_PATCH_HOOK: flag }), expected);
-      assert.equal(grokPatchFeedbackEnabled({ slug }, {}, { CODEX_ROUTER_GROK_PATCH_HOOK: flag }, cap), expected);
+      assert.equal(grokPatchFeedbackEnabled({ slug }, { "x-codex-router-patch-hook": cap }, { CODEX_ROUTER_GROK_PATCH_FEEDBACK: flag }), expected);
+      assert.equal(grokPatchFeedbackEnabled({ slug }, {}, { CODEX_ROUTER_GROK_PATCH_FEEDBACK: flag }, cap), expected);
     }
   }
+});
+
+test("feedback opt-in cannot activate the v1 serializer or vice versa", async () => {
+  const { grokPatchHookEnabled } = await import("../src/grok-patch-hook-transport.mjs");
+  const route = { slug: "grok-oauth/grok-4.7" };
+  assert.equal(grokPatchHookEnabled(route, {}, { CODEX_ROUTER_GROK_PATCH_FEEDBACK: "1" }, "structured-patch-v1"), false);
+  assert.equal(grokPatchFeedbackEnabled(route, {}, { CODEX_ROUTER_GROK_PATCH_HOOK: "1" }, "patch-feedback-v2"), false);
 });
 
 test("valid patch bypasses the hook and retains native history and permissions", () => {

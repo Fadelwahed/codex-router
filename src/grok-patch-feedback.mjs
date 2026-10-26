@@ -4,7 +4,7 @@ import { isGrokOauthAgenticRoute } from "./grok-oauth-routes.mjs";
 import { GROK_PATCH_HOOK_HEADER } from "./grok-patch-hook-transport.mjs";
 
 export function grokPatchFeedbackEnabled(route, headers, environment = process.env, endpointCapability) {
-  return isGrokOauthAgenticRoute(route) && environment.CODEX_ROUTER_GROK_PATCH_HOOK === "1" &&
+  return isGrokOauthAgenticRoute(route) && environment.CODEX_ROUTER_GROK_PATCH_FEEDBACK === "1" &&
     (headers?.[GROK_PATCH_HOOK_HEADER] === GROK_PATCH_FEEDBACK_CAPABILITY || endpointCapability === GROK_PATCH_FEEDBACK_CAPABILITY);
 }
 

@@ -236,7 +236,7 @@ or quality gain follows from passing these deterministic checks.
 ## Denial-only validation feedback (v2)
 
 The `patch-feedback-v2` capability is separate from the older v1 serializer.
-With `CODEX_ROUTER_GROK_PATCH_HOOK=1`, a supported Grok OAuth route, and either
+With `CODEX_ROUTER_GROK_PATCH_FEEDBACK=1`, a supported Grok OAuth route, and either
 `x-codex-router-patch-hook: patch-feedback-v2` or the explicit
 `/v1/_codex-router/patch-feedback-v2` base, Router compiles valid `operations`
 into an ordinary native patch. The native hook leaves that input unchanged;
@@ -265,7 +265,9 @@ payload, exact-command discovery/trust preflight, and an explicitly loaded
 client capability. For v2 the payload is only the hook entrypoint and
 `src/grok-patch-feedback-contract.mjs`; it has no project dependency graph.
 Do not enable a capability merely because an older v1 hook is installed.
-Existing Desktop children may retain the previous endpoint. No installer
+Existing Desktop children may retain the previous endpoint. Persist only this opt-in in `grok-patch-feedback.json`, exactly
+`{"version":1,"enabled":true}`; it does not enable the v1 serializer for
+already-loaded clients. No installer
 silently trusts the command or activates this protocol by default.
 
 The deterministic full-chain check uses mock xAI, not a live model:
