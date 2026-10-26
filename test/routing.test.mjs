@@ -9947,7 +9947,7 @@ test("tool-less routed compaction and ordinary turns keep newest tool results ex
     assert.equal(gatewayBodies[0].input[1].output, value);
     assert.equal(gatewayBodies[0].instructions, "Base instructions.");
     assert.doesNotMatch(gatewayBodies[0].instructions, /Token maxxing pressure|decision packet|Be terse/u);
-    assert.equal(gatewayBodies[1].input[1].output, value,
+    assert.equal(gatewayBodies[1].input.find(item => item.type === "function_call_output" && item.call_id === "latest")?.output, value,
       "a tool-less summarizer cannot recover omitted text and must see the original");
     assert.deepEqual(gatewayBodies[1].tools, []);
     assert.doesNotMatch(gatewayBodies[1].instructions, /Token maxxing pressure|decision packet|Be terse/u);
