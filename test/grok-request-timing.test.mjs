@@ -170,3 +170,39 @@ test("argument protocol failures remain distinct from transport failures", () =>
   assert.equal(rows[0].attempts[1].outcome, undefined);
   assert.doesNotMatch(JSON.stringify(rows), /private-arguments/);
 });
+
+
+test("forwarder timing retains upstream patch shape on cancellation before item close", () => {
+  const { timing, rows } = fixture();
+  const attempt = timing.attempt(id);
+  attempt.event({ type: "response.output_item.added", item: {
+    id: "PRIVATE_CALL_ID", type: "function_call", name: "apply_patch_structured_v1", arguments: "",
+  } });
+  attempt.event({ type: "response.function_call_arguments.done", item_id: "PRIVATE_CALL_ID",
+    arguments: JSON.stringify({ operations: 'PRIVATE_BROKEN_JSON' }) });
+  timing.finish("connection_closed", 200);
+  assert.equal(rows[0].attempts[0].outcome, "cancelled");
+  assert.deepEqual(rows[0].attempts[0].patchArgumentSnapshots,
+    [{ stage: "arguments_done", shape: "operations_invalid_json" }]);
+  assert.doesNotMatch(JSON.stringify(rows), /PRIVATE/);
+  attempt.event({ type: "response.output_item.done", item: { type: "function_call", name: "apply_patch_structured_v1", arguments: '{}' } });
+  assert.equal(rows[0].attempts[0].patchArgumentSnapshots.length, 1);
+});
+
+test("patch shape diagnostics stay per attempt and are absent on router egress", () => {
+  const event = { type: "response.completed", response: { output: [{ type: "function_call", name: "apply_patch_structured_v1", arguments: '{"operations":[]}' }] } };
+  const { timing, rows } = fixture();
+  for (let i = 0; i < 2; i++) {
+    const attempt = timing.attempt(id);
+    attempt.event(event);
+    attempt.event(event);
+  }
+  timing.finish("response_finished", 200);
+  for (const attempt of rows[0].attempts) {
+    assert.deepEqual(attempt.patchArgumentSnapshots, [{ stage: "terminal", shape: "operations_array" }]);
+  }
+  const router = fixture("router");
+  router.timing.attempt(id).event(event);
+  router.timing.finish("response_finished", 200);
+  assert.equal(router.rows[0].attempts[0].patchArgumentSnapshots, undefined);
+});

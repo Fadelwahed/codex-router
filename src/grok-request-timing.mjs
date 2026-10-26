@@ -1,7 +1,7 @@
 import { knownServiceTier } from "./request-diagnostics.mjs";
 import { randomUUID } from "node:crypto";
 import { knownGenerationOutcome } from "./response-outcome.mjs";
-import { grokToolDiagnostics } from "./grok-tool-diagnostics.mjs";
+import { grokToolDiagnostics, createGrokPatchArgumentObserver } from "./grok-tool-diagnostics.mjs";
 
 export const GROK_TIMING_HEADER = "x-codex-router-request-id";
 const requestIds = new WeakMap();
@@ -128,9 +128,17 @@ export function createGrokRequestTiming({ layer, requestId, now = () => performa
       // Keep a hard diagnostics bound if future callers change that policy.
       if (!finished && row.attempts.length < 8) row.attempts.push(data);
       const attemptMark = marker(data);
+      const observeArguments = layer === "forwarder"
+        ? createGrokPatchArgumentObserver(sample => (data.patchArgumentSnapshots ??= []).push(sample))
+        : () => {};
       return {
         mark: attemptMark,
-        event(event) { if (!finished) observeEvent(data, attemptMark, event); },
+        event(event) {
+          if (!finished && data.terminal === undefined) {
+            observeArguments(event);
+            observeEvent(data, attemptMark, event);
+          }
+        },
         headers(status) {
           if (finished) return;
           attemptMark("headersMs");

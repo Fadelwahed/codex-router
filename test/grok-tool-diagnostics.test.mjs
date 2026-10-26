@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { grokToolDiagnostics } from "../src/grok-tool-diagnostics.mjs";
+import { grokToolDiagnostics, createGrokPatchArgumentObserver } from "../src/grok-tool-diagnostics.mjs";
 import { chatProviderToolSurface } from "../src/chat-tool-surface.mjs";
 
 const poll = { type: "function", name: "write_stdin", parameters: {
@@ -107,4 +107,80 @@ test("structured patch diagnostics retain the declared schema without exposing h
   ]);
   assert.deepEqual(Object.keys(result.known), ["apply_patch_structured_v1"]);
   assert.deepEqual(result.known.apply_patch_structured_v1.declarations[0].parameters, ["operations"]);
+});
+
+
+test("patch snapshots identify malformed encoded operations before adapter conversion without values", () => {
+  const samples = [];
+  const observe = createGrokPatchArgumentObserver(sample => samples.push(sample));
+  const id = "PRIVATE_CALL_ID";
+  const args = JSON.stringify({ operations: '[{"path":"PRIVATE_SOURCE"' });
+  const item = { type: "function_call", id, name: "apply_patch_structured_v1", arguments: args };
+  const before = structuredClone(item);
+  observe({ type: "response.output_item.added", item: { ...item, arguments: "" } });
+  observe({ type: "response.function_call_arguments.delta", item_id: id, delta: "PRIVATE_PARTIAL_JSON" });
+  assert.deepEqual(samples, []);
+  observe({ type: "response.function_call_arguments.done", item_id: id, arguments: args });
+  assert.deepEqual(samples, [{ stage: "arguments_done", shape: "operations_invalid_json" }]);
+  observe({ type: "response.output_item.done", item });
+  observe({ type: "response.completed", response: { output: [item] } });
+  assert.deepEqual(samples, ["arguments_done", "output_item_done", "terminal"].map(stage => ({ stage, shape: "operations_invalid_json" })));
+  assert.doesNotMatch(JSON.stringify(samples), /PRIVATE/);
+  assert.deepEqual(item, before);
+});
+
+test("patch snapshot shape is syntax evidence and does not claim schema acceptance", () => {
+  for (const [args, shape] of [
+    [null, "arguments_not_string"], ["x".repeat(1024 * 1024 + 1), "arguments_too_large"],
+    ["ю".repeat(524289), "arguments_too_large"],
+    ["{", "arguments_invalid_json"], ["null", "arguments_not_object"], ["[]", "arguments_not_object"],
+    ["{}", "operations_missing"], [JSON.stringify({ operations: null }), "operations_wrong_type"],
+    [JSON.stringify({ operations: [] }), "operations_array"],
+    [JSON.stringify({ operations: '[{"PRIVATE_PATH":true}]' }), "operations_encoded_array"],
+    [JSON.stringify({ operations: '{"PRIVATE_PATH":true}' }), "operations_encoded_non_array"],
+  ]) {
+    const samples = [];
+    createGrokPatchArgumentObserver(s => samples.push(s))({ type: "response.completed", response: {
+      output: [{ type: "function_call", name: "apply_patch_structured_v1", arguments: args }],
+    } });
+    assert.deepEqual(samples, [{ stage: "terminal", shape }]);
+    assert.doesNotMatch(JSON.stringify(samples), /PRIVATE/);
+  }
+});
+
+test("patch snapshot diagnostics ignore unrelated identities and bound snapshots", () => {
+  const samples = [];
+  const observe = createGrokPatchArgumentObserver(s => samples.push(s));
+  const item = { type: "function_call", id: "private_id", name: "apply_patch_structured_v1", arguments: '{"operations":[]}' };
+  for (const other of [
+    { ...item, name: "private_apply_patch_structured_v1" },
+    { ...item, name: "apply_patch_history_v1" }, { ...item, namespace: "private_namespace" },
+    { ...item, type: "custom_tool_call" },
+  ]) {
+    observe({ type: "response.output_item.added", item: other });
+    observe({ type: "response.function_call_arguments.done", item_id: other.id, arguments: other.arguments });
+    observe({ type: "response.output_item.done", item: other });
+  }
+  assert.deepEqual(samples, []);
+  for (let i = 0; i < 50; i++) observe({ type: "response.output_item.done", item });
+  assert.equal(samples.length, 33);
+  assert.deepEqual(samples.at(-1), { stage: "limit", shape: "omitted" });
+  assert.doesNotMatch(JSON.stringify(samples), /private/);
+});
+
+
+test("patch snapshot correlation bounds pending IDs and drops reused unrelated IDs", () => {
+  const samples = [];
+  const observe = createGrokPatchArgumentObserver(s => samples.push(s));
+  for (let i = 0; i < 33; i++) observe({ type: "response.output_item.added", item: {
+    type: "function_call", id: `id_${i}`, name: "apply_patch_structured_v1",
+  } });
+  const done = id => ({ type: "response.function_call_arguments.done", item_id: id, arguments: '{"operations":[]}' });
+  observe(done("id_32"));
+  assert.deepEqual(samples, []);
+  observe(done("id_0"));
+  assert.deepEqual(samples, [{ stage: "arguments_done", shape: "operations_array" }]);
+  observe({ type: "response.output_item.added", item: { type: "function_call", id: "id_0", name: "PRIVATE_TOOL" } });
+  observe(done("id_0"));
+  assert.equal(samples.length, 1);
 });

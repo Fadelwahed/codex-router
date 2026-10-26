@@ -108,3 +108,31 @@ Local verification: 611 relevant Grok/namespace tests passed with one skip;
 source. Independent comparison of 426 inputs found no acceptance or output
 changes. Remote CI and installation are separate receipts and must be tied to
 the final commit.
+
+
+## October 26 encoded-operations incident
+
+Three installed-runtime failures around 14:31, 14:33, and 14:38 UTC were
+classified as `operations_invalid_json`. That establishes that the outer JSON
+parsed, `operations` was a string, and parsing that nonempty string as JSON
+failed. The advertised operations-array schema retained the same hash at the
+gateway and upstream boundaries. The first two upstream attempts completed;
+the third was cancelled after the downstream relay refused the call. These
+records do not retain the argument bytes and cannot locate where the malformed
+encoded string originated.
+
+Forwarder timing now records fixed shape labels on original upstream argument
+snapshots, before Responses-to-Chat conversion. It observes argument-done,
+item-done, and terminal snapshots separately, including when the downstream
+client cancels before item close. Only the exact recognized structured-patch
+identity is observed. Each attempt retains at most 32 bounded pending IDs in
+memory, 32 content-free snapshots plus one omission marker, and inspects at
+most 1 MiB per snapshot. Values, paths, field names, parser messages, IDs, and
+argument hashes are not logged. A shape is syntax/type evidence, not schema
+acceptance; repeated snapshot stages are not distinct calls.
+
+A real forwarder process with a local mock provider verifies that valid arrays
+and malformed encoded operations retain their original argument bytes while
+emitting the expected shape labels. This adds evidence for the next organic
+failure; it neither repairs invalid JSON nor claims to resolve the incident.
+No additional live generations are part of this change.

@@ -72,3 +72,55 @@ export function grokToolDiagnostics(tools) {
   for (const tool of Array.isArray(tools) ? tools : []) visit(tool);
   return { count, known };
 }
+
+
+// Observe original provider snapshots before Chat/LiteLLM conversion. Only
+// fixed shape labels leave this function; no call IDs, field names, values,
+// hashes, or JSON parser messages are retained in diagnostics.
+export function createGrokPatchArgumentObserver(record) {
+  const pending = new Set();
+  let samples = 0;
+  const isPatch = item => item?.type === "function_call" &&
+    diagnosticName({ ...item, type: "function" }) === "apply_patch_structured_v1";
+  const emit = (stage, argumentsText) => {
+    if (samples++ >= 32) {
+      if (samples === 33) record({ stage: "limit", shape: "omitted" });
+      return;
+    }
+    record({ stage, shape: patchArgumentShape(argumentsText) });
+  };
+  return event => {
+    if (event?.type === "response.output_item.added") {
+      const id = event.item?.id;
+      pending.delete(id);
+      if (isPatch(event.item) && typeof id === "string" && id.length <= 256 && pending.size < 32) pending.add(id);
+    } else if (event?.type === "response.function_call_arguments.done" && pending.has(event.item_id)) {
+      emit("arguments_done", event.arguments);
+    } else if (event?.type === "response.output_item.done") {
+      if (isPatch(event.item)) emit("output_item_done", event.item.arguments);
+      pending.delete(event.item?.id);
+    } else if (["response.completed", "response.failed", "response.incomplete"].includes(event?.type)) {
+      for (const item of Array.isArray(event.response?.output) ? event.response.output : []) {
+        if (isPatch(item)) emit("terminal", item.arguments);
+      }
+      pending.clear();
+    }
+  };
+}
+
+function patchArgumentShape(text) {
+  if (typeof text !== "string") return "arguments_not_string";
+  // Independently cap diagnostic work before allocating a parsed object.
+  if (text.length > 1024 * 1024 || Buffer.byteLength(text, "utf8") > 1024 * 1024) return "arguments_too_large";
+  let value;
+  try { value = JSON.parse(text); } catch { return "arguments_invalid_json"; }
+  if (!value || typeof value !== "object" || Array.isArray(value)) return "arguments_not_object";
+  if (!Object.hasOwn(value, "operations")) return "operations_missing";
+  if (Array.isArray(value.operations)) return "operations_array";
+  if (typeof value.operations !== "string") return "operations_wrong_type";
+  try {
+    return Array.isArray(JSON.parse(value.operations)) ? "operations_encoded_array" : "operations_encoded_non_array";
+  } catch {
+    return "operations_invalid_json";
+  }
+}

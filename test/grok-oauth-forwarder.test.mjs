@@ -2747,3 +2747,59 @@ test("empty post-tool recovery stops on an upstream HTTP failure without a third
     rmSync(dir, { recursive: true, force: true });
   }
 });
+
+
+test("upstream patch shape diagnostics precede conversion and preserve argument bytes", async () => {
+  let argumentsText;
+  let inbound = 0;
+  const backend = await mockBackend(async (_req, res) => {
+    inbound++;
+    const item = { type: "function_call", id: "PRIVATE_ID", call_id: "PRIVATE_CALL",
+      name: "apply_patch_structured_v1", arguments: argumentsText };
+    res.writeHead(200, { "Content-Type": "text/event-stream" });
+    res.end(sse([
+      { type: "response.output_item.added", item: { ...item, arguments: "" } },
+      { type: "response.function_call_arguments.delta", item_id: item.id, delta: argumentsText },
+      { type: "response.function_call_arguments.done", item_id: item.id, arguments: argumentsText },
+      { type: "response.output_item.done", item },
+      { type: "response.completed", response: { status: "completed", output: [item] } },
+    ]));
+  });
+  const port = await openPort();
+  const dir = mkdtempSync(path.join(os.tmpdir(), "grok-patch-shape-"));
+  const child = startForwarder(port, backend.port, writeSession(dir));
+  const base = `http://127.0.0.1:${port}`;
+  try {
+    await waitHealth(base, child);
+    for (const [args, shape] of [
+      [JSON.stringify({ operations: [{ op: "delete", path: "PRIVATE_PATH" }] }), "operations_array"],
+      [JSON.stringify({ operations: '[{"path":"PRIVATE_PATH"' }), "operations_invalid_json"],
+    ]) {
+      argumentsText = args;
+      const requestId = `01234567-89ab-4cde-8fab-0123456789ab:${inbound + 1}`;
+      const resp = await fetch(`${base}/v1/chat/completions`, {
+        method: "POST", headers: { ...auth, "x-codex-router-request-id": requestId },
+        body: JSON.stringify({ model: "grok-4.7", stream: false,
+          messages: [{ role: "user", content: "PRIVATE_PROMPT" }],
+          tools: [{ type: "function", function: { name: "apply_patch_structured_v1",
+            parameters: { type: "object", properties: { operations: { type: "array" } } } } }],
+        }),
+      });
+      const body = await resp.json();
+      assert.equal(resp.status, 200);
+      assert.equal(body.choices[0].message.tool_calls[0].function.arguments, args);
+      const logs = await waitChildError(child, new RegExp(`\\[grok-timing\\].*${requestId}"`));
+      const row = logs.split("\n").filter(line => line.startsWith("[grok-timing] "))
+        .map(line => JSON.parse(line.slice("[grok-timing] ".length))).find(row => row.requestId === requestId);
+      assert.equal(row.attempts.length, 1);
+      assert.deepEqual(row.attempts[0].patchArgumentSnapshots,
+        ["arguments_done", "output_item_done", "terminal"].map(stage => ({ stage, shape })));
+      assert.doesNotMatch(JSON.stringify(row), /PRIVATE/);
+    }
+    assert.equal(inbound, 2);
+  } finally {
+    await stop(child);
+    await new Promise(resolve => backend.server.close(resolve));
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
