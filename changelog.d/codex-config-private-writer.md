@@ -1,0 +1,1 @@
+- Publish Codex configuration and provider-mode state through the shared private writer, preserving colliding temporary files and avoiding duplicate Windows ACL operations.
