@@ -1,0 +1,1 @@
+- Publish Windows service launchers through the shared private writer, preserving their binary encoding and foreign temporary files while cleaning owned unpublished files on failure.
