@@ -1,0 +1,1 @@
+- Write legacy migration records through the shared private writer, preserving foreign temporary files and cleaning owned unpublished files when publication fails.
