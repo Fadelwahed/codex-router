@@ -1,0 +1,1 @@
+- Avoid redundant Windows ACL hardening during caller-key rotation while preserving custom protection callbacks and rollback generation tracking.

@@ -271,6 +271,7 @@ export function protectPrivateFile(target) {
 export function replacePrivateFile(temporary, target, {
   protect = protectPrivateFile,
   beforeReplace,
+  afterReplace,
   hardenFailure = "throw",
 } = {}) {
   if (path.resolve(path.dirname(temporary)) !== path.resolve(path.dirname(target))) {
@@ -288,6 +289,7 @@ export function replacePrivateFile(temporary, target, {
   }
   beforeReplace?.();
   renameSync(temporary, target);
+  afterReplace?.();
   // Same-directory Windows rename carries the hardened file's DACL. A custom
   // protector may validate a path or do more than set an ACL, so preserve both
   // of its callbacks rather than guessing that its final-path work is redundant.
