@@ -1319,3 +1319,14 @@ test("all service definitions persist only valid startup cooldown settings", () 
     }
   } finally { rmSync(testRoot, { recursive: true, force: true }); }
 });
+
+test("feedback activation leaves the legacy hook disabled and honors separate overrides", () => {
+  const stateDir = mkdtempSync(path.join(os.tmpdir(), "router-feedback-isolated-"));
+  try {
+    writeFileSync(path.join(stateDir, "grok-patch-hook.json"), '{"version":1,"enabled":false}');
+    writeFileSync(path.join(stateDir, "grok-patch-feedback.json"), '{"version":1,"enabled":true}');
+    assert.deepEqual(serviceGrokPatchHookEnvironment({ stateDir, environment: {} }), { CODEX_ROUTER_GROK_PATCH_FEEDBACK: "1" });
+    assert.deepEqual(serviceGrokPatchHookEnvironment({ stateDir, environment: { CODEX_ROUTER_GROK_PATCH_HOOK: "0" } }), { CODEX_ROUTER_GROK_PATCH_HOOK: "0", CODEX_ROUTER_GROK_PATCH_FEEDBACK: "1" });
+    assert.deepEqual(serviceGrokPatchHookEnvironment({ stateDir, environment: { CODEX_ROUTER_GROK_PATCH_FEEDBACK: "0" } }), { CODEX_ROUTER_GROK_PATCH_FEEDBACK: "0" });
+  } finally { rmSync(stateDir, { recursive: true, force: true }); }
+});

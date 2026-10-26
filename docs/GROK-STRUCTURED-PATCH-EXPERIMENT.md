@@ -293,3 +293,6 @@ permission check. Without feedback, the deterministic invalid-argument control
 made six transport attempts and failed the turn; v2 completed the three supplied
 model responses (invalid call, corrected call, final). These counts describe
 scripted responses, not a measured live Grok improvement.
+The same full-chain denial/correction check also passes with the Desktop's
+bundled Codex 0.164.0-alpha.11.1 and with the protected hook Node 24.13.1.
+This does not prove an already-open Desktop child reloaded its configuration.
