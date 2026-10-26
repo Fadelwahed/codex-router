@@ -52,6 +52,9 @@ test("the Grok protocol workflow is gated on the guidance path and never skips L
     "src/grok-apply-patch-guidance.mjs",
     "src/grok-structured-patch.mjs",
     "src/grok-patch-hook*.mjs",
+    "src/grok-patch-feedback*.mjs",
+    "scripts/grok-patch-feedback-hook.mjs",
+    "test/grok-patch-feedback.test.mjs",
     "scripts/grok-patch-hook.mjs",
     "test/grok-patch-hook*.test.mjs",
     "src/namespace-relay.mjs",
@@ -75,6 +78,7 @@ test("the Grok protocol workflow is gated on the guidance path and never skips L
   assert.ok(verifyStep.includes('node scripts/verify-grok-apply-patch-guidance.mjs "$venv_python" --native-hook'));
   assert.ok(verifyStep.includes('MODEL_ROUTER_TEST_LITELLM_PYTHON="$venv_python" node --test test/litellm-stream-cleanup.test.mjs'));
   assert.ok(verifyStep.includes('node scripts/verify-grok-apply-patch-guidance.mjs "$venv_python" --native-hook --native-hook-endpoint --cancel-before-next-provider-read'));
+  assert.ok(verifyStep.includes('node scripts/verify-grok-apply-patch-guidance.mjs "$venv_python" --native-feedback --native-hook-endpoint'));
   assert.doesNotMatch(verifyStep, /continue-on-error:\s*true/);
   assert.doesNotMatch(verifyStep, /skip/i);
 });

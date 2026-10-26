@@ -173,6 +173,14 @@ export function compileStructuredPatchArguments(argumentsText) {
   return serializeStructuredPatch(normalizeGrokEdit(parseArgumentObject(argumentsText)));
 }
 
+// The feedback protocol accepts only the advertised operations interface.
+// Text-edit aliases require additional filesystem checks in the older hook.
+export function compileStructuredOperationsArguments(argumentsText) {
+  const value = parseArgumentObject(argumentsText);
+  object(value, ["operations"]);
+  return serializeStructuredPatch(mergeUpdateOperations(value));
+}
+
 function splitLogicalLines(text) {
   if (typeof text !== "string") reject("string_required");
   if (/\r/u.test(text)) reject("crlf_unrepresentable");

@@ -21,9 +21,16 @@ import { routedModel } from "../src/catalog.mjs";
 import { MODEL_BY_SLUG } from "../src/model-registry.mjs";
 
 import { GROK_PATCH_HOOK_PREFIX, GROK_PATCH_HOOK_HEADER, GROK_PATCH_HOOK_CAPABILITY } from "../src/grok-patch-hook-transport.mjs";
-import { CODEX_PATCH_HOOK_BASE_PATH } from "../src/codex-patch-hook-endpoint.mjs";
+import { GROK_PATCH_FEEDBACK_CODEC } from "../src/grok-patch-feedback.mjs";
+import { GROK_PATCH_FEEDBACK_CAPABILITY } from "../src/grok-patch-feedback-contract.mjs";
+import { CODEX_PATCH_FEEDBACK_BASE_PATH, CODEX_PATCH_HOOK_BASE_PATH } from "../src/codex-patch-hook-endpoint.mjs";
 
-const nativeHook = process.argv.includes("--native-hook");
+const nativeFeedback = process.argv.includes("--native-feedback");
+const probeSlug = nativeFeedback ? "grok-oauth/grok-4.7" : "grok-oauth/grok-4.6";
+const hookScript = nativeFeedback ? "grok-patch-feedback-hook.mjs" : "grok-patch-hook.mjs";
+const nativeApproval = process.argv.find((arg) => arg.startsWith("--native-approval="))?.split("=")[1] || "never";
+if (!["never", "on-request", "untrusted"].includes(nativeApproval)) throw new Error("invalid native approval policy");
+const nativeHook = nativeFeedback || process.argv.includes("--native-hook");
 const hookEndpoint = process.argv.includes("--native-hook-endpoint");
 if (hookEndpoint && !nativeHook) throw new Error("--native-hook-endpoint requires --native-hook");
 const structured = nativeHook || process.argv.includes("--structured");
@@ -69,10 +76,18 @@ const structuredOperations = { operations: [{ op: "add", path: 'café "quotes".t
 let nativeRecoveryProbe;
 let nativeIngressServer;
 let hookRawWireArguments;
-const nativeInvalidArguments = ' { "operations" : [] } \n' + " ".repeat(errorPadding);
-const hookHeaders = nativeHook && !hookEndpoint ? { [GROK_PATCH_HOOK_HEADER]: GROK_PATCH_HOOK_CAPABILITY } : {};
-const clientBaseUrl = (port) => callerBaseUrl(port, CALLER_KEY) + (hookEndpoint ? CODEX_PATCH_HOOK_BASE_PATH.slice(3) : "");
-const wirePatchInput = (args) => nativeHook ? GROK_PATCH_HOOK_PREFIX + args : serializeStructuredPatch(JSON.parse(args));
+const nativeInvalidArguments = (nativeFeedback ? '{"operations":"[{invalid-json"}' : ' { "operations" : [] } \n') + " ".repeat(errorPadding);
+const hookCapability = nativeFeedback ? GROK_PATCH_FEEDBACK_CAPABILITY : GROK_PATCH_HOOK_CAPABILITY;
+const hookBasePath = nativeFeedback ? CODEX_PATCH_FEEDBACK_BASE_PATH : CODEX_PATCH_HOOK_BASE_PATH;
+const hookHeaders = nativeHook && !hookEndpoint ? { [GROK_PATCH_HOOK_HEADER]: hookCapability } : {};
+const clientBaseUrl = (port) => callerBaseUrl(port, CALLER_KEY) + (hookEndpoint ? hookBasePath.slice(3) : "");
+const wirePatchInput = (args) => nativeFeedback ? GROK_PATCH_FEEDBACK_CODEC.decodeArguments(args) : nativeHook ? GROK_PATCH_HOOK_PREFIX + args : serializeStructuredPatch(JSON.parse(args));
+
+const historyArguments = (raw) => {
+  if (!nativeFeedback) return raw;
+  const wire = wirePatchInput(raw);
+  return GROK_PATCH_FEEDBACK_CODEC.encodeHistoryInput(wire) ?? JSON.stringify({ input: wire });
+};
 
 const python = process.argv[2] || process.env.LITELLM_PYTHON;
 if (!python) {
@@ -281,7 +296,7 @@ function larkFence(description) {
 
 function applyPatchRequest({ historyInput, historyId }) {
   return {
-    model: "grok-oauth/grok-4.6",
+    model: probeSlug,
     stream: true,
     input: [
       { type: "message", role: "user", content: [{ type: "input_text", text: "patch notes" }] },
@@ -510,7 +525,7 @@ function mockNativeExec(body, response) {
 // disposable CODEX_HOME is changed; the caller's real trust/config is untouched.
 async function prepareTrustedNativeHook(codexHome, fixtureDir) {
   const shellQuote = (value) => "'" + value.replaceAll("'", "'\\''") + "'";
-  const command = `${shellQuote(process.execPath)} ${shellQuote(path.join(root, "scripts", "grok-patch-hook.mjs"))}`;
+  const command = `${shellQuote(process.execPath)} ${shellQuote(path.join(root, "scripts", hookScript))}`;
   const configPath = path.join(codexHome, "config.toml");
   const hooksPath = path.join(codexHome, "hooks.json");
   const writeHook = (configuredCommand) => writeFileSync(hooksPath, JSON.stringify({ hooks: {
@@ -630,19 +645,19 @@ async function handleMockRequest(request, response) {
       for (const [callId, raw] of probe.expectedHistory) {
         const history = (body.input || []).find((item) => item.type === "function_call" && item.call_id === callId);
         const feedback = outputs.find((item) => item.call_id === callId);
-        assert.equal(history?.arguments, raw, `native history for ${callId} must be restored byte-exactly`);
+        assert.equal(history?.arguments, historyArguments(raw), `native history for ${callId} must be restored byte-exactly`);
         assert.ok(feedback, `native output must keep ${callId}`);
       }
       if (probe.requests === 2) {
         assert.equal(readFileSync(probe.fixturePath, "utf8"), nativeFault === "duplicate-close" ? "old\nmarker\n" : "old\n", "first call must remain unwritten after rejection/disconnect, or execute once after identical duplicate deduplication");
         if (singleNativeControl) {
-          const rejected = outputs.find((item) => item.call_id === "call_native_repair");
-          assert.match(String(rejected?.output), nativeOutsideDir ? /writing outside of the project/i : /apply_patch verification failed/i);
+          const rejected = outputs.find((item) => item.call_id === (nativeFeedback && nativeHookControl ? "call_native_invalid" : "call_native_repair"));
+          assert.match(String(rejected?.output), nativeOutsideDir ? /writing outside of the project|approval|denied/i : /apply_patch verification failed/i);
           if (nativeOutsideDir) assert.equal(readFileSync(probe.targetPath, "utf8"), "old\n", "native permissions must protect the outside canary");
           probe.controlFeedback = true;
         } else if (!nativeFault || nativeFault === "invalid-arguments") {
           const denied = outputs.find((item) => item.call_id === "call_native_invalid");
-          assert.match(String(denied?.output), /Invalid structured apply_patch arguments \(array_bounds\)/);
+          assert.match(String(denied?.output), nativeFeedback ? /Invalid structured apply_patch arguments \(operations_invalid_json\)/ : /Invalid structured apply_patch arguments \(array_bounds\)/);
           probe.invalidArgumentFeedback = true;
           probe.invalidFeedbackBytes = Buffer.byteLength(String(denied.output), "utf8");
         }
@@ -655,7 +670,7 @@ async function handleMockRequest(request, response) {
       response.end(mockFunctionCall("call_invalid_native", '{"operations":[]}', toolName));
       return;
     }
-    if (nativeHook && !singleNativeControl && (!nativeFault || nativeFault === "invalid-arguments") && probe.requests === 1) {
+    if (nativeHook && (!singleNativeControl || (nativeFeedback && nativeHookControl)) && (!nativeFault || nativeFault === "invalid-arguments") && probe.requests === 1) {
       probe.expectedHistory.set("call_native_invalid", nativeInvalidArguments);
       response.end(mockFunctionCall("call_native_invalid", nativeInvalidArguments, toolName));
       return;
@@ -806,9 +821,9 @@ cancellation_boundary_callback = CustomLogger()
     litellmConfig,
     [
       "model_list:",
-      '  - model_name: "grok-oauth-grok-4-6"',
+      `  - model_name: "${probeSlug.replaceAll(/[/.]/g, "-")}"`,
       "    litellm_params:",
-      '      model: "openai/grok-4.6"',
+      `      model: "openai/${probeSlug.split("/")[1]}"`,
       "      api_base: os.environ/GROK_OAUTH_FORWARD_BASE_URL",
       '      api_key: "os.environ/CODEX_ROUTER_INTERNAL_KEY"',
       "      use_chat_completions_api: true",
@@ -980,7 +995,7 @@ cancellation_boundary_callback = CustomLogger()
     const rejected = await postTurn(applyPatchRequest({ historyInput: "CODEC_REJECT_WIRE", historyId: "ctc_reject" }));
     assert.equal(capturedGrok.length, 3, "invalid arguments must not cause a hidden Router request");
     if (nativeHook) {
-      assert.equal(itemsByCallId(rejected).get("call_rejected")?.input, GROK_PATCH_HOOK_PREFIX + '{"operations":[]}');
+      assert.equal(itemsByCallId(rejected).get("call_rejected")?.input, wirePatchInput('{"operations":[]}'));
       assert.ok(rejected.includes('"type":"response.completed"'), "semantic errors reach the native hook as a completed tool call");
     } else {
       assert.ok(rejected.includes('"type":"error"') || rejected.includes('"type":"response.failed"'), "invalid arguments must surface a transport error");
@@ -1058,12 +1073,12 @@ cancellation_boundary_callback = CustomLogger()
     for (const raw of rawArguments) {
       const before = capturedGrok.length;
       hookRawWireArguments = raw;
-      const wire = await postTurn(applyPatchRequest({ historyInput: GROK_PATCH_HOOK_PREFIX + raw, historyId: "ctc_raw_history" }));
+      const wire = await postTurn(applyPatchRequest({ historyInput: wirePatchInput(raw), historyId: "ctc_raw_history" }));
       hookRawWireArguments = undefined;
-      assert.equal(itemsByCallId(wire).get("call_raw_roundtrip")?.input, GROK_PATCH_HOOK_PREFIX + raw, "provider arguments must reach the native hook without parsing or reserialization");
+      assert.equal(itemsByCallId(wire).get("call_raw_roundtrip")?.input, wirePatchInput(raw), "provider arguments must reach the native hook without parsing or reserialization");
       assert.equal(capturedGrok.length, before + 1);
       const history = capturedGrok.at(-1).body.input.find((item) => item.type === "function_call" && item.call_id === "call_history");
-      assert.equal(history.arguments, raw, "hook history must restore the exact original argument string");
+      assert.equal(history.arguments, historyArguments(raw), "hook history must restore the exact original argument string");
       const result = capturedGrok.at(-1).body.input.find((item) => item.type === "function_call_output" && item.call_id === "call_history");
       assert.equal(result.output, "Done!");
     }
@@ -1082,27 +1097,28 @@ cancellation_boundary_callback = CustomLogger()
         const closed = failed.split("\n").filter((line) => line.startsWith("data:") && line.includes('"type":"response.output_item.done"'))
           .map((line) => JSON.parse(line.slice(5))).filter((event) => event.item?.call_id === "call_hook_fault");
         assert.equal(closed.length, 1, "identical upstream duplicate must produce exactly one completed native call");
-        assert.equal(closed[0].item.input, GROK_PATCH_HOOK_PREFIX + JSON.stringify(structuredOperations));
+        assert.equal(closed[0].item.input, wirePatchInput(JSON.stringify(structuredOperations)));
         assert.ok(failed.includes('"type":"response.completed"'));
       }
     }
     const malformedWire = await postTurn(applyPatchRequest({ historyInput: "HOOK_RAW_JSON_WIRE", historyId: "ctc_raw_json" }));
     const malformedWireItem = itemsByCallId(malformedWire).get("call_raw_json");
-    assert.equal(malformedWireItem?.input, GROK_PATCH_HOOK_PREFIX + '{"operations":[not-json');
+    assert.equal(malformedWireItem?.input, wirePatchInput('{"operations":[not-json'));
     // This subprocess proves the repository entrypoint contract in CI, but does
     // not claim native hook trust, permissions or apply_patch execution.
-    for (const [input, expectedDecision] of [[malformedWireItem.input, "deny"], [unicodeItem.input, "allow"]]) {
-      const hook = spawnSync(process.execPath, [path.join(root, "scripts", "grok-patch-hook.mjs")], {
-        input: JSON.stringify({ hook_event_name: "PreToolUse", model: "grok-oauth/grok-4.6", tool_name: "apply_patch", tool_input: { command: input } }),
+    for (const [input, expectedDecision] of [[malformedWireItem.input, "deny"], [unicodeItem.input, nativeFeedback ? undefined : "allow"]]) {
+      const hook = spawnSync(process.execPath, [path.join(root, "scripts", hookScript)], {
+        input: JSON.stringify({ hook_event_name: "PreToolUse", model: probeSlug, tool_name: "apply_patch", tool_input: { command: input } }),
         encoding: "utf8", timeout: 10_000, maxBuffer: 2 * 1024 * 1024,
       });
       assert.equal(hook.status, 0, hook.stderr);
       const decision = JSON.parse(hook.stdout).hookSpecificOutput;
-      assert.equal(decision.permissionDecision, expectedDecision);
-      if (expectedDecision === "deny") assert.equal(decision.updatedInput, undefined);
+      assert.equal(decision?.permissionDecision, expectedDecision);
+      if (expectedDecision === undefined) assert.equal(decision, undefined);
+      else if (expectedDecision === "deny") assert.equal(decision.updatedInput, undefined);
       else assert.equal(decision.updatedInput.command, serializeStructuredPatch(structuredOperations));
     }
-    process.stdout.write("ok exact hook argument history restored through the complete protocol path, including malformed JSON; local hook entrypoint denies malformed input and compiles Unicode operations\n");
+    process.stdout.write("ok exact hook argument history restored through the complete protocol path, including malformed JSON; local hook entrypoint follows the negotiated deny/transform contract\n");
   }
   if (codexBinary) {
     // Offline handler integration only. This separate CLI process is not a
@@ -1150,7 +1166,7 @@ console.log("BARRIER_PASSED:" + name);
     const template = nativeModels.find((model) => model.apply_patch_tool_type === "freeform");
     assert.ok(template, "bundled metadata must provide the native freeform patch tool");
     const catalogPath = path.join(workspace, "probe-catalog.json");
-    const probeModel = routedModel(template, MODEL_BY_SLUG.get("grok-oauth/grok-4.6"));
+    const probeModel = routedModel(template, MODEL_BY_SLUG.get(probeSlug));
     assert.equal(probeModel.supports_parallel_tool_calls, false);
     assert.equal(Object.hasOwn(probeModel, "tool_mode"), false, "native probe must use routed catalog capabilities");
     writeFileSync(catalogPath, JSON.stringify({ models: [probeModel] }));
@@ -1179,7 +1195,7 @@ console.log("BARRIER_PASSED:" + name);
       nativeClientBaseUrl = clientBaseUrl(nativeIngressServer.address().port);
     }
     if (nativeHook) await prepareTrustedNativeHook(codexHome, fixtureDir);
-    const args = ["exec", "--ephemeral", ...(!nativeHook ? ["--ignore-user-config"] : []), "--skip-git-repo-check", "--sandbox", "workspace-write", "--color", "never", "--json", "--model", "grok-oauth/grok-4.6", "--cd", fixtureDir, "--disable", "plugins", "--disable", "remote_plugin"];
+    const args = ["exec", "--ephemeral", ...(!nativeHook ? ["--ignore-user-config"] : []), "--skip-git-repo-check", "--sandbox", "workspace-write", "--color", "never", "--json", "--model", probeSlug, "--cd", fixtureDir, "--disable", "plugins", "--disable", "remote_plugin"];
     for (const setting of [
       'model_provider="local-protocol"',
       `model_catalog_json=${JSON.stringify(catalogPath)}`,
@@ -1188,10 +1204,10 @@ console.log("BARRIER_PASSED:" + name);
       'model_providers.local-protocol.wire_api="responses"',
       'model_providers.local-protocol.requires_openai_auth=false',
       'model_providers.local-protocol.supports_websockets=false',
-      'approval_policy="never"',
+      `approval_policy=${JSON.stringify(nativeApproval)}`,
       'model_reasoning_effort="high"',
     ]) args.push("-c", setting);
-    if (nativeHook && !hookEndpoint) args.push("-c", `model_providers.local-protocol.http_headers={${JSON.stringify(GROK_PATCH_HOOK_HEADER)}=${JSON.stringify(GROK_PATCH_HOOK_CAPABILITY)}}`);
+    if (nativeHook && !hookEndpoint) args.push("-c", `model_providers.local-protocol.http_headers={${JSON.stringify(GROK_PATCH_HOOK_HEADER)}=${JSON.stringify(hookCapability)}}`);
     if (hookEndpoint) args.push("-c", 'model_provider="openai"', "-c", `openai_base_url=${JSON.stringify(nativeClientBaseUrl)}`);
     args.push(nativeExec
       ? "Offline native exec/poll protocol test. Run the supplied temporary process, poll its returned session, preserve its output and exit status, then finish."
@@ -1235,7 +1251,7 @@ console.log("BARRIER_PASSED:" + name);
       assert.equal(nativeRecoveryProbe.successFeedback, false);
       assert.equal(readFileSync(path.join(fixtureDir, "fixture.txt"), "utf8"), "old\n");
       if (nativeOutsideDir) assert.equal(readFileSync(nativeRecoveryProbe.targetPath, "utf8"), "old\n");
-      process.stdout.write(`ok native ${nativeOutsideDir ? "outside-workspace permission" : nativeHookControl + " hook"}: valid structured operation refused without a write, call ID and raw history preserved\n`);
+      process.stdout.write(`ok native ${nativeOutsideDir ? "outside-workspace permission" : nativeHookControl + " hook"}: operation refused without a write, call ID and history preserved\n`);
     } else if (nativeHook && (!nativeFault || nativeFault === "invalid-arguments")) {
       assert.equal(exit, 0, client.testOutput());
       assert.equal(nativeRecoveryProbe.requests, 3);
@@ -1274,4 +1290,4 @@ console.log("BARRIER_PASSED:" + name);
   if (outsideCanaryDirectory) rmSync(outsideCanaryDirectory, { recursive: true, force: true });
 }
 
-process.stdout.write(`ok grok apply_patch ${nativeHook ? "native hook transport" : structured ? "structured codec" : "guidance"} through Router, LiteLLM, Grok forwarder, and mock xAI\n`);
+process.stdout.write(`ok grok apply_patch ${nativeFeedback ? "denial-only feedback" : nativeHook ? "native hook transport" : structured ? "structured codec" : "guidance"} through Router, LiteLLM, Grok forwarder, and mock xAI\n`);

@@ -178,8 +178,9 @@ import {
   GROK_STRUCTURED_PATCH_CODEC,
   grokStructuredPatchEnabled,
 } from "./grok-structured-patch.mjs";
+import { GROK_PATCH_FEEDBACK_CODEC, grokPatchFeedbackEnabled } from "./grok-patch-feedback.mjs";
 import { GROK_PATCH_HOOK_CODEC, grokPatchHookEnabled } from "./grok-patch-hook-transport.mjs";
-import { CODEX_PATCH_HOOK_BASE_PATH, codexPatchHookEndpoint } from "./codex-patch-hook-endpoint.mjs";
+import { codexPatchCapabilityBasePath, codexPatchHookEndpoint } from "./codex-patch-hook-endpoint.mjs";
 import {
   NamespaceToolCallTransform,
   agentMessagesAsUserMessages,
@@ -3855,19 +3856,22 @@ async function buildRoutedRequest({ request, payload, route, agedInput }) {
   let routedToolChoice = payload.tool_choice;
   let installedFacade = new Set();
   let facadeNameCollision = false;
-  const patchHook = grokPatchHookEnabled(route, request.headers, process.env, request.codexRouterPatchHookCapability);
-  const structuredPatch = (patchHook || grokStructuredPatchEnabled(route)) &&
+  const patchFeedback = grokPatchFeedbackEnabled(route, request.headers, process.env, request.codexRouterPatchHookCapability);
+  const patchHook = !patchFeedback && grokPatchHookEnabled(route, request.headers, process.env, request.codexRouterPatchHookCapability);
+  const structuredPatch = (patchFeedback || patchHook || grokStructuredPatchEnabled(route)) &&
     Array.isArray(tools) && tools.some(
       (tool) => tool?.type === "custom" && tool.name === "apply_patch",
     );
-  if (needsStrictOpenCodeToolCompatibility(route) || deepSeekResponses || structuredPatch || patchHook) {
+  if (needsStrictOpenCodeToolCompatibility(route) || deepSeekResponses || structuredPatch || patchHook || patchFeedback) {
     const customTools = bridgeCustomTools(
       tools,
       routedInput,
       flattenedNamespaces,
       routedToolChoice,
       deepSeekResponses ? deepSeekCustomToolNames(tools, routedInput, routedToolChoice) : undefined,
-      patchHook
+      patchFeedback
+        ? { codecs: new Map([["apply_patch", GROK_PATCH_FEEDBACK_CODEC]]) }
+        : patchHook
         ? { codecs: new Map([["apply_patch", GROK_PATCH_HOOK_CODEC]]) }
         : structuredPatch
         ? { codecs: new Map([["apply_patch", GROK_STRUCTURED_PATCH_CODEC]]) }
@@ -4072,10 +4076,10 @@ async function buildRoutedRequest({ request, payload, route, agedInput }) {
     flattenedNamespaces,
     grokStructuredPatch: isGrokOauthAgenticRoute(route)
       ? {
-          enabled: patchHook || grokStructuredPatchEnabled(route),
+          enabled: patchFeedback || patchHook || grokStructuredPatchEnabled(route),
           applied: structuredPatch,
           schemaVersion: GROK_STRUCTURED_PATCH_CODEC.version,
-          ...(patchHook ? { mode: "client_hook" } : {}),
+          ...(patchFeedback ? { mode: "client_feedback" } : patchHook ? { mode: "client_hook" } : {}),
         }
       : undefined,
     // Close finished children the parent left Working, but only when this
@@ -6836,7 +6840,7 @@ server.on("upgrade", (request, socket, head) => {
     // re-enters this caller-authenticated HTTP route, so routing, provider
     // credentials, retries, failover, transforms, usage, and cancellation all
     // continue to have one implementation.
-    responsesUrl: `${callerBaseUrl(LISTEN_PORT, CALLER_KEY)}${hookEndpoint.capability ? CODEX_PATCH_HOOK_BASE_PATH.slice(3) : ""}/responses`,
+    responsesUrl: `${callerBaseUrl(LISTEN_PORT, CALLER_KEY)}${(codexPatchCapabilityBasePath(hookEndpoint.capability) ?? "/v1").slice(3)}/responses`,
   });
 });
 // Without this an 'error' event is unhandled and the process exits silently.
