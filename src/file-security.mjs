@@ -5,6 +5,7 @@ import {
   closeSync,
   existsSync,
   fstatSync,
+  fsyncSync,
   lstatSync,
   mkdirSync,
   openSync,
@@ -294,13 +295,14 @@ export function replacePrivateFile(temporary, target, {
   return target;
 }
 
-function writeAndClosePrivateDescriptor(descriptor, contents, ownership) {
+function writeAndClosePrivateDescriptor(descriptor, contents, sync, ownership) {
   let writeFailed = false;
   let writeError;
   try {
     // Platform file IDs can exceed Number's exact integer range.
     ownership.identity = fstatSync(descriptor, { bigint: true });
     writeFileSync(descriptor, contents, { encoding: "utf8" });
+    if (sync) fsyncSync(descriptor);
   } catch (error) {
     writeFailed = true;
     writeError = error;
@@ -354,6 +356,7 @@ function cleanupOwnedTemporary(temporary, error, identity) {
 // file its extra hardening rather than cost the router its startup.
 export function writePrivateFile(target, contents, {
   directoryMode,
+  fsync = false,
   hardenFailure = "throw",
   protect,
   beforeReplace,
@@ -371,7 +374,7 @@ export function writePrivateFile(target, contents, {
   try {
     const descriptor = openSync(temporary, "wx", 0o600);
     ownership.created = true;
-    writeAndClosePrivateDescriptor(descriptor, contents, ownership);
+    writeAndClosePrivateDescriptor(descriptor, contents, fsync, ownership);
     replacePrivateFile(temporary, target, { hardenFailure, protect, beforeReplace });
   } catch (error) {
     // An exclusive-create collision belongs to somebody else. Only a
@@ -396,7 +399,7 @@ export async function writePrivateFileAsync(target, contents, { directoryMode } 
   try {
     const descriptor = openSync(temporary, "wx", 0o600);
     ownership.created = true;
-    writeAndClosePrivateDescriptor(descriptor, contents, ownership);
+    writeAndClosePrivateDescriptor(descriptor, contents, false, ownership);
     await protectPrivateFilesWin32Async([temporary]);
     renameSync(temporary, target);
   } catch (error) {
