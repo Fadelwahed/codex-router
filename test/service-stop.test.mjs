@@ -66,16 +66,24 @@ async function run(command, mode, { missingTask = false, queryFailure = false, r
     ...shared, ...ownershipModule, CODEX_HOME: "fixture-codex", LOG_PATH: "fixture.log", TARGET: "codex",
     ensureCheckoutReadable: () => { if (earlyFailure === "acl") throw new Error("fixture checkout ACL failed"); },
     protectPrivateFile: () => {},
+    writePrivateFile: (...args) => {
+      assert.equal(calls.at(-1), "guard-launcher-write", "private launcher write follows the service guard");
+      context.writeFileSync(...args);
+      return args[0];
+    },
     providerApiKeyServiceEnvironment: () => ({}), serviceZaiCodingStreamEnvironment: () => ({}),
     responsesWsServiceEnvironment: () => ({}),
     serviceNativeCatalogEnvironment: () => ({}),
     serviceProxyEnvironment: () => ({}), serviceGrokPatchHookEnvironment: () => ({}), serviceStartupTimeoutEnvironment: () => ({}),
     serviceAppConnectorEnvironment: (environment = processObject.env) => serviceAppConnectorEnvironment(environment),
     serviceStartupBackoffEnvironment: () => ({}), resetStartupAttempts: () => true,
-    assertServiceWriteIsolated: () => {}, skipServiceManagerCall: () => false,
+    assertServiceWriteIsolated: () => { calls.push("guard-launcher-write"); }, skipServiceManagerCall: () => false,
     windowsScheduledTaskState: async () => undefined,
     existsSync: () => true, mkdirSync: () => {}, renameSync: () => {},
-    writeFileSync: () => { if (earlyFailure === "launcher") throw new Error("fixture launcher write failed"); },
+    writeFileSync: () => {
+      calls.push("write-launcher");
+      if (earlyFailure === "launcher") throw new Error("fixture launcher write failed");
+    },
     unlinkSync: () => { removed = true; calls.push("remove-launcher"); },
     console: { error: (value) => diagnostics.push(value) },
     Date: class extends Date { static now() { return now; } },
@@ -250,7 +258,7 @@ for (const earlyFailure of ["acl", "launcher"]) {
     assert.equal(result.exitCode, 1);
     assert.equal(result.recordPresent, true);
     assert.equal(result.killed, false);
-    assert.equal(result.budgets.length, 0);
+    assert.equal(result.budgets.length, 0, "launcher preparation failure stops before ownership probes");
     assert.equal(result.calls.some((call) => /\/Run|\/ENABLE|Register-ScheduledTask/.test(call)), false);
     assert.match(result.diagnostics.join("\n"), /fixture .* failed/);
   });
