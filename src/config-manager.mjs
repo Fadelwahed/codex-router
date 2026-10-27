@@ -20,7 +20,7 @@ import {
   isManagedCodexBaseUrl,
   redactCallerUrl,
 } from "./caller-auth.mjs";
-import { CODEX_PATCH_HOOK_BASE_PATH } from "./codex-patch-hook-endpoint.mjs";
+import { CODEX_PATCH_CAPABILITY_PATHS } from "./codex-patch-hook-endpoint.mjs";
 import {
   privateFileIsProtected,
   protectPrivateFile,
@@ -162,9 +162,10 @@ function configuredRouterBaseUrl() {
   // Keep an explicitly activated client capability during repair, catalog
   // refresh, port migration and caller-key rotation. Fresh installs stay /v1.
   const existingBase = rootValue(splitRoot(current).rootLines, "openai_base_url");
-  if (isManagedRouterBaseUrl(existingBase) &&
-      new URL(existingBase).pathname.replace(/\/$/, "").endsWith(CODEX_PATCH_HOOK_BASE_PATH)) {
-    return loopback(PORTS.router, CODEX_PATCH_HOOK_BASE_PATH);
+  if (isManagedRouterBaseUrl(existingBase)) {
+    const pathname = new URL(existingBase).pathname.replace(/\/$/, "");
+    const capabilityPath = CODEX_PATCH_CAPABILITY_PATHS.find((base) => pathname.endsWith(base));
+    if (capabilityPath) return loopback(PORTS.router, capabilityPath);
   }
   return loopback(PORTS.router, "/v1");
 }

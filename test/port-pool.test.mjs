@@ -24,9 +24,21 @@ test("every pool address passes fetch's port policy before dispatch", async () =
   const dispatcher = {
     dispatch(_options, handler) {
       dispatched += 1;
-      handler.onConnect(() => {});
-      handler.onHeaders(204, [], () => {}, "No Content");
-      handler.onComplete([]);
+      // Node 26's built-in fetch uses the current Dispatcher handler API;
+      // older LTS runtimes still pass the legacy callback interface.
+      if (typeof handler.onRequestStart === "function") {
+        const controller = { aborted: false, paused: false, reason: null,
+          abort() { throw new Error("unexpected cancellation in port-policy fixture"); },
+          pause() {}, resume() {},
+        };
+        handler.onRequestStart(controller, null);
+        handler.onResponseStart(controller, 204, {}, "No Content");
+        handler.onResponseEnd(controller, {});
+      } else {
+        handler.onConnect(() => {});
+        handler.onHeaders(204, [], () => {}, "No Content");
+        handler.onComplete([]);
+      }
       return true;
     },
   };
@@ -45,6 +57,7 @@ test("every pool address passes fetch's port policy before dispatch", async () =
       return;
     }
     assert.ok(!seen.has(port), `duplicate pool address ${port}`);
+    assert.ok(port !== 5000 && port !== 7000, "AirPlay system listeners cannot be fixture ports");
     seen.add(port);
     const response = await fetch(`http://127.0.0.1:${port}`, { dispatcher });
     assert.equal(response.status, 204, `fetch rejected pool address ${port}`);

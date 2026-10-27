@@ -1,0 +1,1 @@
+- Record bounded, content-free structured-patch argument shapes at the original Grok response boundary, including before an interrupted tool call closes, so malformed provider output can be distinguished from downstream conversion failures.

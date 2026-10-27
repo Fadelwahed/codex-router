@@ -1,0 +1,1 @@
+- Add an opt-in Codex patch feedback protocol for Grok OAuth: invalid structured arguments return through a denial-only native hook so the agent can correct the call, while valid patches retain ordinary native permissions. Preserve the negotiated protocol across HTTP and WebSocket requests.

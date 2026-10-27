@@ -2,19 +2,24 @@ import { readFileSync } from "node:fs";
 import path from "node:path";
 import { STATE_DIR } from "./paths.mjs";
 
-// Persist only the Router opt-in, never hook commands or trust. Native Codex
-// still owns installation, discovery, validation and authorization of hooks.
+// Separate opt-ins prevent enabling v2 from reactivating the v1 serializer in
+// already-loaded clients. Neither marker installs or trusts a native hook.
 export function serviceGrokPatchHookEnvironment({ environment = process.env, stateDir = STATE_DIR } = {}) {
-  if (Object.hasOwn(environment, "CODEX_ROUTER_GROK_PATCH_HOOK")) {
-    return { CODEX_ROUTER_GROK_PATCH_HOOK: environment.CODEX_ROUTER_GROK_PATCH_HOOK === "1" ? "1" : "0" };
-  }
-  try {
-    const value = JSON.parse(readFileSync(path.join(stateDir, "grok-patch-hook.json"), "utf8"));
-    if (value?.version === 1 && value.enabled === true && Object.keys(value).length === 2) {
-      return { CODEX_ROUTER_GROK_PATCH_HOOK: "1" };
+  const result = {};
+  for (const [flag, file] of [
+    ["CODEX_ROUTER_GROK_PATCH_HOOK", "grok-patch-hook.json"],
+    ["CODEX_ROUTER_GROK_PATCH_FEEDBACK", "grok-patch-feedback.json"],
+  ]) {
+    if (Object.hasOwn(environment, flag)) {
+      result[flag] = environment[flag] === "1" ? "1" : "0";
+      continue;
     }
-  } catch {
-    // Missing or invalid opt-in cannot enable the experiment.
+    try {
+      const value = JSON.parse(readFileSync(path.join(stateDir, file), "utf8"));
+      if (value?.version === 1 && value.enabled === true && Object.keys(value).length === 2) result[flag] = "1";
+    } catch {
+      // Missing or invalid opt-in cannot enable a client protocol.
+    }
   }
-  return {};
+  return result;
 }

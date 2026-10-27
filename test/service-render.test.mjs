@@ -105,22 +105,22 @@ test("all service platforms persist a bounded native catalog polling override", 
   }
 });
 
-test("service regeneration retains persisted hook opt-in on all platforms", () => {
+for (const [flagName, fileName] of [["CODEX_ROUTER_GROK_PATCH_HOOK", "grok-patch-hook.json"], ["CODEX_ROUTER_GROK_PATCH_FEEDBACK", "grok-patch-feedback.json"]]) test(`service regeneration retains ${flagName} independently on all platforms`, () => {
   const testRoot = mkdtempSync(path.join(os.tmpdir(), "router-hook-service-"));
   const stateDir = path.join(testRoot, "codex router state");
   mkdirSync(stateDir, { recursive: true });
-  const file = path.join(stateDir, "grok-patch-hook.json");
+  const file = path.join(stateDir, fileName);
   try {
     for (const [platform, script] of [["darwin", "service-macos.mjs"], ["linux", "service-linux.mjs"], ["win32", "service-windows.mjs"]]) {
       for (const [contents, enabled] of [['{"version":1,"enabled":true}', true], ['{"version":1,"enabled":false}', false], ['{"version":2,"enabled":true}', false], ['{', false]]) {
         writeFileSync(file, contents, { mode: 0o600 });
-        const output = serviceCommand(script, platform, testRoot, "render", "codex", root, { CODEX_ROUTER_GROK_PATCH_HOOK: undefined });
-        assert.equal(output.includes("CODEX_ROUTER_GROK_PATCH_HOOK"), enabled, `${platform}: ${contents}`);
+        const output = serviceCommand(script, platform, testRoot, "render", "codex", root, { CODEX_ROUTER_GROK_PATCH_HOOK: undefined, CODEX_ROUTER_GROK_PATCH_FEEDBACK: undefined });
+        assert.equal(output.includes(flagName), enabled, `${platform}: ${contents}`);
       }
     }
     writeFileSync(file, '{"version":1,"enabled":true}', { mode: 0o600 });
     for (const flag of ["0", "1", "true", ""]) {
-      assert.deepEqual(serviceGrokPatchHookEnvironment({ stateDir, environment: { CODEX_ROUTER_GROK_PATCH_HOOK: flag } }), { CODEX_ROUTER_GROK_PATCH_HOOK: flag === "1" ? "1" : "0" });
+      assert.deepEqual(serviceGrokPatchHookEnvironment({ stateDir, environment: { [flagName]: flag } }), { [flagName]: flag === "1" ? "1" : "0" });
     }
   } finally {
     rmSync(testRoot, { recursive: true, force: true });
@@ -1318,4 +1318,15 @@ test("all service definitions persist only valid startup cooldown settings", () 
       }
     }
   } finally { rmSync(testRoot, { recursive: true, force: true }); }
+});
+
+test("feedback activation leaves the legacy hook disabled and honors separate overrides", () => {
+  const stateDir = mkdtempSync(path.join(os.tmpdir(), "router-feedback-isolated-"));
+  try {
+    writeFileSync(path.join(stateDir, "grok-patch-hook.json"), '{"version":1,"enabled":false}');
+    writeFileSync(path.join(stateDir, "grok-patch-feedback.json"), '{"version":1,"enabled":true}');
+    assert.deepEqual(serviceGrokPatchHookEnvironment({ stateDir, environment: {} }), { CODEX_ROUTER_GROK_PATCH_FEEDBACK: "1" });
+    assert.deepEqual(serviceGrokPatchHookEnvironment({ stateDir, environment: { CODEX_ROUTER_GROK_PATCH_HOOK: "0" } }), { CODEX_ROUTER_GROK_PATCH_HOOK: "0", CODEX_ROUTER_GROK_PATCH_FEEDBACK: "1" });
+    assert.deepEqual(serviceGrokPatchHookEnvironment({ stateDir, environment: { CODEX_ROUTER_GROK_PATCH_FEEDBACK: "0" } }), { CODEX_ROUTER_GROK_PATCH_FEEDBACK: "0" });
+  } finally { rmSync(stateDir, { recursive: true, force: true }); }
 });

@@ -32,14 +32,17 @@ import { fileURLToPath } from "node:url";
 // A successful bind does not make a port usable by fetch: its bad-port policy
 // rejects e.g. SANE's 6566 before opening a connection. Adding a test file can
 // reshuffle blocks onto those ports, so exclude them from the address space.
+// AirPlay can answer on 5000/7000 even when a loopback bind probe succeeds
+// on macOS. Keep fixture HTTP traffic away from those system listeners.
 const PORT_RANGES = [
-  [5_000, 5_059],
+  [5_001, 5_059],
   [5_062, 5_999],
   [6_001, 6_565],
   [6_567, 6_664],
   [6_670, 6_678],
   [6_680, 6_696],
-  [6_698, 9_999],
+  [6_698, 6_999],
+  [7_001, 9_999],
   [30_000, 32_767],
 ];
 const PORT_COUNT = PORT_RANGES.reduce((count, [first, last]) => count + last - first + 1, 0);
