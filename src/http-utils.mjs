@@ -760,8 +760,9 @@ export async function finishResponse(response) {
 //
 // A graceful SSE end alone cannot state a turn's failure. Marked Responses
 // streams with trusted final-egress metadata get a typed `response.failed`.
-// Unmarked streams, and marked streams without trustworthy metadata, keep the
-// generic `error` frame. Prompt clean EOF lets clients handle the failure;
+// Native Responses also permit a minimal local failure when metadata is unknown.
+// Other streams without trustworthy metadata keep the generic `error` frame.
+// Prompt clean EOF lets clients handle the failure;
 // retries still follow their policy. The message is approved router-side text,
 // never an upstream error body, so no response body can leak through it.
 //
@@ -775,16 +776,15 @@ export async function finishResponse(response) {
 // silent corruption this function exists to avoid. Leading newlines are inert
 // when the stream did end cleanly: a blank line with no buffered fields
 // dispatches nothing.
-// `message` lets a caller that diagnosed the failure say so; the code stays
-// fixed, because a diagnosed cause is more detail about this same failure and
-// not a second kind of it. The default wording holds for every caller that
-// reaches here with nothing more specific -- a guessed cause is worse than an
-// honest generic one.
-export function endStreamedResponse(response, { message } = {}) {
+// Transport failures keep their default retryable classification. A caller
+// rejecting unsafe output locally must preserve its diagnostic code and mark
+// the rejection terminal, so a client does not replay the committed generation.
+export function endStreamedResponse(response, { code = "local_router_stream_failed", message, localRejection = false } = {}) {
   if (!response || response.writableEnded || response.destroyed) return;
   writeStreamErrorEvent(response, {
-    code: "local_router_stream_failed",
+    code,
     message: message || "The local router lost the upstream response stream.",
+    localRejection,
   });
   response.end();
 }

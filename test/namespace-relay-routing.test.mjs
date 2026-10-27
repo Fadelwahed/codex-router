@@ -18,14 +18,11 @@ import {
   GROK_APPLY_PATCH_UPDATE_EXAMPLE,
 } from "../src/grok-apply-patch-guidance.mjs";
 
-// End-to-end proof of the namespace relay through the REAL router: a routed
-// request carrying the client's namespace toolset must reach the (mock)
-// gateway with every namespace flattened into plain functions -- including the
-// MCP namespaces (mcp__node_repl__js and friends) that LiteLLM's bridge drops
-// when left as namespace entries -- and function calls streaming back must be
-// restored to the client's native { name, namespace } shape. The router must
-// not execute any app tool itself. The whole scenario runs twice and must
-// produce byte-identical outgoing and incoming bodies (determinism).
+// Real Router preparation and client restoration against explicit gateway/API
+// stubs. Chat models flatten namespaces for the gateway; Responses models keep
+// their native declarations and history on the API hop. The real Router/API
+// boundary is covered separately in direct-responses-runtime.test.mjs.
+// No app tool is executed here.
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const CALLER_KEY = "test-router-caller-capability-with-sufficient-length";
@@ -82,11 +79,17 @@ function run(script, env) {
     env?.MODEL_ROUTER_STATE_DIR || env?.CODEX_ROUTER_STATE_DIR
       ? {}
       : { MODEL_ROUTER_STATE_DIR: mkdtempSync(path.join(os.tmpdir(), "relay-routing-state-")) };
+  const isolatedState = env?.MODEL_ROUTER_STATE_DIR || env?.CODEX_ROUTER_STATE_DIR || stateIsolation.MODEL_ROUTER_STATE_DIR;
   const child = spawn(process.execPath, [path.join(root, "src", script)], {
     cwd: root,
     env: {
       ...process.env,
       ...stateIsolation,
+      MODEL_ROUTER_STATE_DIR: isolatedState,
+      CODEX_ROUTER_STATE_DIR: isolatedState,
+      CODEX_HOME: path.join(isolatedState, "codex"),
+      CODEX_NATIVE_BASE_URL: `${env?.CODEX_ROUTER_GATEWAY_BASE_URL || "http://127.0.0.1:9"}/forbidden-native`,
+      CODEX_ROUTER_API_BASE_URL: env?.CODEX_ROUTER_GATEWAY_BASE_URL || "http://127.0.0.1:9/unused-api/v1",
       CODEX_ROUTER_CALLER_KEY: CALLER_KEY,
       CODEX_ROUTER_INTERNAL_KEY: INTERNAL_KEY,
       CODEX_ROUTER_SHOW_ALL_MODELS: "1",
@@ -118,6 +121,21 @@ async function waitFor(url, child, headers = {}) {
     await new Promise((resolve) => setTimeout(resolve, 50));
   }
   throw new Error(`Timed out waiting for ${url}: ${child.testErrors()}`);
+}
+
+// HTTP completion and stderr delivery are independent cross-process events.
+// Wait for the full diagnostic record before teardown, especially on Windows
+// where SIGTERM can terminate the child before its asynchronous pipe is drained.
+async function waitForLog(child, pattern) {
+  const deadline = Date.now() + 5_000;
+  while (Date.now() < deadline) {
+    if (pattern.test(child.testErrors())) return;
+    if (child.exitCode !== null || child.signalCode !== null) {
+      throw new Error(`Child exited before log record: ${child.testErrors()}`);
+    }
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
+  throw new Error(`Timed out waiting for log record: ${child.testErrors()}`);
 }
 
 async function stopChild(child) {
@@ -902,10 +920,12 @@ async function scenario(
     prepareRouterEnv,
     visionJsonBody,
     expectedStatus = 200,
+    routerLogPattern,
   } = {},
 ) {
   const gatewayBodies = [];
   const gatewayHeaders = [];
+  const upstreamPaths = [];
   const visionBodies = [];
   const gateway = await mockServer(async (request, response) => {
     if (request.url === "/vision/v1/chat/completions" && visionJsonBody) {
@@ -918,7 +938,8 @@ async function scenario(
       );
       return;
     }
-    if (request.url === "/v1/responses") {
+    if (["/gateway/v1/responses", "/api/v1/responses"].includes(request.url)) {
+      upstreamPaths.push(request.url);
       const gatewayBody = await bodyJson(request);
       gatewayBodies.push(gatewayBody);
       gatewayHeaders.push(request.headers);
@@ -942,7 +963,8 @@ async function scenario(
     : {};
   const router = run("router.mjs", {
     CODEX_ROUTER_PORT: String(routerPort),
-    CODEX_ROUTER_GATEWAY_BASE_URL: `http://127.0.0.1:${gateway.port}/v1`,
+    CODEX_ROUTER_GATEWAY_BASE_URL: `http://127.0.0.1:${gateway.port}/gateway/v1`,
+    CODEX_ROUTER_API_BASE_URL: `http://127.0.0.1:${gateway.port}/api/v1`,
     CODEX_ROUTER_QUIET: "1",
     ...routerEnv,
     ...preparedRouterEnv,
@@ -960,7 +982,8 @@ async function scenario(
     });
     assert.equal(response.status, expectedStatus, `router status ${response.status}`);
     const clientBody = await response.text();
-    return { gatewayBodies, gatewayHeaders, visionBodies, clientBody, router, status: response.status };
+    if (routerLogPattern) await waitForLog(router, routerLogPattern);
+    return { gatewayBodies, gatewayHeaders, upstreamPaths, visionBodies, clientBody, router, status: response.status };
   } finally {
     await stopChild(router);
     await closeServer(gateway.server);
@@ -2145,6 +2168,7 @@ test("Responses-native routes preserve pre-flattened tools and restore call iden
       jsonBody: () => ({ id: "resp_flat_json", output: [call] }),
     });
     assert.equal(result.gatewayBodies.length, 1);
+    assert.deepEqual(result.upstreamPaths, ["/api/v1/responses"], "Responses preparation must reach the explicit API stub");
     const outgoing = result.gatewayBodies[0];
     assert.equal(outgoing.model, "meta-muse-spark-1-2");
     assert.equal(
@@ -2175,6 +2199,7 @@ test("Responses-native routed providers inherit the model on fresh local thread 
     requestPayload: routedToolSearchHistoryPayload,
   };
   const streamed = await scenario(true, options);
+  assert.deepEqual(streamed.upstreamPaths, ["/api/v1/responses"]);
   assert.equal(streamed.gatewayBodies[0].model, "meta-muse-spark-1-2");
   assert.ok(
     streamed.gatewayBodies[0].tools.some((tool) => tool?.type === "namespace"),
@@ -2909,9 +2934,10 @@ function grokApplyPatchSseBody() {
   ].join("");
 }
 
-test("Grok 4.6 OAuth annotates native custom apply_patch and leaves history, collisions, and other models alone", async () => {
+test("Grok structured-patch opt-out retains native guidance, history and collisions", async () => {
   const guided = await scenario(true, {
     model: "grok-oauth/grok-4.6",
+    routerEnv: { CODEX_ROUTER_GROK_STRUCTURED_PATCH: "0" },
     requestPayload: grokApplyPatchPayload,
     sseBody: grokApplyPatchSseBody,
   });
@@ -2987,11 +3013,11 @@ function structuredPatchSse(body) {
   ].join("");
 }
 
-test("Grok structured patch opt-in crosses the real Router with collision, choice and historical identity intact", async () => {
+test("Grok structured patch default crosses the real Router with collision, choice and historical identity intact", async () => {
   for (const stream of [true, false]) {
     const result = await scenario(stream, {
       model: "grok-oauth/grok-4.6",
-      routerEnv: { CODEX_ROUTER_GROK_STRUCTURED_PATCH: "1" },
+      routerEnv: { CODEX_ROUTER_GROK_STRUCTURED_PATCH: "" },
       requestPayload: (stream, model) => ({ ...grokApplyPatchPayload(stream, model), tool_choice: { type: "custom", name: "apply_patch" } }),
       sseBody: structuredPatchSse,
       jsonBody: (body) => ({ id: "response_structured", output: [structuredPatchCall(body)] }),
@@ -3005,7 +3031,8 @@ test("Grok structured patch opt-in crosses the real Router with collision, choic
     assert.deepEqual(outgoing.tools.find((tool) => tool.name === "future_custom"), { type: "custom", name: "future_custom", description: "leave me" });
     assert.deepEqual(outgoing.tool_choice, { type: "function", name: tool.name });
     const old = outgoing.input.find((item) => item.call_id === "call_history");
-    assert.equal(old.name, tool.name);
+    assert.notEqual(old.name, tool.name);
+    assert.equal(outgoing.tools.some((tool) => tool.name === old.name), false);
     assert.equal(Object.hasOwn(old, "id"), false);
     assert.equal(JSON.parse(old.arguments).input, grokApplyPatchPayload(stream, outgoing.model).input[1].input);
     assert.deepEqual(outgoing.input.find((item) => item.type === "function_call_output"), { type: "function_call_output", call_id: "call_history", output: "Done!" });
@@ -3029,7 +3056,13 @@ test("the enabled flag leaves another route and undeclared native patch requests
     requestPayload: grokApplyPatchPayload,
     sseBody: grokApplyPatchSseBody,
   });
-  assert.deepEqual(control.gatewayBodies, disabled.gatewayBodies);
+  const withoutOwnedTimingId = (body) => {
+    const { extra_headers, ...rest } = body;
+    assert.deepEqual(Object.keys(extra_headers), ["x-codex-router-request-id"]);
+    assert.match(extra_headers["x-codex-router-request-id"], /^[0-9a-f-]{36}:[0-9]+$/);
+    return rest;
+  };
+  assert.deepEqual(control.gatewayBodies.map(withoutOwnedTimingId), disabled.gatewayBodies.map(withoutOwnedTimingId));
   assert.equal(control.clientBody, disabled.clientBody);
   const undeclared = await scenario(false, {
     model: "grok-oauth/grok-4.6",
@@ -3426,4 +3459,93 @@ test("Console Go Muse Contributor routes carry Codex handoffs as user messages",
     [{ ...handoff, content: expected.content }],
     "an untouched Console Go route keeps the collaboration item",
   );
+});
+
+
+test("Grok timing records a rejected streamed patch as failed despite committed HTTP 200", async () => {
+  const result = await scenario(true, {
+    model: "grok-oauth/grok-4.7",
+    routerLogPattern: /^\[grok-timing\] [^\r\n]+\r?\n/m,
+    routerEnv: { CODEX_ROUTER_GROK_STRUCTURED_PATCH: "1", CODEX_ROUTER_GROK_PATCH_HOOK: "0" },
+    requestPayload: (stream, model) => ({ model, stream, input: "Synthetic patch rejection.", tools: [{ type: "custom", name: "apply_patch" }] }),
+    sseBody: (body) => {
+      const name = body.tools.find(tool => tool.parameters?.properties?.operations)?.name;
+      assert.ok(name, "the actual routed structured patch schema is advertised");
+      return [
+        { type: "response.created", response: { id: "resp_timing_failure", status: "in_progress", model: body.model, output: [] } },
+        { type: "response.output_item.added", output_index: 0, item: {
+          id: "fc_timing", call_id: "call_timing", type: "function_call", name, arguments: "", status: "in_progress",
+        } },
+        { type: "response.function_call_arguments.done", item_id: "fc_timing", output_index: 0, arguments: '{"operations":[]}' },
+        { type: "response.completed", response: { id: "resp_timing_failure", status: "completed", output: [] } },
+      ].map(event => `data: ${JSON.stringify(event)}\n\n`).join("");
+    },
+  });
+  assert.equal(result.status, 200);
+  assert.equal(result.gatewayBodies.length, 1);
+  assert.doesNotMatch(result.clientBody, /"type":"response.completed"/);
+  const rows = result.router.testErrors().split("\n").filter(line => line.startsWith("[grok-timing] "))
+    .map(line => JSON.parse(line.slice("[grok-timing] ".length)));
+  assert.equal(rows.length, 1, "finish and close must not duplicate timing records");
+  assert.equal(rows[0].httpStatus, 200);
+  assert.equal(rows[0].requestStatus, 502);
+  assert.equal(rows[0].generationOutcome, "failed");
+  assert.match(result.router.testErrors(), /invalid custom tool arguments done/);
+});
+
+
+test("Grok timing waits for a successful handler outcome after the response finishes", async () => {
+  const result = await scenario(false, {
+    model: "grok-oauth/grok-4.7",
+    routerLogPattern: /^\[grok-timing\] [^\r\n]+\r?\n/m,
+    requestPayload: (stream, model) => ({ model, stream, input: "Synthetic completed response.",
+      client_metadata: { "x-codex-turn-metadata": JSON.stringify({ thread_source: "composer_predictions", prediction_source_thread_id: "private" }) },
+    }),
+    jsonBody: (body) => ({ id: "resp_timing_ok", object: "response", status: "completed", model: body.model,
+      output: [{ type: "message", role: "assistant", status: "completed", content: [{ type: "output_text", text: "done" }] }],
+      usage: { input_tokens: 10, output_tokens: 1, total_tokens: 11 },
+    }),
+  });
+  const rows = result.router.testErrors().split("\n").filter(line => line.startsWith("[grok-timing] "))
+    .map(line => JSON.parse(line.slice("[grok-timing] ".length)));
+  assert.equal(rows.length, 1);
+  assert.equal(rows[0].httpStatus, 200);
+  assert.equal(rows[0].requestStatus, 200);
+  assert.equal(rows[0].generationOutcome, "completed");
+  assert.equal(rows[0].clientSource, "composer_predictions");
+  assert.doesNotMatch(JSON.stringify(rows), /private/);
+});
+
+test("local custom tool rejection preserves its cause and prevents automatic replay with or without response metadata", async () => {
+  for (const trusted of [true, false]) {
+    for (const argumentsText of [JSON.stringify({ content: "second" }), '{"content":"first"} trailing', JSON.stringify({ content: null })]) {
+      const result = await scenario(true, {
+        model: "zai-coding/glm-5.3-flash",
+        requestPayload: (stream, model) => ({ model, stream, input: "Apply a synthetic patch.", tools: [{ type: "custom", name: "apply_patch" }] }),
+        sseBody: () => [
+          sseEvent({ type: "response.created", ...(trusted ? { sequence_number: 0 } : {}), response: {
+            id: "resp_rejected", ...(trusted ? { model: "zai-coding-glm-5-3-flash", created_at: 1791840000 } : {}), status: "in_progress", output: [],
+          } }),
+          sseEvent({ type: "response.output_item.added", sequence_number: 1, output_index: 0, item: {
+            type: "custom_tool_call", id: "call_rejected", call_id: "call_rejected", name: "apply_patch", input: "", status: "in_progress",
+          } }),
+          sseEvent({ type: "response.function_call_arguments.delta", sequence_number: 2, output_index: 0, item_id: "call_rejected", delta: JSON.stringify({ content: "first" }) }),
+          sseEvent({ type: "response.function_call_arguments.done", sequence_number: 3, output_index: 0, item_id: "call_rejected", arguments: argumentsText }),
+          sseEvent({ type: "response.output_item.done", sequence_number: 4, output_index: 0, item: {
+            type: "custom_tool_call", id: "call_rejected", call_id: "call_rejected", name: "apply_patch", input: "second", status: "completed",
+          } }),
+          sseEvent({ type: "response.completed", sequence_number: 5, response: { id: "resp_rejected", output: [] } }),
+        ].join(""),
+      });
+      const events = result.clientBody.split(/\r?\n/).filter((line) => line.startsWith("data: {")).map((line) => JSON.parse(line.slice(6)));
+      assert.equal(result.gatewayBodies.length, 1, "the Router must not replay a committed request");
+      const failures = events.filter((event) => event.type === "response.failed");
+      assert.equal(failures.length, 1, `one terminal rejection is required (trusted=${trusted})`);
+      assert.equal(failures[0].code, "ERR_NAMESPACE_RELAY_COMMITTED_STREAM");
+      assert.equal(failures[0].response.error.code, "invalid_prompt");
+      assert.match(failures[0].response.error.message, /custom tool argument deltas disagree|invalid custom tool arguments done/);
+      assert.equal(events.some((event) => event.type === "response.output_item.done" || event.type === "response.completed"), false, "unsafe input cannot complete or execute");
+      if (!trusted) assert.equal(Object.hasOwn(failures[0].response, "created_at"), false, "missing identity must not be invented");
+    }
+  }
 });

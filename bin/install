@@ -206,6 +206,11 @@ ensure_uv_venv() {
   fi
 }
 
+compatibility_required=$(node src/compatibility-layer-state.mjs required)
+case "$compatibility_required" in required|unused) ;; *) echo "Could not read compatibility policy." >&2; exit 1 ;; esac
+if [ "$compatibility_required" = unused ]; then
+  echo "Compatibility layer disabled; skipping Python dependencies and probes (including forced repair)."
+else
 case "$(install_step python-deps)" in
   managed) echo "Homebrew manages LiteLLM; skipping Python dependency installation." ;;
   skip) echo "LiteLLM already matches the pinned versions; skipping the Python install." ;;
@@ -246,6 +251,7 @@ case "$(install_step python-deps)" in
     fi
     ;;
 esac
+fi
 
 node src/secret.mjs ensure
 config_enabled=false

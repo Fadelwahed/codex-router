@@ -232,3 +232,67 @@ provider-visible feedback sizes must be recorded separately from token counts.
 Downstream truncation or aging can change this measurement; it is not a bound
 on the original native denial or future provider context. No performance
 or quality gain follows from passing these deterministic checks.
+
+## Denial-only validation feedback (v2)
+
+The `patch-feedback-v2` capability is separate from the older v1 serializer.
+With `CODEX_ROUTER_GROK_PATCH_FEEDBACK=1`, a supported Grok OAuth route, and either
+`x-codex-router-patch-hook: patch-feedback-v2` or the explicit
+`/v1/_codex-router/patch-feedback-v2` base, Router compiles valid `operations`
+into an ordinary native patch. The native hook leaves that input unchanged;
+Codex performs its usual permission and file matching checks.
+
+Only a bounded, recognized compiler error becomes a
+`CODEX_ROUTER_PATCH_ERROR_V2` envelope containing the fixed error category and
+original argument bytes. `scripts/grok-patch-feedback-hook.mjs` returns a
+native `PreToolUse` denial for this envelope. It never returns `allow` or
+`updatedInput`, imports the compiler, reads project files, or executes edits.
+The client owns the resulting tool error and any subsequent correction turn.
+The Router does not synthesize tool results or initiate a retry. Invalid
+Unicode, argument/patch size bounds, unknown exceptions, and contradictory
+transport events remain fatal. The v2 schema does not enable the v1-only
+`write` and `search_replace` facades.
+
+Failed-call history restores the raw argument string. Successful-call history
+uses the existing native patch history envelope and a non-callable history
+identity. The client may echo the entire denied input in tool feedback, so
+this protocol does not promise a smaller context or faster model correction.
+An absent or untrusted hook leaves an envelope that the native patch parser
+rejects without editing; its error is less specific than a trusted hook denial.
+
+Deployment still requires a protected Node executable and the complete hook
+payload, exact-command discovery/trust preflight, and an explicitly loaded
+client capability. For v2 the payload is only the hook entrypoint and
+`src/grok-patch-feedback-contract.mjs`; it has no project dependency graph.
+Do not enable a capability merely because an older v1 hook is installed.
+Existing Desktop children may retain the previous endpoint. Persist only this opt-in in `grok-patch-feedback.json`, exactly
+`{"version":1,"enabled":true}`; it does not enable the v1 serializer for
+already-loaded clients. No installer
+silently trusts the command or activates this protocol by default.
+
+The deterministic full-chain check uses mock xAI, not a live model:
+
+```sh
+node scripts/verify-grok-apply-patch-guidance.mjs <venv-python> --native-feedback --native-hook-endpoint --codex=<codex-binary>
+```
+
+It covers Grok 4.7, malformed string-valued `operations`, native denial, an
+explicit corrected model call, final file contents, and call/history identity.
+Use `--native-hook-control=missing|untrusted|changed` for trust controls,
+`--native-outside-dir=<protected-parent>` for a native permission control,
+and `--native-approval=never|on-request|untrusted` to select the client policy.
+`--native-fault=disconnect|duplicate-close` verifies that a mutation is not
+applied twice. These fixtures establish protocol behavior, not live model
+quality or Desktop activation.
+
+Local validation on Codex 0.159.0: v2 denial/correction, missing/untrusted/changed
+hook, outside-workspace controls with `never` and `on-request`, disconnect,
+and duplicate completion pass. This Codex version rejects the retired
+`approval_policy="untrusted"` before running a turn; it is not a passing
+permission check. Without feedback, the deterministic invalid-argument control
+made six transport attempts and failed the turn; v2 completed the three supplied
+model responses (invalid call, corrected call, final). These counts describe
+scripted responses, not a measured live Grok improvement.
+The same full-chain denial/correction check also passes with the Desktop's
+bundled Codex 0.164.0-alpha.11.1 and with the protected hook Node 24.13.1.
+This does not prove an already-open Desktop child reloaded its configuration.

@@ -29,9 +29,24 @@ import { fileURLToPath } from "node:url";
 // Antigravity kernel leases occupy 10000-29999 on POSIX. A fixture listener
 // there can deny token promotion for its entire lock-wait horizon. Keep both
 // segments outside those leases, the managed router ports, and ephemeral ports.
-const PORT_RANGES = [[5_000, 9_999], [30_000, 32_767]];
+// A successful bind does not make a port usable by fetch: its bad-port policy
+// rejects e.g. SANE's 6566 before opening a connection. Adding a test file can
+// reshuffle blocks onto those ports, so exclude them from the address space.
+// AirPlay can answer on 5000/7000 even when a loopback bind probe succeeds
+// on macOS. Keep fixture HTTP traffic away from those system listeners.
+const PORT_RANGES = [
+  [5_001, 5_059],
+  [5_062, 5_999],
+  [6_001, 6_565],
+  [6_567, 6_664],
+  [6_670, 6_678],
+  [6_680, 6_696],
+  [6_698, 6_999],
+  [7_001, 9_999],
+  [30_000, 32_767],
+];
 const PORT_COUNT = PORT_RANGES.reduce((count, [first, last]) => count + last - first + 1, 0);
-function portAt(index) {
+export function portAt(index) {
   for (const [first, last] of PORT_RANGES) {
     const count = last - first + 1;
     if (index < count) return first + index;
@@ -59,13 +74,27 @@ function blockFor(entry) {
     .sort();
   const index = files.indexOf(path.basename(entry));
   if (index === -1) return undefined;
-  const size = Math.max(
-    MIN_BLOCK,
-    Math.min(MAX_BLOCK, Math.floor(PORT_COUNT / Math.max(files.length, 1))),
-  );
-  const start = index * size;
-  if (start + size > PORT_COUNT) throw new Error("Integration test port pool has no remaining disjoint blocks.");
-  return { start, size };
+  // A large suite can declare its bounded demand rather than lose capacity
+  // whenever another independent test file starts using this pool. Reserve
+  // those blocks first, then divide the remainder between ordinary consumers.
+  const reservations = files.map((file) => {
+    const source = readFileSync(path.join(TEST_DIR, file), "utf8");
+    const hint = source.match(/^\/\/ port-pool block-size: ([^\r\n]*)$/m);
+    if (!hint) return undefined;
+    const size = Number(hint[1]);
+    if (!Number.isSafeInteger(size) || size < MIN_BLOCK || size > MAX_BLOCK) {
+      throw new Error(`${file} declares an invalid test port block size.`);
+    }
+    return size;
+  });
+  const reserved = reservations.reduce((sum, size) => sum + (size ?? 0), 0);
+  const ordinaryCount = reservations.filter((size) => size === undefined).length;
+  const ordinarySize = Math.min(MAX_BLOCK, Math.floor((PORT_COUNT - reserved) / Math.max(ordinaryCount, 1)));
+  if (reserved > PORT_COUNT || (ordinaryCount && ordinarySize < MIN_BLOCK)) {
+    throw new Error("Integration test port pool has no remaining disjoint blocks.");
+  }
+  const sizes = reservations.map((size) => size ?? ordinarySize);
+  return { start: sizes.slice(0, index).reduce((sum, size) => sum + size, 0), size: sizes[index] };
 }
 
 async function isFree(port) {
@@ -126,7 +155,7 @@ export async function freePort() {
   }
   throw new Error(
     `${path.basename(process.argv[1] || "this file")} exhausted its ${block.size}-port ` +
-      `block at ${portAt(block.start)}; raise MAX_BLOCK in test/port-pool.mjs or free the leftovers`,
+      `block at ${portAt(block.start)}; declare a bounded port-pool block-size or free the leftovers`,
   );
 }
 

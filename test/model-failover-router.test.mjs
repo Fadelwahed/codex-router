@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { spawn } from "node:child_process";
+import { execFileSync, spawn } from "node:child_process";
 import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import http from "node:http";
 import os from "node:os";
@@ -291,6 +291,8 @@ function run(
     env: {
       ...process.env,
       MODEL_ROUTER_STATE_DIR: stateDir,
+      CODEX_ROUTER_STATE_DIR: stateDir,
+      CODEX_HOME: path.join(stateDir, "codex"),
       CODEX_ROUTER_CALLER_KEY: CALLER_KEY,
       CODEX_ROUTER_INTERNAL_KEY: INTERNAL_KEY,
       KIMI_INTERNAL_KEY: INTERNAL_KEY,
@@ -318,10 +320,13 @@ function routerEnv(gatewayPort, routerPort) {
   return {
     CODEX_ROUTER_PORT: String(routerPort),
     CODEX_ROUTER_GATEWAY_BASE_URL: `http://127.0.0.1:${gatewayPort}/v1`,
+    CODEX_ROUTER_API_BASE_URL: `http://127.0.0.1:${gatewayPort}/v1`,
     CODEX_ROUTER_OAUTH_HEALTH_URL: `http://127.0.0.1:${gatewayPort}/health`,
     CODEX_ROUTER_API_HEALTH_URL: `http://127.0.0.1:${gatewayPort}/health`,
     CODEX_ROUTER_GROK_OAUTH_HEALTH_URL: `http://127.0.0.1:${gatewayPort}/health`,
     CODEX_ROUTER_GATEWAY_HEALTH_URL: `http://127.0.0.1:${gatewayPort}/health`,
+    MODEL_ROUTER_ANTIGRAVITY_OAUTH_PORT: String(gatewayPort),
+    MODEL_ROUTER_DEVIN_CLI_PORT: String(gatewayPort),
   };
 }
 
@@ -2095,6 +2100,49 @@ test("a streamed function_call with unterminated JSON is failed and the completi
   }
 });
 
+test("invalid function arguments after visible output terminate without retry or failover", async () => {
+  let attempts = 0;
+  const gw = await gateway(async (request, response) => {
+    await bodyJson(request);
+    attempts += 1;
+    response.writeHead(200, { "Content-Type": "text/event-stream" });
+    const prelude = [
+      { type: "response.created", response: { id: "r-tool" } },
+      { type: "response.output_item.added", output_index: 0, item: {
+        id: "msg-visible", type: "message", role: "assistant", content: [], status: "in_progress",
+      } },
+      { type: "response.output_text.delta", output_index: 0, content_index: 0,
+        item_id: "msg-visible", delta: "Visible output before invalid tool." },
+      { type: "response.output_item.done", output_index: 0, item: {
+        id: "msg-visible", type: "message", role: "assistant", status: "completed",
+        content: [{ type: "output_text", text: "Visible output before invalid tool." }],
+      } },
+    ];
+    response.end(prelude.map((event) => `data: ${JSON.stringify(event)}\n\n`).join("") +
+      toolCallSse("exec_command", '{"cmd":"unterminated').replace(/^event: response.created\ndata: [^\n]+\n\n/, ""));
+  });
+  const routerPort = await openPort();
+  const child = run(routerEnv(gw.port, routerPort));
+  try {
+    await waitFor(`http://127.0.0.1:${routerPort}/health`, child);
+    const result = await readRouted(routerPort, TURN_BODY);
+    assert.equal(result.status, 200, "the visible response has committed headers");
+    assert.equal(attempts, 1, "committed output must not be regenerated or failed over");
+    assert.match(result.body, /Visible output before invalid tool/);
+    const events = result.body.split(/\r?\n/).filter((line) => line.startsWith("data: {")).map((line) => JSON.parse(line.slice(6)));
+    const failures = events.filter((event) => event.type === "response.failed");
+    assert.equal(failures.length, 1);
+    assert.equal(failures[0].code, "invalid_function_call_arguments");
+    assert.equal(failures[0].response.error.code, "invalid_prompt");
+    assert.equal(events.some((event) => event.type === "response.completed" ||
+      (event.type === "response.output_item.done" && event.item?.type === "function_call")), false);
+    assert.doesNotMatch(child.testErrors(), /failover|invalid function_call arguments; retrying/);
+  } finally {
+    await stopChild(child);
+    await closeServer(gw.server);
+  }
+});
+
 test("a streamed function_call with unterminated JSON retries onto a valid call", async () => {
   let attempts = 0;
   const gw = await gateway(async (request, response) => {
@@ -2182,11 +2230,33 @@ function compactSuccessJson() {
 }
 
 async function oversizedWindowsExcept(keepSlugs = []) {
-  const { LISTED_MODELS } = await import("../src/model-registry.mjs");
-  const keep = new Set(keepSlugs);
-  return LISTED_MODELS.filter(
-    (model) => !keep.has(model.slug) && Number(model.contextWindow) >= 434983,
-  ).map((model) => model.slug);
+  // Match the child's pristine registry, rather than the operator's possibly
+  // filtered registry (for example, with the compatibility layer disabled).
+  const directory = mkdtempSync(path.join(os.tmpdir(), "failover-catalog-"));
+  try {
+    const output = execFileSync(process.execPath, ["--input-type=module", "-e", `
+      import { LISTED_MODELS } from "./src/model-registry.mjs";
+      const keep = new Set(JSON.parse(process.argv[1]));
+      process.stdout.write(JSON.stringify(LISTED_MODELS.filter(model =>
+        !keep.has(model.slug) && Number(model.contextWindow) >= 434983,
+      ).map(model => model.slug)));
+    `, JSON.stringify(keepSlugs)], {
+      cwd: root,
+      env: {
+        ...process.env,
+        HOME: directory, USERPROFILE: directory,
+        APPDATA: path.join(directory, "appdata"), LOCALAPPDATA: path.join(directory, "localappdata"),
+        CODEX_HOME: path.join(directory, "codex"),
+        MODEL_ROUTER_STATE_DIR: directory, CODEX_ROUTER_STATE_DIR: directory,
+        MODEL_ROUTER_USER_MODELS: path.join(directory, "user-models.json"),
+        MODEL_ROUTER_GENERIC_PROVIDERS: path.join(directory, "generic-providers.json"),
+      },
+      encoding: "utf8", timeout: 30_000, windowsHide: true,
+    });
+    return JSON.parse(output);
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
 }
 
 test("compact overflow hops to a larger same-family window without cooldown", async () => {

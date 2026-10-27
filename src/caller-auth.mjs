@@ -1,5 +1,5 @@
 import { timingSafeEqual } from "node:crypto";
-import { CODEX_PATCH_HOOK_BASE_PATH } from "./codex-patch-hook-endpoint.mjs";
+import { CODEX_PATCH_CAPABILITY_PATHS } from "./codex-patch-hook-endpoint.mjs";
 
 export const CALLER_PATH_PREFIX = "/_codex-router";
 const MINIMUM_SECRET_LENGTH = 32;
@@ -126,7 +126,7 @@ export function isManagedCallerBaseUrl(value, port) {
 // with a bearer sent to the plain loopback Responses endpoint.
 export function isManagedCodexBaseUrl(value, port) {
   if (isManagedCallerBaseUrl(value, port)) return true;
-  if (isManagedLeafBaseUrl(value, port, CODEX_PATCH_HOOK_BASE_PATH.slice(1))) return true;
+  if (CODEX_PATCH_CAPABILITY_PATHS.some((base) => isManagedLeafBaseUrl(value, port, base.slice(1)))) return true;
   if (typeof value !== "string" || !value) return false;
   try {
     const url = new URL(value);
@@ -137,7 +137,7 @@ export function isManagedCodexBaseUrl(value, port) {
       (port === undefined || url.port === expectedPort) &&
       !url.username && !url.password && !url.search && !url.hash &&
       (url.pathname.replace(/\/$/, "") === "/v1" ||
-       url.pathname.replace(/\/$/, "") === CODEX_PATCH_HOOK_BASE_PATH)
+       CODEX_PATCH_CAPABILITY_PATHS.includes(url.pathname.replace(/\/$/, "")))
     );
   } catch {
     return false;

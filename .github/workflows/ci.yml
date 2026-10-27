@@ -30,7 +30,15 @@ jobs:
         if: runner.os == 'Linux'
         run: npx playwright install --with-deps chromium
       - run: npm run check
-      - run: npm test
+      - name: Test (POSIX)
+        if: runner.os != 'Windows'
+        run: npm test
+      - name: Test (Windows, bounded ACL helper concurrency)
+        if: runner.os == 'Windows'
+        # Private-file tests launch real PowerShell ACL helpers. Avoid starving
+        # their existing deadlines on shared runners; retain every test and
+        # all within-file request/race concurrency assertions.
+        run: node --test --test-timeout=600000 --test-concurrency=2 test/*.test.mjs
       - run: npm audit --omit=dev --audit-level=high
       - name: Test the macOS tray
         if: runner.os == 'macOS'
@@ -93,7 +101,7 @@ jobs:
       - name: Set up Homebrew
         id: set-up-homebrew
         if: steps.changed.outputs.run == 'true'
-        uses: Homebrew/actions/setup-homebrew@e99025eb970cfa124b8284a35463d87426917478 # 2026.09.28.1
+        uses: Homebrew/actions/setup-homebrew@d482da0e602890d3160aade42e72c8556103bf04 # 2026.10.26.1
       - name: Cache Homebrew Bundler RubyGems
         id: cache-homebrew-gems
         if: steps.changed.outputs.run == 'true'
@@ -122,7 +130,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - name: Set up Homebrew
-        uses: Homebrew/actions/setup-homebrew@e99025eb970cfa124b8284a35463d87426917478 # 2026.09.28.1
+        uses: Homebrew/actions/setup-homebrew@d482da0e602890d3160aade42e72c8556103bf04 # 2026.10.26.1
       - name: Build and test the formula from source
         run: packaging/homebrew/check-core-readiness.sh --install
 
@@ -391,18 +399,31 @@ jobs:
           set -euo pipefail
           app="$RUNNER_TEMP/Codex Router.app"
           outer="$app/Contents/MacOS/ModelRouterTray"
-          embedded="$app/Contents/Resources/Control Center.app/Contents/MacOS/Codex Router"
           log="$RUNNER_TEMP/model-router-macos-smoke.log"
 
           query_lifecycle() {
-            node -e '
-              const { execFileSync } = require("node:child_process");
-              const env = { ...process.env };
-              delete env.ELECTRON_RUN_AS_NODE;
-              process.stdout.write(execFileSync(process.argv[1], ["--query-lifecycle"], {
-                env, encoding: "utf8", timeout: 10000, killSignal: "SIGKILL",
-              }));
-            ' "$embedded"
+            # A GUI query helper registers as this same macOS application. If
+            # it overlaps NSWorkspace.openApplication, LaunchServices can fail
+            # the real window launch. Observe the existing record without
+            # starting another application, using the exact same validator.
+            node scripts/query-control-center-lifecycle.mjs
+          }
+
+          diagnose_app_launch() {
+            /usr/bin/osascript -l JavaScript -e '
+              ObjC.import("AppKit");
+              const result = [];
+              for (const identifier of ["io.github.codex-router.tray", "io.github.codex-router.control-center"]) {
+                const apps = $.NSRunningApplication.runningApplicationsWithBundleIdentifier(identifier);
+                for (let index = 0; index < apps.count; index += 1) {
+                  const app = apps.objectAtIndex(index);
+                  result.push({ identifier, pid: Number(app.processIdentifier),
+                    finishedLaunching: Boolean(app.isFinishedLaunching),
+                    terminated: Boolean(app.isTerminated), bundlePath: app.bundleURL.path.js });
+                }
+              }
+              JSON.stringify(result);
+            ' >&2 || true
           }
 
           wait_for_lifecycle() {
@@ -412,6 +433,7 @@ jobs:
             last_state=
             for _ in {1..120}; do
               if ! last_state=$(query_lifecycle); then
+                diagnose_app_launch
                 cat "$log" >&2 || true
                 return 1
               fi
@@ -436,6 +458,7 @@ jobs:
             done
             printf 'Timed out waiting for Control Center lifecycle %s/%s/%s; last state: %s\n' \
               "$expected_running" "$expected_ready" "$expected_visible" "$last_state" >&2
+            diagnose_app_launch
             cat "$log" >&2 || true
             return 1
           }
@@ -497,11 +520,8 @@ jobs:
           }
           trap cleanup EXIT
 
-          sleep 1
-          if ! kill -0 "$pid" 2>/dev/null; then
-            wait "$pid" || true
-            cat "$log"
-            echo "Unified macOS host exited before its first reopen event." >&2
+          if ! node scripts/wait-macos-app-ready.mjs "$pid" "$app"; then
+            cat "$log" >&2 || true
             exit 1
           fi
 

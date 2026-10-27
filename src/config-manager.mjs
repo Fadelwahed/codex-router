@@ -3,10 +3,8 @@ import { randomBytes } from "node:crypto";
 import {
   copyFileSync,
   existsSync,
-  mkdirSync,
   mkdtempSync,
   readFileSync,
-  renameSync,
   rmSync,
   unlinkSync,
   writeFileSync,
@@ -22,10 +20,11 @@ import {
   isManagedCodexBaseUrl,
   redactCallerUrl,
 } from "./caller-auth.mjs";
-import { CODEX_PATCH_HOOK_BASE_PATH } from "./codex-patch-hook-endpoint.mjs";
+import { CODEX_PATCH_CAPABILITY_PATHS } from "./codex-patch-hook-endpoint.mjs";
 import {
   privateFileIsProtected,
   protectPrivateFile,
+  writePrivateFile,
 } from "./file-security.mjs";
 import {
   refreshCodexCallerCapabilityContents,
@@ -163,9 +162,10 @@ function configuredRouterBaseUrl() {
   // Keep an explicitly activated client capability during repair, catalog
   // refresh, port migration and caller-key rotation. Fresh installs stay /v1.
   const existingBase = rootValue(splitRoot(current).rootLines, "openai_base_url");
-  if (isManagedRouterBaseUrl(existingBase) &&
-      new URL(existingBase).pathname.replace(/\/$/, "").endsWith(CODEX_PATCH_HOOK_BASE_PATH)) {
-    return loopback(PORTS.router, CODEX_PATCH_HOOK_BASE_PATH);
+  if (isManagedRouterBaseUrl(existingBase)) {
+    const pathname = new URL(existingBase).pathname.replace(/\/$/, "");
+    const capabilityPath = CODEX_PATCH_CAPABILITY_PATHS.find((base) => pathname.endsWith(base));
+    if (capabilityPath) return loopback(PORTS.router, capabilityPath);
   }
   return loopback(PORTS.router, "/v1");
 }
@@ -1134,20 +1134,7 @@ function readProviderModeState() {
 }
 
 function writeProviderModeState(value) {
-  mkdirSync(path.dirname(CODEX_PROVIDER_MODE_PATH), { recursive: true, mode: 0o700 });
-  const temporary = `${CODEX_PROVIDER_MODE_PATH}.tmp.${process.pid}`;
-  writeFileSync(temporary, `${JSON.stringify(value, null, 2)}\n`, {
-    encoding: "utf8",
-    mode: 0o600,
-  });
-  try {
-    protectPrivateFile(temporary);
-    renameSync(temporary, CODEX_PROVIDER_MODE_PATH);
-    protectPrivateFile(CODEX_PROVIDER_MODE_PATH);
-  } catch (error) {
-    if (existsSync(temporary)) unlinkSync(temporary);
-    throw error;
-  }
+  writePrivateFile(CODEX_PROVIDER_MODE_PATH, `${JSON.stringify(value, null, 2)}\n`);
 }
 
 function clearProviderModeState() {
@@ -1192,20 +1179,7 @@ function readSignedProviderModeState() {
 }
 
 function writeSignedProviderModeState(value) {
-  mkdirSync(path.dirname(SIGNED_PROVIDER_MODE_PATH), { recursive: true, mode: 0o700 });
-  const temporary = `${SIGNED_PROVIDER_MODE_PATH}.tmp.${process.pid}`;
-  writeFileSync(temporary, `${JSON.stringify(value, null, 2)}\n`, {
-    encoding: "utf8",
-    mode: 0o600,
-  });
-  try {
-    protectPrivateFile(temporary);
-    renameSync(temporary, SIGNED_PROVIDER_MODE_PATH);
-    protectPrivateFile(SIGNED_PROVIDER_MODE_PATH);
-  } catch (error) {
-    if (existsSync(temporary)) unlinkSync(temporary);
-    throw error;
-  }
+  writePrivateFile(SIGNED_PROVIDER_MODE_PATH, `${JSON.stringify(value, null, 2)}\n`);
 }
 
 function clearSignedProviderModeState() {
@@ -1584,17 +1558,7 @@ function restoreNativeCatalog(contents) {
 }
 
 function atomicWrite(contents) {
-  mkdirSync(path.dirname(CONFIG_PATH), { recursive: true, mode: 0o700 });
-  const temporary = `${CONFIG_PATH}.tmp.${process.pid}`;
-  writeFileSync(temporary, contents, { encoding: "utf8", mode: 0o600 });
-  try {
-    protectPrivateFile(temporary);
-    renameSync(temporary, CONFIG_PATH);
-    protectPrivateFile(CONFIG_PATH);
-  } catch (error) {
-    if (existsSync(temporary)) unlinkSync(temporary);
-    throw error;
-  }
+  writePrivateFile(CONFIG_PATH, contents);
 }
 
 if (!new Set([

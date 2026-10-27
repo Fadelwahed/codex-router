@@ -1,4 +1,5 @@
 import { spawn } from "node:child_process";
+import { COMPATIBILITY_LAYER } from "./model-registry.mjs";
 import { existsSync, readFileSync, writeSync } from "node:fs";
 import path from "node:path";
 
@@ -22,8 +23,7 @@ import { waitForHealth as pollHealth } from "./health-probe.mjs";
 import { describeChildExit, fatalExitFollowUp } from "./fatal-exit.mjs";
 import { gatewaySupervisorLimits, superviseGateway } from "./gateway-supervisor.mjs";
 import { writeLiteLlmConfig } from "./litellm-config.mjs";
-import { MODELS } from "./model-registry.mjs";
-import { readLocalModelSelection } from "./local-models.mjs";
+import { runtimeDependencyRequirements } from "./runtime-dependency-requirements.mjs";
 import { antigravityOAuthStartupState } from "./antigravity-oauth-status.mjs";
 import { attemptAntigravityProbePromotionAfterReadiness } from "./antigravity-probe-activation.mjs";
 import { spawnableCommand } from "./spawnable-command.mjs";
@@ -101,6 +101,10 @@ if (Object.keys(restoredProxy).length > 0) {
 }
 
 const dependencyFix = dependencyRepairHint();
+// Installation and execution use the same selected-route dependency boundary.
+// The explicit pending-proof listener is handled separately in main() below.
+const executionPlan = runtimeDependencyRequirements({ includePendingActivation: false });
+const requiredServices = new Set(executionPlan.services);
 
 const litellm =
   process.env.MODEL_ROUTER_LITELLM_BIN ||
@@ -113,7 +117,7 @@ const litellm =
     process.platform === "win32" ? "Scripts" : "bin",
     process.platform === "win32" ? "litellm.exe" : "litellm",
   );
-if (!existsSync(litellm)) {
+if (executionPlan.needsGateway && !existsSync(litellm)) {
   throw new Error(`LiteLLM is not installed at ${litellm}. ${dependencyFix}.`);
 }
 
@@ -132,7 +136,7 @@ if (!existsSync(litellm)) {
 const usesBundledVenv = !process.env.MODEL_ROUTER_LITELLM_BIN &&
   !(TARGET === "codex" &&
     (process.env.CODEX_ROUTER_LITELLM_BIN || process.env.KIMI_LITELLM_BIN));
-if (usesBundledVenv) {
+if (executionPlan.needsGateway && usesBundledVenv) {
   const venvPython = path.join(
     SOURCE_ROOT,
     ".venv",
@@ -160,7 +164,7 @@ if (!internalKey) throw new Error("Internal service key is empty.");
 const callerKey = assertCallerSecret(
   readFileSync(CALLER_SECRET_PATH, "utf8").trim(),
 );
-writeLiteLlmConfig();
+if (executionPlan.needsGateway) writeLiteLlmConfig();
 
 // Drop enabled providers this build cannot authenticate (missing credential,
 // retired/unknown id). Without this, enabled-providers.json accrues dead
@@ -169,7 +173,7 @@ writeLiteLlmConfig();
 // gateway config write so a prune that rewrites selection cannot race a
 // concurrent config reader mid-start; forwarders spawned below see the
 // reconciled file.
-const prunedProviders = pruneUnconfiguredProviders();
+const prunedProviders = COMPATIBILITY_LAYER.enabled ? pruneUnconfiguredProviders() : [];
 if (prunedProviders.length) {
   console.error(
     `[codex-router] pruned ${prunedProviders.length} provider(s) from ${PROVIDER_SELECTION_PATH}: ${
@@ -185,7 +189,7 @@ if (prunedProviders.length) {
 // so keep its daemon available for the gateway. This never installs software
 // or pulls a model during service startup; a missing runtime remains a doctor
 // warning, while a present runtime is started as a detached, headless server.
-if (readLocalModelSelection().enabled.length) {
+if (requiredServices.has("ollama")) {
   try {
     await ensureOllamaHeadless({ install: false });
   } catch (error) {
@@ -193,12 +197,9 @@ if (readLocalModelSelection().enabled.length) {
   }
 }
 
-// Same rule, one layer up: a curated model is what gives a provider a gateway
-// route, so it is also what makes that provider's own forwarder worth a
-// process and a port. `writeLiteLlmConfig()` above emits the
-// `DEVIN_CLI_FORWARD_BASE_URL` route from this same MODELS array on this same
-// boot, so the route and the listener cannot disagree -- no curated Devin
-// model means no route to the port and nothing bound to it. Devin ships
+// A selected, curated model gives Devin both its gateway route and its
+// listener requirement in the execution plan. No selected Devin model means
+// no route to the port and nothing bound to it. Devin ships
 // catalog-only (`bin/curate-models devin-cli`), so an operator who never asked
 // for it pays nothing: no fourth child, no fourth port, no fourth health wait.
 //
@@ -206,7 +207,7 @@ if (readLocalModelSelection().enabled.length) {
 // model but has not run `devin auth login` should get the forwarder's 401
 // naming that command, not a bare connection error from a port nobody is
 // listening on.
-const devinCliRouted = MODELS.some((model) => model.provider === "devin-cli");
+const devinCliRouted = requiredServices.has("devin");
 const cursorInstalled = existsSync(CURSOR_CATALOG_PATH);
 
 const commonEnv = {
@@ -265,6 +266,7 @@ const commonEnv = {
 };
 
 const children = [];
+const childExits = new WeakMap();
 let shuttingDown = false;
 let stopNativeCatalogWatch = () => {};
 
@@ -287,17 +289,24 @@ function run(command, args, extraEnv = {}) {
     stdio: "inherit",
     ...spawnable.options,
   });
+  // Observe from spawn time, before health checks or later teardown await the
+  // child. A failed spawn emits error without exit; leaving it unhandled skips
+  // the finally block and strands forwarders that have already started.
+  childExits.set(child, new Promise((resolve) => {
+    child.once("exit", (code, signal) => resolve({ code, signal }));
+    child.on("error", (error) => {
+      console.error(`[model-router] child process error: ${error.message}`);
+      // Errors after a successful spawn (for example a failed kill) do not
+      // prove termination. Keep waiting for that child's actual exit.
+      if (child.pid === undefined) resolve({ code: 1, signal: null });
+    });
+  }));
   children.push(child);
   return child;
 }
 
 function waitForExit(child, label) {
-  if (child.exitCode !== null || child.signalCode !== null) {
-    return Promise.resolve({ label, code: child.exitCode, signal: child.signalCode });
-  }
-  return new Promise((resolve) => {
-    child.once("exit", (code, signal) => resolve({ label, code, signal }));
-  });
+  return childExits.get(child).then((result) => ({ label, ...result }));
 }
 
 // The probe loop lives in src/health-probe.mjs so it can be tested directly;
@@ -354,47 +363,50 @@ async function main() {
   // These forwarders use separate ports and do not depend on one another.
   // Start all of them before waiting so a cold service does not pay their
   // startup times one after another.
-  const kimiForwarder = run(process.execPath, [path.join(SOURCE_ROOT, "src", "oauth-forwarder.mjs")]);
-  const api = run(process.execPath, [path.join(SOURCE_ROOT, "src", "api-forwarder.mjs")]);
-  const grokForwarder = run(process.execPath, [path.join(SOURCE_ROOT, "src", "grok-oauth-forwarder.mjs")]);
+  const kimiForwarder = requiredServices.has("kimi")
+    ? run(process.execPath, [path.join(SOURCE_ROOT, "src", "oauth-forwarder.mjs")]) : undefined;
+  const api = requiredServices.has("api")
+    ? run(process.execPath, [path.join(SOURCE_ROOT, "src", "api-forwarder.mjs")]) : undefined;
+  const grokForwarder = requiredServices.has("grok")
+    ? run(process.execPath, [path.join(SOURCE_ROOT, "src", "grok-oauth-forwarder.mjs")]) : undefined;
   // An unverified account has no routable Antigravity model. A successful
   // probe writes a nonpublishable pending generation, which is the sole
   // exception to the active-proof gate: startup may boot and health-check its
   // forwarder, then atomically promote that exact generation only after the
   // whole local stack is ready. An unrelated listener on this otherwise-unused
   // port therefore cannot take down an account that has never passed proof.
-  const antigravityStartup = antigravityOAuthStartupState();
-  const antigravityForwarder = antigravityStartup.startForwarder
+  const antigravityStartup = COMPATIBILITY_LAYER.enabled ? antigravityOAuthStartupState() : {};
+  const antigravityForwarder = requiredServices.has("antigravity") || antigravityStartup.pendingActivationGeneration
     ? run(process.execPath, [path.join(SOURCE_ROOT, "src", "antigravity-oauth-forwarder.mjs")])
     : undefined;
   const devinForwarder = devinCliRouted
     ? run(process.execPath, [path.join(SOURCE_ROOT, "src", "devin-cli-forwarder.mjs")])
     : undefined;
   await Promise.all([
-    waitForHealth(
+    ...(kimiForwarder ? [waitForHealth(
       "OAuth forwarder",
       loopback(PORTS.oauth, "/health"),
       { Authorization: `Bearer ${internalKey}` },
       STARTUP_CHILD_HEALTH_TIMEOUT_MS,
       undefined,
       kimiForwarder,
-    ),
-    waitForHealth(
+    )] : []),
+    ...(api ? [waitForHealth(
       "API forwarder",
       loopback(PORTS.api, "/health"),
       { Authorization: `Bearer ${internalKey}` },
       STARTUP_CHILD_HEALTH_TIMEOUT_MS,
       undefined,
       api,
-    ),
-    waitForHealth(
+    )] : []),
+    ...(grokForwarder ? [waitForHealth(
       "Grok OAuth forwarder",
       loopback(PORTS.grokOauth, "/health"),
       { Authorization: `Bearer ${internalKey}` },
       STARTUP_CHILD_HEALTH_TIMEOUT_MS,
       undefined,
       grokForwarder,
-    ),
+    )] : []),
     ...(antigravityForwarder
       ? [
         waitForHealth(
@@ -459,8 +471,8 @@ async function main() {
       {},
       4_000,
     );
-  const gateway = startGateway();
-  await gatewayHealthy(gateway);
+  const gateway = executionPlan.needsGateway ? startGateway() : undefined;
+  if (gateway) await gatewayHealthy(gateway);
 
   const frontend = FRONTEND;
   const frontendService = frontend.service;
@@ -546,9 +558,9 @@ async function main() {
   // (issue #261, a 429 raised out of LiteLLM's exception mapping), and taking
   // the router down with it turned one failed request into a dead session.
   const result = await Promise.race([
-    waitForExit(kimiForwarder, "OAuth forwarder"),
-    waitForExit(api, "API forwarder"),
-    waitForExit(grokForwarder, "Grok OAuth forwarder"),
+    ...(kimiForwarder ? [waitForExit(kimiForwarder, "OAuth forwarder")] : []),
+    ...(api ? [waitForExit(api, "API forwarder")] : []),
+    ...(grokForwarder ? [waitForExit(grokForwarder, "Grok OAuth forwarder")] : []),
     ...(antigravityForwarder
       ? [waitForExit(antigravityForwarder, "Antigravity OAuth forwarder")]
       : []),
@@ -561,7 +573,7 @@ async function main() {
     ...(devinForwarder ? [waitForExit(devinForwarder, "Devin CLI forwarder")] : []),
     ...(cursorEdge ? [waitForExit(cursorEdge, "Cursor public edge")] : []),
     ...(cursorTunnel ? [waitForExit(cursorTunnel, "Cursor named tunnel")] : []),
-    superviseGateway({
+    ...(gateway ? [superviseGateway({
       label: "LiteLLM gateway",
       child: gateway,
       start: startGateway,
@@ -571,7 +583,7 @@ async function main() {
       isShuttingDown: () => shuttingDown,
       log: (message) => console.error(`[${frontendService}] ${message}`),
       ...gatewaySupervisorLimits(),
-    }),
+    })] : []),
     waitForExit(router, frontend.label),
   ]);
   if (!shuttingDown) {

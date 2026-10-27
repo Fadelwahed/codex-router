@@ -1,0 +1,1 @@
+- Publish credential-reference metadata and migration records through the shared private writer, preserving managed-path validation and exact rollback bytes while respecting temporary-file ownership on failure.
